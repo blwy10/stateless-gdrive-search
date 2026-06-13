@@ -73,6 +73,12 @@ type ChatCompletion = {
     message: {
       role: "assistant";
       content: string | null;
+      // Reasoning/thinking models return their chain-of-thought separately from
+      // `content` (which is null on tool-call turns). Fireworks/DeepSeek/vLLM use
+      // `reasoning_content`; OpenRouter and some others use `reasoning`. Capture
+      // both so the transcript log shows the rationale regardless of provider.
+      reasoning_content?: string | null;
+      reasoning?: string | null;
       tool_calls?: ToolCall[];
     };
   }>;
@@ -359,24 +365,77 @@ class ModelRequestError extends Error {
   }
 }
 
+/**
+ * Identifies which logical caller is issuing a model request so its debug-log
+ * events stay attributable. The agent makes model calls from two distinct places
+ * that must never blur together in a transcript: the main reasoning loop and the
+ * isolated per-file relevance grader (curated list mode). They share a requestId
+ * and step — and a single step can grade several files — so the caller is what
+ * tells them apart.
+ */
+type ModelCaller = "agent" | "grader";
+
+/**
+ * Debug-log event namespace for a {@link callModel} invocation. The main agent
+ * loop logs under `agent.model.*`; the grader logs under `agent.grade.*` so its
+ * isolated relevance judgements are never mistaken for the agent's own reasoning
+ * turns (and align with the `agent.grade.failed` event the grader already emits).
+ */
+export function modelEventPrefix(caller: ModelCaller) {
+  return caller === "grader" ? "agent.grade" : "agent.model";
+}
+
+/**
+ * Pull a model turn's chain-of-thought out of whichever field the provider used.
+ * Reasoning/thinking models return it separately from `content` (which is null
+ * on tool-call turns): Fireworks/DeepSeek/vLLM use `reasoning_content`,
+ * OpenRouter and some others use `reasoning`. Returning it lets the transcript
+ * log show the rationale regardless of provider; `null` means none was given.
+ */
+export function extractReasoningContent(
+  message: { reasoning_content?: string | null; reasoning?: string | null } | undefined
+): string | null {
+  return message?.reasoning_content ?? message?.reasoning ?? null;
+}
+
+/**
+ * Debug-log attribution for a single {@link callModel} invocation: which caller
+ * issued it (so grader calls log distinctly under `agent.grade.*`) and any extra
+ * fields merged into every one of that call's events. The grader passes the
+ * hashed key of the file it is judging, so a grade's request/completed/
+ * transcript/error entries are self-correlating even when several files are
+ * graded within one step.
+ */
+type ModelCallLog = {
+  caller?: ModelCaller;
+  fields?: Record<string, unknown>;
+};
+
 async function callModel(
   settings: EffectiveModelSettings,
   messages: ChatMessage[],
   requestId: string,
   step: number,
-  offeredTools: ToolDefinition[] | null = null
+  offeredTools: ToolDefinition[] | null = null,
+  log: ModelCallLog = {}
 ) {
   const startedAt = Date.now();
   const toolsEnabled = Boolean(offeredTools?.length);
+  // Grader calls log under agent.grade.* (see modelEventPrefix) so they are
+  // never confused with the main agent's agent.model.* turns; logFields tags
+  // every event for this call (e.g. the grader's file hash) for correlation.
+  const eventPrefix = modelEventPrefix(log.caller ?? "agent");
+  const logFields = log.fields ?? {};
 
   await writeDebugLog({
-    event: "agent.model.request",
+    event: `${eventPrefix}.request`,
     requestId,
     step,
     model: settings.model,
     modelSettingsSource: settings.source,
     messageCount: messages.length,
-    toolsEnabled
+    toolsEnabled,
+    ...logFields
   });
 
   let lastError: unknown;
@@ -406,7 +465,7 @@ async function callModel(
       if (!response.ok) {
         const responseBody = await response.text();
         await writeDebugLog({
-          event: "agent.model.failed",
+          event: `${eventPrefix}.failed`,
           level: "error",
           requestId,
           step,
@@ -415,7 +474,8 @@ async function callModel(
           status: response.status,
           durationMs: Date.now() - startedAt,
           attempt,
-          response: debugText(responseBody)
+          response: debugText(responseBody),
+          ...logFields
         });
         throw new ModelRequestError(
           `AI request failed with status ${response.status}`,
@@ -425,34 +485,47 @@ async function callModel(
 
       const completion = (await response.json()) as ChatCompletion;
       const message = completion.choices[0]?.message;
+      // Reasoning models (e.g. gpt-oss on Fireworks) put their chain-of-thought
+      // in reasoning_content/reasoning, not content — and content is null on
+      // tool-call turns. extractReasoningContent falls back across the field
+      // names so the rationale is captured regardless of provider.
+      const reasoning = extractReasoningContent(message);
       await writeDebugLog({
-        event: "agent.model.completed",
+        event: `${eventPrefix}.completed`,
         requestId,
         step,
         model: settings.model,
         modelSettingsSource: settings.source,
         durationMs: Date.now() - startedAt,
         toolCallCount: message?.tool_calls?.length ?? 0,
-        responseContentLength: message?.content?.length ?? 0
+        responseContentLength: message?.content?.length ?? 0,
+        reasoningContentLength: reasoning?.length ?? 0,
+        ...logFields
       });
       // Full transcript dump (DEBUG_LOG_TRANSCRIPT only): the model's raw,
-      // untruncated reasoning text plus the tool calls it issued this step (names
-      // and arguments). This is what makes curation decisions auditable — e.g.
-      // why a file was kept vs. merely reviewed — which the metadata-only
-      // agent.model.completed event above cannot show. Emitted for every model
-      // call (every mode, including the forced final synthesis turn) and kept
+      // untruncated reasoning text (reasoningContent) plus the tool calls it
+      // issued this step (names and arguments). This is what makes curation
+      // decisions auditable — e.g. why a file was kept vs. merely reviewed —
+      // which the metadata-only completed event above cannot show. For reasoning
+      // models the rationale lives in reasoningContent since content is null
+      // whenever the model calls a tool, so both fields are logged in full. The
+      // grader logs its own agent.grade.transcript (distinct from the main
+      // agent's agent.model.transcript). Emitted for every model call (every
+      // mode, the grader, and the forced final synthesis turn) and kept
       // independent of DEBUG_LOG_CONTENT.
       if (isDebugTranscriptLogEnabled()) {
         await writeDebugLog({
-          event: "agent.model.transcript",
+          event: `${eventPrefix}.transcript`,
           requestId,
           step,
           model: settings.model,
           content: message?.content ?? null,
+          reasoningContent: reasoning,
           toolCalls: (message?.tool_calls ?? []).map((toolCall) => ({
             name: toolCall.function.name,
             arguments: toolCall.function.arguments
-          }))
+          })),
+          ...logFields
         });
       }
       return completion;
@@ -463,7 +536,7 @@ async function callModel(
       const retryable = error instanceof ModelRequestError ? error.retryable : true;
       const willRetry = retryable && attempt < MODEL_REQUEST_MAX_RETRIES;
       await writeDebugLog({
-        event: "agent.model.error",
+        event: `${eventPrefix}.error`,
         level: willRetry ? "warn" : "error",
         requestId,
         step,
@@ -472,7 +545,8 @@ async function callModel(
         durationMs: Date.now() - startedAt,
         attempt,
         willRetry,
-        error: debugError(error)
+        error: debugError(error),
+        ...logFields
       });
       if (!willRetry) throw error;
     }
@@ -567,13 +641,19 @@ export async function gradeFileRelevance(
   requestId: string,
   step: number
 ): Promise<GradeVerdict> {
+  // The grader is a separate model call from the main agent loop: route its logs
+  // under agent.grade.* (caller: "grader") and tag every event with the file it
+  // is judging so each grade stays attributable even when several files share a
+  // step.
+  const fileKeyHash = hashForDebug(fileKey(file));
   try {
     const completion = await callModel(
       modelSettings,
       buildGradeMessages(query, file, content),
       requestId,
       step,
-      null
+      null,
+      { caller: "grader", fields: { fileKeyHash } }
     );
     return parseGradeResponse(completion.choices[0]?.message?.content ?? null);
   } catch (error) {
@@ -582,7 +662,7 @@ export async function gradeFileRelevance(
       level: "warn",
       requestId,
       step,
-      fileKeyHash: hashForDebug(fileKey(file)),
+      fileKeyHash,
       error: debugError(error)
     });
     return { relevant: true, reason: "Relevance check unavailable; kept by default." };
@@ -1182,6 +1262,11 @@ export async function handleReviewFileTool(
     mimeType: opened.file.mimeType,
     contentLength: opened.content.length,
     relevant: verdict.relevant,
+    // The grader's justification is meant to be auditable (see GradeVerdict);
+    // surface it here at the metadata tier (gated like other model-derived text
+    // via debugText) so a keep/discard decision is explained even without the
+    // full DEBUG_LOG_TRANSCRIPT dump.
+    reason: debugText(verdict.reason),
     reviewFileCallCount: state.reviewFileCallCount,
     keptFileCount: state.keptFiles.length
   });

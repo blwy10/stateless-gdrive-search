@@ -4,10 +4,12 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   dispatchToolCall,
+  extractReasoningContent,
   handleOpenFileTool,
   handleReviewFileTool,
   handleSearchTool,
   isRetryableModelStatus,
+  modelEventPrefix,
   parseFinalAnswer,
   parseGradeResponse,
   type AgentProgress,
@@ -557,5 +559,51 @@ describe("isRetryableModelStatus", () => {
     for (const status of [200, 400, 401, 403, 404, 422]) {
       expect(isRetryableModelStatus(status), String(status)).toBe(false);
     }
+  });
+});
+
+describe("modelEventPrefix", () => {
+  it("logs grader calls under a namespace distinct from the main agent", () => {
+    // The whole point: a grader model call and a main-agent model call share a
+    // requestId and step, so the debug-log event prefix is what keeps them
+    // distinguishable in a transcript.
+    expect(modelEventPrefix("agent")).toBe("agent.model");
+    expect(modelEventPrefix("grader")).toBe("agent.grade");
+    expect(modelEventPrefix("grader")).not.toBe(modelEventPrefix("agent"));
+  });
+});
+
+describe("extractReasoningContent", () => {
+  it("returns reasoning_content when the provider supplies it", () => {
+    // Fireworks/DeepSeek/vLLM style: chain-of-thought in reasoning_content
+    // (on a tool-call turn `content` would be null, hence the dedicated field).
+    expect(extractReasoningContent({ reasoning_content: "step by step" })).toBe("step by step");
+  });
+
+  it("falls back to reasoning when reasoning_content is absent or null", () => {
+    // OpenRouter style: chain-of-thought in reasoning.
+    expect(extractReasoningContent({ reasoning: "thinking" })).toBe("thinking");
+    expect(extractReasoningContent({ reasoning_content: null, reasoning: "thinking" })).toBe(
+      "thinking"
+    );
+  });
+
+  it("prefers reasoning_content over reasoning when both are present", () => {
+    expect(
+      extractReasoningContent({ reasoning_content: "primary", reasoning: "secondary" })
+    ).toBe("primary");
+  });
+
+  it("returns null when neither field is present or the message is missing", () => {
+    // A non-reasoning model's turn carries no reasoning_content/reasoning at all.
+    expect(extractReasoningContent({})).toBeNull();
+    expect(extractReasoningContent({ reasoning_content: null, reasoning: null })).toBeNull();
+    expect(extractReasoningContent(undefined)).toBeNull();
+  });
+
+  it("preserves an empty-string reasoning rather than collapsing it to null", () => {
+    // "" is a real (if empty) value, distinct from a missing field; nullish
+    // coalescing must not skip it, so reasoningContentLength stays an honest 0.
+    expect(extractReasoningContent({ reasoning_content: "" })).toBe("");
   });
 });

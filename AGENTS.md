@@ -12,10 +12,15 @@
   `escapeDriveQuery`, `emptyExtractionNote`, `parseFinalAnswer`,
   `parseGradeResponse` (the curated-mode relevance-grader reply parser, which
   defaults to keeping a file when the grader's reply can't be parsed),
-  and the debug-log gating helpers (`debugText`/`isDebugLogEnabled`/
+  the debug-log gating helpers (`debugText`/`isDebugLogEnabled`/
   `isDebugContentLogEnabled`/`isDebugTranscriptLogEnabled`, which force all debug
   logging — metadata, content previews, and the full transcript dump — off when
-  `NODE_ENV=production`). `test/agent.test.ts` also
+  `NODE_ENV=production`), and the model-call logging helpers `modelEventPrefix`
+  (grader calls log under `agent.grade.*` and the main agent under `agent.model.*`,
+  so the two stay distinguishable in a shared-requestId transcript) and
+  `extractReasoningContent` (reads a turn's chain-of-thought from whichever field
+  the provider used — `reasoning_content` or `reasoning` — so reasoning is captured
+  even on tool-call turns where `content` is null). `test/agent.test.ts` also
   covers `handleOpenFileTool`'s failure path with a mocked `openDriveFile` (a tool
   execution error must become a tool-result observation, never abort the run), its
   out-of-scope-connectionId path (a connectionId not in `selectedDriveIds` — usually
@@ -56,6 +61,18 @@
   is injected as `AgentRunContext.gradeFile` so tests can stub it without mocking
   the network; on any grader failure (request error or unparseable reply) it
   defaults to keeping the file, favouring recall.
+
+  Debug logging keeps the grader distinct from the main agent. `callModel` takes a
+  `caller` ("agent" vs "grader", via `modelEventPrefix`) so grader model calls log
+  under `agent.grade.*` (`.request`/`.completed`/`.transcript`/`.failed`/`.error`),
+  never `agent.model.*`, and each is tagged with the graded file's hash — the two
+  share a requestId and step, and one step may grade several files, so the event
+  namespace plus that hash are what make a grade attributable. With
+  `DEBUG_LOG_TRANSCRIPT=1` every model call (agent and grader) logs full,
+  untruncated `content` plus `reasoningContent` (reasoning models put their
+  chain-of-thought in `reasoning_content`/`reasoning`, not `content`, which is null
+  on tool-call turns — see `extractReasoningContent`). The keep/discard verdict and
+  the grader's `reason` are also recorded on `agent.tool.review_file.completed`.
 
   The set of kept files (`AgentRunState.keptFiles`) is the authoritative curated
   result — there is no end-of-run marker, and no opened-files fallback: with the
