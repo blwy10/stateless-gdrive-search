@@ -17,10 +17,16 @@
   logging — metadata, content previews, and the full transcript dump — off when
   `NODE_ENV=production`), and the model-call logging helpers `modelEventPrefix`
   (grader calls log under `agent.grade.*` and the main agent under `agent.model.*`,
-  so the two stay distinguishable in a shared-requestId transcript) and
+  so the two stay distinguishable in a shared-requestId transcript),
   `extractReasoningContent` (reads a turn's chain-of-thought from whichever field
   the provider used — `reasoning_content` or `reasoning` — so reasoning is captured
-  even on tool-call turns where `content` is null). `test/agent.test.ts` also
+  even on tool-call turns where `content` is null), and `assistantTurnMessage`
+  (builds the assistant turn replayed into the next request, carrying its
+  `reasoning_content` back so reasoning providers can think *between* tool calls —
+  Fireworks-style interleaved thinking — instead of restarting after each tool
+  result; the rationale is normalised across `reasoning_content`/`reasoning` and
+  re-emitted as `reasoning_content`, and omitted when the turn had none).
+  `test/agent.test.ts` also
   covers `handleOpenFileTool`'s failure path with a mocked `openDriveFile` (a tool
   execution error must become a tool-result observation, never abort the run), its
   out-of-scope-connectionId path (a connectionId not in `selectedDriveIds` — usually
@@ -46,6 +52,17 @@
   timeouts, HTTP 5xx, and 429 — up to `MODEL_REQUEST_MAX_RETRIES` (4xx is never
   retried; see `isRetryableModelStatus`), and an empty model response finalizes
   gracefully with partial results instead of throwing.
+
+  Interleaved-thinking invariant: the main loop replays each assistant turn via
+  `assistantTurnMessage`, which carries that turn's `reasoning_content` back into
+  the conversation. Reasoning providers (Fireworks et al.) require the prior
+  turn's chain-of-thought to be resent or they re-reason from scratch after every
+  tool result — and the agent's loop is exactly that case, since each follow-up
+  request ends with a `tool` message (the trigger Fireworks uses for interleaved
+  thinking). The field is replayed only when present, so non-reasoning models and
+  providers that never return it are unaffected; it is not round-tripped on the
+  grader's isolated single-shot calls (which have no follow-up turn). See
+  https://docs.fireworks.ai/guides/reasoning.
 
   Curated file-list mode uses per-file relevance grading instead of loading file
   contents into the agent's context. When curating, the model is offered

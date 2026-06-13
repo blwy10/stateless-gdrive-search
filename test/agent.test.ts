@@ -3,6 +3,7 @@
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  assistantTurnMessage,
   dispatchToolCall,
   extractReasoningContent,
   handleOpenFileTool,
@@ -605,5 +606,64 @@ describe("extractReasoningContent", () => {
     // "" is a real (if empty) value, distinct from a missing field; nullish
     // coalescing must not skip it, so reasoningContentLength stays an honest 0.
     expect(extractReasoningContent({ reasoning_content: "" })).toBe("");
+  });
+});
+
+describe("assistantTurnMessage", () => {
+  const searchCall = {
+    id: "call-1",
+    type: "function" as const,
+    function: { name: "search_drive" as const, arguments: "{}" }
+  };
+
+  it("replays reasoning_content so the model keeps thinking across tool calls", () => {
+    // The core of the fix (Fireworks interleaved thinking): the prior turn's
+    // chain-of-thought must be sent back or the model re-reasons from scratch
+    // after every tool result. On a tool-call turn `content` is null, so
+    // reasoning_content is the only place the rationale lives.
+    expect(
+      assistantTurnMessage({
+        role: "assistant",
+        content: null,
+        reasoning_content: "first I'll search",
+        tool_calls: [searchCall]
+      })
+    ).toEqual({
+      role: "assistant",
+      content: null,
+      tool_calls: [searchCall],
+      reasoning_content: "first I'll search"
+    });
+  });
+
+  it("normalises a provider's `reasoning` field back to reasoning_content", () => {
+    // OpenRouter-style reasoning is re-emitted under the field Fireworks reads,
+    // so a turn round-trips no matter which field name the provider returned.
+    const replayed = assistantTurnMessage({
+      role: "assistant",
+      content: "done",
+      reasoning: "openrouter-style"
+    });
+    expect(replayed.reasoning_content).toBe("openrouter-style");
+  });
+
+  it("omits reasoning_content when the turn has none", () => {
+    // A non-reasoning model's turn carries no rationale; the field must be left
+    // off entirely rather than sent as null, so it is never sent where it would
+    // be meaningless (and providers that never return it stay untouched).
+    const replayed = assistantTurnMessage({ role: "assistant", content: "hi" });
+    expect("reasoning_content" in replayed).toBe(false);
+    expect(replayed.content).toBe("hi");
+  });
+
+  it("preserves an empty-string reasoning rather than dropping it", () => {
+    // "" is a real value distinct from a missing field (matches
+    // extractReasoningContent), so it is replayed rather than omitted.
+    const replayed = assistantTurnMessage({
+      role: "assistant",
+      content: null,
+      reasoning_content: ""
+    });
+    expect(replayed.reasoning_content).toBe("");
   });
 });

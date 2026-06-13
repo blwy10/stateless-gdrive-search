@@ -47,7 +47,20 @@ type AgentRequest = z.infer<typeof AgentRequest>;
 type ChatMessage =
   | { role: "system"; content: string }
   | { role: "user"; content: string }
-  | { role: "assistant"; content: string | null; tool_calls?: ToolCall[] }
+  | {
+      role: "assistant";
+      content: string | null;
+      tool_calls?: ToolCall[];
+      // The turn's chain-of-thought, replayed into the next request. Reasoning
+      // providers (Fireworks et al.) require the prior assistant turn's
+      // reasoning_content to be sent back so the model thinks *between* tool
+      // calls (interleaved thinking) instead of re-reasoning from scratch after
+      // each tool result — which is exactly this agent's loop, where every
+      // follow-up request ends with a `tool` message. Providers that don't
+      // support it ignore the field, so sending it is safe broadly.
+      // See https://docs.fireworks.ai/guides/reasoning.
+      reasoning_content?: string | null;
+    }
   | { role: "tool"; tool_call_id: string; content: string };
 
 type ToolCall = {
@@ -68,19 +81,21 @@ type ToolDefinition = {
   };
 };
 
+type CompletionMessage = {
+  role: "assistant";
+  content: string | null;
+  // Reasoning/thinking models return their chain-of-thought separately from
+  // `content` (which is null on tool-call turns). Fireworks/DeepSeek/vLLM use
+  // `reasoning_content`; OpenRouter and some others use `reasoning`. Capture
+  // both so the transcript log shows the rationale regardless of provider.
+  reasoning_content?: string | null;
+  reasoning?: string | null;
+  tool_calls?: ToolCall[];
+};
+
 type ChatCompletion = {
   choices: Array<{
-    message: {
-      role: "assistant";
-      content: string | null;
-      // Reasoning/thinking models return their chain-of-thought separately from
-      // `content` (which is null on tool-call turns). Fireworks/DeepSeek/vLLM use
-      // `reasoning_content`; OpenRouter and some others use `reasoning`. Capture
-      // both so the transcript log shows the rationale regardless of provider.
-      reasoning_content?: string | null;
-      reasoning?: string | null;
-      tool_calls?: ToolCall[];
-    };
+    message: CompletionMessage;
   }>;
 };
 
@@ -396,6 +411,31 @@ export function extractReasoningContent(
   message: { reasoning_content?: string | null; reasoning?: string | null } | undefined
 ): string | null {
   return message?.reasoning_content ?? message?.reasoning ?? null;
+}
+
+/**
+ * Build the assistant message replayed into the conversation for the next model
+ * call, preserving the turn's chain-of-thought. Reasoning providers (Fireworks
+ * et al.) require the prior assistant turn's `reasoning_content` to be sent back
+ * so the model thinks *between* tool calls (interleaved thinking) rather than
+ * re-reasoning from scratch after each tool result — and that interleaving is
+ * exactly this agent's loop, where every follow-up request ends with a `tool`
+ * message. The rationale is normalised across provider field names via
+ * {@link extractReasoningContent} and re-emitted as `reasoning_content` (the
+ * field Fireworks reads). It is included only when present, so turns from
+ * non-reasoning models (and providers that never return it) are left untouched
+ * and the field is never sent where it would be meaningless.
+ */
+export function assistantTurnMessage(
+  message: CompletionMessage
+): Extract<ChatMessage, { role: "assistant" }> {
+  const reasoning = extractReasoningContent(message);
+  return {
+    role: "assistant",
+    content: message.content,
+    tool_calls: message.tool_calls,
+    ...(reasoning !== null ? { reasoning_content: reasoning } : {})
+  };
 }
 
 /**
@@ -1477,11 +1517,10 @@ export async function runDriveAgent(
       return;
     }
 
-    messages.push({
-      role: "assistant",
-      content: message.content,
-      tool_calls: message.tool_calls
-    });
+    // Replay the assistant turn — including its reasoning_content — so the model
+    // can continue its chain-of-thought across tool calls (interleaved thinking)
+    // instead of restarting after each tool result. See assistantTurnMessage.
+    messages.push(assistantTurnMessage(message));
 
     if (!message.tool_calls?.length) {
       const { answer, answerFormat } = parseFinalAnswer(message.content, input.mode);
