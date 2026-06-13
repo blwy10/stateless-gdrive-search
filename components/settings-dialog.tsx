@@ -5,12 +5,39 @@
 
 import { useEffect, useState } from "react";
 
+export type ModelProvider = "openai" | "anthropic" | "openai-compatible";
+
 export type ModelSettingsSummary = {
   hasCustomModel: boolean;
   apiKeyConfigured: boolean;
+  provider: ModelProvider | null;
   baseUrl: string | null;
   model: string | null;
   updatedAt: string | null;
+};
+
+const PROVIDER_OPTIONS: { value: ModelProvider; label: string; hint: string }[] = [
+  {
+    value: "openai",
+    label: "OpenAI (Responses API)",
+    hint: "Uses OpenAI's official endpoint. Endpoint URL optional."
+  },
+  {
+    value: "anthropic",
+    label: "Anthropic (Claude)",
+    hint: "Uses Anthropic's official endpoint. Endpoint URL optional."
+  },
+  {
+    value: "openai-compatible",
+    label: "OpenAI-compatible (Fireworks, vLLM, …)",
+    hint: "Any OpenAI-compatible endpoint. Endpoint URL required."
+  }
+];
+
+const PROVIDER_LABELS: Record<ModelProvider, string> = {
+  openai: "OpenAI",
+  anthropic: "Anthropic",
+  "openai-compatible": "OpenAI-compatible"
 };
 
 // Modal for managing the optional bring-your-own OpenAI-compatible provider.
@@ -26,6 +53,9 @@ export function SettingsDialog({
   onClose: () => void;
 }) {
   const hasCustomModel = modelSettings?.hasCustomModel ?? false;
+  const [provider, setProvider] = useState<ModelProvider>(
+    () => modelSettings?.provider ?? "openai"
+  );
   const [baseUrl, setBaseUrl] = useState(() =>
     modelSettings?.hasCustomModel ? (modelSettings.baseUrl ?? "") : ""
   );
@@ -33,6 +63,7 @@ export function SettingsDialog({
     modelSettings?.hasCustomModel ? (modelSettings.model ?? "") : ""
   );
   const [apiKey, setApiKey] = useState("");
+  const baseUrlRequired = provider === "openai-compatible";
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
@@ -54,10 +85,15 @@ export function SettingsDialog({
     setError("");
 
     try {
-      const body: { baseUrl: string; model: string; apiKey?: string } = {
-        baseUrl,
+      const body: { provider: ModelProvider; model: string; baseUrl?: string; apiKey?: string } = {
+        provider,
         model
       };
+      // Native providers use their official endpoint; only send a base URL when
+      // one was actually entered (required for openai-compatible).
+      if (baseUrl.trim()) {
+        body.baseUrl = baseUrl.trim();
+      }
       if (apiKey.trim()) {
         body.apiKey = apiKey;
       }
@@ -76,6 +112,7 @@ export function SettingsDialog({
       }
 
       onSettingsChange(data.settings);
+      setProvider(data.settings.provider ?? "openai");
       setBaseUrl(data.settings.baseUrl ?? "");
       setModel(data.settings.model ?? "");
       setApiKey("");
@@ -103,6 +140,7 @@ export function SettingsDialog({
       }
 
       onSettingsChange(data.settings);
+      setProvider("openai");
       setBaseUrl("");
       setModel("");
       setApiKey("");
@@ -156,9 +194,15 @@ export function SettingsDialog({
             {hasCustomModel ? (
               <dl className="provider-details">
                 <div>
-                  <dt>Endpoint</dt>
-                  <dd>{modelSettings?.baseUrl}</dd>
+                  <dt>Provider</dt>
+                  <dd>{modelSettings?.provider ? PROVIDER_LABELS[modelSettings.provider] : "—"}</dd>
                 </div>
+                {modelSettings?.baseUrl ? (
+                  <div>
+                    <dt>Endpoint</dt>
+                    <dd>{modelSettings.baseUrl}</dd>
+                  </div>
+                ) : null}
                 <div>
                   <dt>Model</dt>
                   <dd>{modelSettings?.model}</dd>
@@ -181,18 +225,43 @@ export function SettingsDialog({
             </div>
             <p className="settings-help">
               {hasCustomModel
-                ? "Update your saved OpenAI-compatible endpoint, model, or API key."
-                : "Add your own OpenAI-compatible endpoint, model, and API key."}
+                ? "Update your saved provider, model, or API key."
+                : "Use your own model provider, model, and API key."}
             </p>
 
           <div className="field">
-            <label htmlFor="model-base-url">OpenAI-compatible endpoint</label>
+            <label htmlFor="model-provider">Provider</label>
+            <select
+              id="model-provider"
+              value={provider}
+              onChange={(event) => setProvider(event.target.value as ModelProvider)}
+            >
+              {PROVIDER_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+            <p className="settings-help">
+              {PROVIDER_OPTIONS.find((option) => option.value === provider)?.hint}
+            </p>
+          </div>
+
+          <div className="field">
+            <label htmlFor="model-base-url">
+              Endpoint URL
+              <span className="inline-status">{baseUrlRequired ? "required" : "optional"}</span>
+            </label>
             <input
               id="model-base-url"
               type="url"
               value={baseUrl}
               onChange={(event) => setBaseUrl(event.target.value)}
-              placeholder="https://api.openai.com/v1"
+              placeholder={
+                baseUrlRequired
+                  ? "https://api.fireworks.ai/inference/v1"
+                  : "Leave blank to use the official endpoint"
+              }
             />
           </div>
 

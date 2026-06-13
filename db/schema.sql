@@ -27,8 +27,19 @@ create unique index if not exists drive_connections_owner_email_idx
 create table if not exists user_model_settings (
   owner_sub text primary key,
   api_key_ciphertext text not null,
-  base_url text not null,
+  base_url text,
   model text not null,
+  provider text not null default 'openai-compatible',
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+
+-- Multi-provider support. Existing rows predate the provider column and were all
+-- user-supplied OpenAI-compatible endpoints, so default them to that. Native
+-- providers (openai, anthropic) may omit base_url (they use their official
+-- endpoint), so base_url is no longer required.
+alter table user_model_settings
+  add column if not exists provider text not null default 'openai-compatible';
+
+alter table user_model_settings
+  alter column base_url drop not null;

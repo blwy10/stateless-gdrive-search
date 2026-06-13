@@ -3,16 +3,11 @@
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  assistantTurnMessage,
-  dispatchToolCall,
-  extractReasoningContent,
   handleOpenFileTool,
   handleReviewFileTool,
   handleSearchTool,
-  isRetryableModelStatus,
-  modelEventPrefix,
+  normalizeGradeVerdict,
   parseFinalAnswer,
-  parseGradeResponse,
   type AgentProgress,
   type AgentRunContext,
   type AgentRunState,
@@ -71,6 +66,7 @@ function makeState(overrides: Partial<AgentRunState> = {}): AgentRunState {
     reviewFileCallCount: 0,
     lowProgressSearchCount: 0,
     stopAfterToolUseReason: null,
+    currentStep: 0,
     ...overrides
   };
 }
@@ -156,44 +152,38 @@ describe("parseFinalAnswer", () => {
   });
 });
 
-describe("parseGradeResponse", () => {
-  it("parses a clean JSON verdict", () => {
-    expect(parseGradeResponse('{"relevant": true, "reason": "matches the query"}')).toEqual({
+describe("normalizeGradeVerdict", () => {
+  it("passes through a relevant/irrelevant verdict with its reason", () => {
+    expect(normalizeGradeVerdict({ relevant: true, reason: "matches the query" })).toEqual({
       relevant: true,
       reason: "matches the query"
     });
-    expect(parseGradeResponse('{"relevant": false, "reason": "off topic"}')).toEqual({
+    expect(normalizeGradeVerdict({ relevant: false, reason: "off topic" })).toEqual({
       relevant: false,
       reason: "off topic"
     });
   });
 
-  it("extracts the JSON object when wrapped in code fences or prose", () => {
-    expect(
-      parseGradeResponse('```json\n{"relevant": true, "reason": "ok"}\n```')
-    ).toEqual({ relevant: true, reason: "ok" });
-    expect(
-      parseGradeResponse('Sure! Here is my verdict: {"relevant": false, "reason": "no"} done.')
-    ).toEqual({ relevant: false, reason: "no" });
-  });
-
-  it("reads relevance leniently (string yes/true)", () => {
-    expect(parseGradeResponse('{"relevant": "yes", "reason": "r"}').relevant).toBe(true);
-    expect(parseGradeResponse('{"relevant": "false", "reason": "r"}').relevant).toBe(false);
-  });
-
-  it("supplies a default reason when the model omits one", () => {
-    expect(parseGradeResponse('{"relevant": true}')).toEqual({
+  it("supplies a default reason when the grader omits or blanks it", () => {
+    expect(normalizeGradeVerdict({ relevant: true })).toEqual({
+      relevant: true,
+      reason: "Judged relevant."
+    });
+    expect(normalizeGradeVerdict({ relevant: false, reason: "   " })).toEqual({
+      relevant: false,
+      reason: "Judged not relevant."
+    });
+    expect(normalizeGradeVerdict({ relevant: true, reason: null })).toEqual({
       relevant: true,
       reason: "Judged relevant."
     });
   });
 
-  it("defaults to keeping the file when the reply cannot be parsed", () => {
-    const verdict = parseGradeResponse("not json at all");
-    expect(verdict.relevant).toBe(true);
-    expect(verdict.reason).toContain("could not be parsed");
-    expect(parseGradeResponse(null).relevant).toBe(true);
+  it("trims and caps an overlong reason", () => {
+    const long = "x".repeat(500);
+    const verdict = normalizeGradeVerdict({ relevant: true, reason: `  ${long}  ` });
+    expect(verdict.reason.length).toBe(300);
+    expect(verdict.reason.startsWith("x")).toBe(true);
   });
 });
 
@@ -480,190 +470,5 @@ describe("handleSearchTool", () => {
     expect(payload.message).toContain("Invalid arguments for search_drive");
     expect(searchDriveFiles).not.toHaveBeenCalled();
     expect(runState.searchCallCount).toBe(0);
-  });
-});
-
-describe("dispatchToolCall", () => {
-  beforeEach(() => {
-    vi.mocked(openDriveFile).mockReset();
-    vi.mocked(searchDriveFiles).mockReset();
-  });
-
-  it("answers an unknown tool name with a recoverable observation", async () => {
-    const runState = makeState();
-    // The wire type constrains tool names, but the model can emit anything; cast
-    // to simulate a hallucinated tool the contract forbids. Leaving it
-    // unanswered would corrupt the next request and abort the run.
-    const unknownCall = {
-      id: "call-unknown",
-      type: "function" as const,
-      function: { name: "delete_everything", arguments: "{}" }
-    } as unknown as Parameters<typeof dispatchToolCall>[3];
-
-    const result = await dispatchToolCall(makeContext(), runState, 0, unknownCall);
-
-    expect(result.role).toBe("tool");
-    expect(result.tool_call_id).toBe("call-unknown");
-    const payload = JSON.parse(result.content) as { error?: boolean; message?: string };
-    expect(payload.error).toBe(true);
-    expect(payload.message).toContain('Unknown tool "delete_everything"');
-    expect(payload.message).toContain("search_drive");
-    expect(openDriveFile).not.toHaveBeenCalled();
-    expect(searchDriveFiles).not.toHaveBeenCalled();
-  });
-
-  it("routes a known tool name to its handler", async () => {
-    vi.mocked(openDriveFile).mockResolvedValue({
-      file: file("c1", "f1", "Doc"),
-      content: "hi"
-    });
-    const runState = makeState();
-    const openCall = {
-      id: "call-route",
-      type: "function" as const,
-      function: {
-        name: "open_file" as const,
-        arguments: JSON.stringify({ connectionId: "c1", fileId: "f1" })
-      }
-    };
-
-    const result = await dispatchToolCall(makeContext(), runState, 0, openCall);
-
-    const payload = JSON.parse(result.content) as { content?: string };
-    expect(payload.content).toBe("hi");
-    expect(openDriveFile).toHaveBeenCalledTimes(1);
-  });
-
-  it("routes review_file to its handler in curated mode", async () => {
-    vi.mocked(openDriveFile).mockResolvedValue({
-      file: file("c1", "f1", "Doc"),
-      content: "hi"
-    });
-    const runState = makeState();
-    const gradeFile = vi.fn(async () => ({ relevant: true, reason: "ok" }));
-    const context = curatedContext({ gradeFile });
-
-    const result = await dispatchToolCall(context, runState, 0, reviewCall("route-review"));
-
-    const payload = JSON.parse(result.content) as { reviewed?: boolean; kept?: boolean };
-    expect(payload.reviewed).toBe(true);
-    expect(payload.kept).toBe(true);
-    expect(gradeFile).toHaveBeenCalledTimes(1);
-  });
-});
-
-describe("isRetryableModelStatus", () => {
-  it("retries 5xx and 429 but not 4xx or success", () => {
-    for (const status of [500, 502, 503, 504, 429]) {
-      expect(isRetryableModelStatus(status), String(status)).toBe(true);
-    }
-    for (const status of [200, 400, 401, 403, 404, 422]) {
-      expect(isRetryableModelStatus(status), String(status)).toBe(false);
-    }
-  });
-});
-
-describe("modelEventPrefix", () => {
-  it("logs grader calls under a namespace distinct from the main agent", () => {
-    // The whole point: a grader model call and a main-agent model call share a
-    // requestId and step, so the debug-log event prefix is what keeps them
-    // distinguishable in a transcript.
-    expect(modelEventPrefix("agent")).toBe("agent.model");
-    expect(modelEventPrefix("grader")).toBe("agent.grade");
-    expect(modelEventPrefix("grader")).not.toBe(modelEventPrefix("agent"));
-  });
-});
-
-describe("extractReasoningContent", () => {
-  it("returns reasoning_content when the provider supplies it", () => {
-    // Fireworks/DeepSeek/vLLM style: chain-of-thought in reasoning_content
-    // (on a tool-call turn `content` would be null, hence the dedicated field).
-    expect(extractReasoningContent({ reasoning_content: "step by step" })).toBe("step by step");
-  });
-
-  it("falls back to reasoning when reasoning_content is absent or null", () => {
-    // OpenRouter style: chain-of-thought in reasoning.
-    expect(extractReasoningContent({ reasoning: "thinking" })).toBe("thinking");
-    expect(extractReasoningContent({ reasoning_content: null, reasoning: "thinking" })).toBe(
-      "thinking"
-    );
-  });
-
-  it("prefers reasoning_content over reasoning when both are present", () => {
-    expect(
-      extractReasoningContent({ reasoning_content: "primary", reasoning: "secondary" })
-    ).toBe("primary");
-  });
-
-  it("returns null when neither field is present or the message is missing", () => {
-    // A non-reasoning model's turn carries no reasoning_content/reasoning at all.
-    expect(extractReasoningContent({})).toBeNull();
-    expect(extractReasoningContent({ reasoning_content: null, reasoning: null })).toBeNull();
-    expect(extractReasoningContent(undefined)).toBeNull();
-  });
-
-  it("preserves an empty-string reasoning rather than collapsing it to null", () => {
-    // "" is a real (if empty) value, distinct from a missing field; nullish
-    // coalescing must not skip it, so reasoningContentLength stays an honest 0.
-    expect(extractReasoningContent({ reasoning_content: "" })).toBe("");
-  });
-});
-
-describe("assistantTurnMessage", () => {
-  const searchCall = {
-    id: "call-1",
-    type: "function" as const,
-    function: { name: "search_drive" as const, arguments: "{}" }
-  };
-
-  it("replays reasoning_content so the model keeps thinking across tool calls", () => {
-    // The core of the fix (Fireworks interleaved thinking): the prior turn's
-    // chain-of-thought must be sent back or the model re-reasons from scratch
-    // after every tool result. On a tool-call turn `content` is null, so
-    // reasoning_content is the only place the rationale lives.
-    expect(
-      assistantTurnMessage({
-        role: "assistant",
-        content: null,
-        reasoning_content: "first I'll search",
-        tool_calls: [searchCall]
-      })
-    ).toEqual({
-      role: "assistant",
-      content: null,
-      tool_calls: [searchCall],
-      reasoning_content: "first I'll search"
-    });
-  });
-
-  it("normalises a provider's `reasoning` field back to reasoning_content", () => {
-    // OpenRouter-style reasoning is re-emitted under the field Fireworks reads,
-    // so a turn round-trips no matter which field name the provider returned.
-    const replayed = assistantTurnMessage({
-      role: "assistant",
-      content: "done",
-      reasoning: "openrouter-style"
-    });
-    expect(replayed.reasoning_content).toBe("openrouter-style");
-  });
-
-  it("omits reasoning_content when the turn has none", () => {
-    // A non-reasoning model's turn carries no rationale; the field must be left
-    // off entirely rather than sent as null, so it is never sent where it would
-    // be meaningless (and providers that never return it stay untouched).
-    const replayed = assistantTurnMessage({ role: "assistant", content: "hi" });
-    expect("reasoning_content" in replayed).toBe(false);
-    expect(replayed.content).toBe("hi");
-  });
-
-  it("preserves an empty-string reasoning rather than dropping it", () => {
-    // "" is a real value distinct from a missing field (matches
-    // extractReasoningContent), so it is replayed rather than omitted.
-    const replayed = assistantTurnMessage({
-      role: "assistant",
-      content: null,
-      reasoning_content: ""
-    });
-    expect(replayed.reasoning_content).toBe("");
   });
 });

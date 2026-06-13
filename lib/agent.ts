@@ -1,13 +1,22 @@
 // Copyright (c) 2026 Benjamin Lau
 // SPDX-License-Identifier: MIT
 
-import { fetch as undiciFetch } from "undici";
+import {
+  generateObject,
+  generateText,
+  jsonSchema,
+  stepCountIs,
+  tool,
+  type ModelMessage,
+  type StepResult,
+  type ToolSet
+} from "ai";
 import { z } from "zod";
 import { listDriveConnections } from "@/lib/drive-connections";
 import { openDriveFile, searchDriveFiles, type DriveFile } from "@/lib/drive";
 import { formatMimeType } from "@/lib/file-types";
-import { getEffectiveModelSettings, type EffectiveModelSettings } from "@/lib/model-settings";
-import { ssrfSafeDispatcher } from "@/lib/ssrf";
+import { getEffectiveModelSettings, type ModelProvider } from "@/lib/model-settings";
+import { resolveModel, type ResolvedModel } from "@/lib/model-provider";
 import {
   createDebugRequestId,
   debugError,
@@ -18,20 +27,11 @@ import {
 } from "@/lib/debug-log";
 
 /**
- * Per-request timeout for the outbound model call. Without it, a hung upstream
- * endpoint would stall the request indefinitely and hold the agent's SSE stream
- * and server resources open. Applied via {@link AbortSignal.timeout}, so it
- * bounds connect + response-body read for each individual attempt.
- */
-const MODEL_REQUEST_TIMEOUT_MS = 60_000;
-
-/**
- * Additional retry attempts for a failed model call, on top of the initial
- * attempt (so `2` ⇒ up to three attempts total). Only transient failures are
- * retried — network errors, timeouts, HTTP 5xx, and 429 — mirroring
- * {@link withToolRetries} for the Drive tools, which the model call previously
- * lacked. Client errors (4xx) are never retried: an identical bad request will
- * only fail again and waste time and tokens.
+ * Retry attempts for a failed model call, passed to the AI SDK as `maxRetries`.
+ * The SDK retries only transient failures (network errors, timeouts, HTTP 5xx,
+ * and 429) with exponential backoff and never retries 4xx — matching the policy
+ * the old hand-rolled `callModel` enforced. The per-request timeout now lives in
+ * the SSRF-safe fetch wrapper (see lib/model-provider.ts).
  */
 const MODEL_REQUEST_MAX_RETRIES = 2;
 
@@ -44,25 +44,14 @@ const AgentRequest = z.object({
 
 type AgentRequest = z.infer<typeof AgentRequest>;
 
-type ChatMessage =
-  | { role: "system"; content: string }
-  | { role: "user"; content: string }
-  | {
-      role: "assistant";
-      content: string | null;
-      tool_calls?: ToolCall[];
-      // The turn's chain-of-thought, replayed into the next request. Reasoning
-      // providers (Fireworks et al.) require the prior assistant turn's
-      // reasoning_content to be sent back so the model thinks *between* tool
-      // calls (interleaved thinking) instead of re-reasoning from scratch after
-      // each tool result — which is exactly this agent's loop, where every
-      // follow-up request ends with a `tool` message. Providers that don't
-      // support it ignore the field, so sending it is safe broadly.
-      // See https://docs.fireworks.ai/guides/reasoning.
-      reasoning_content?: string | null;
-    }
-  | { role: "tool"; tool_call_id: string; content: string };
-
+/**
+ * Minimal OpenAI-style tool-call shape used only to bridge the AI SDK's parsed
+ * tool input into the existing tool handlers, which were written against this
+ * shape and remain the tested, run-resilient core of the agent. The SDK now
+ * validates and routes tool calls itself; this is just the adapter currency (see
+ * {@link buildAgentTools}). Reasoning round-trip and the assistant/tool message
+ * bookkeeping that the old loop did by hand are handled inside the SDK.
+ */
 type ToolCall = {
   id: string;
   type: "function";
@@ -72,32 +61,12 @@ type ToolCall = {
   };
 };
 
-type ToolDefinition = {
-  type: "function";
-  function: {
-    name: ToolCall["function"]["name"];
-    description: string;
-    parameters: Record<string, unknown>;
-  };
-};
-
-type CompletionMessage = {
-  role: "assistant";
-  content: string | null;
-  // Reasoning/thinking models return their chain-of-thought separately from
-  // `content` (which is null on tool-call turns). Fireworks/DeepSeek/vLLM use
-  // `reasoning_content`; OpenRouter and some others use `reasoning`. Capture
-  // both so the transcript log shows the rationale regardless of provider.
-  reasoning_content?: string | null;
-  reasoning?: string | null;
-  tool_calls?: ToolCall[];
-};
-
-type ChatCompletion = {
-  choices: Array<{
-    message: CompletionMessage;
-  }>;
-};
+/**
+ * Tool-result observation appended after a tool call. Every handler returns
+ * exactly one of these (never throwing — see the run-resilience invariant); the
+ * adapter unwraps `content` into the value handed back to the model.
+ */
+type ToolResultMessage = { role: "tool"; tool_call_id: string; content: string };
 
 /**
  * Per-run limits that bound how much work the agent may do before it must stop
@@ -174,87 +143,8 @@ const reviewArgs = z.object({
   fileId: z.string().min(1)
 });
 
-const searchTool: ToolDefinition = {
-  type: "function",
-  function: {
-    name: "search_drive",
-    description:
-      "Search the user's selected Google Drive connections for files relevant to a query.",
-    parameters: {
-      type: "object",
-      properties: {
-        query: {
-          type: "string",
-          description: "A concise Google Drive search query. Try alternate wording when needed."
-        },
-        limit: {
-          type: "number",
-          description: "Maximum results per connected Drive, up to 20."
-        }
-      },
-      required: ["query"],
-      additionalProperties: false
-    }
-  }
-};
-
-const openFileTool: ToolDefinition = {
-  type: "function",
-  function: {
-    name: "open_file",
-    description:
-      "Open and read a file returned by search_drive. Copy connectionId and fileId verbatim from a single search_drive result — never invent, guess, or modify an id, and never pair the connectionId of one file with the fileId of another. connectionId must be one of the selected Drive connection IDs.",
-    parameters: {
-      type: "object",
-      properties: {
-        connectionId: { type: "string" },
-        fileId: { type: "string" }
-      },
-      required: ["connectionId", "fileId"],
-      additionalProperties: false
-    }
-  }
-};
-
-// Curated list mode only. Reads a candidate file and judges its relevance in a
-// single step. Crucially, the file's content is NOT loaded into the main agent's
-// context: review_file opens the file and grades it in an isolated, single-shot
-// model call (see gradeFileRelevance), returning only a compact verdict. This
-// keeps the curating loop's context tiny no matter how many files it reviews,
-// and makes each relevance judgement an independent decision with the model's
-// full attention rather than one made while 14 other files crowd the window.
-const reviewFileTool: ToolDefinition = {
-  type: "function",
-  function: {
-    name: "review_file",
-    description:
-      "Open a file returned by search_drive, read it, and judge whether it is relevant to the query. Relevant files are kept in the curated results automatically; irrelevant ones are discarded. Copy connectionId and fileId verbatim from a single search_drive result — never invent, guess, or modify an id, and never pair the connectionId of one file with the fileId of another. connectionId must be one of the selected Drive connection IDs.",
-    parameters: {
-      type: "object",
-      properties: {
-        connectionId: { type: "string" },
-        fileId: { type: "string" }
-      },
-      required: ["connectionId", "fileId"],
-      additionalProperties: false
-    }
-  }
-};
-
-const baseTools: ToolDefinition[] = [searchTool, openFileTool];
-
 function isCuratingRequest(input: AgentRequest) {
   return input.mode === "list" && input.curateList;
-}
-
-/**
- * Tools offered to the model for a given request. Curated list mode swaps
- * `open_file` for `review_file`: instead of pulling file contents into the
- * agent's context and judging them inline, the model reviews candidates and an
- * isolated grader decides relevance, so curated runs never offer `open_file`.
- */
-function toolsForRequest(input: AgentRequest): ToolDefinition[] {
-  return isCuratingRequest(input) ? [searchTool, reviewFileTool] : baseTools;
 }
 
 export const defaultAgentBudgets: Record<AgentRequest["mode"], AgentBudget> = {
@@ -366,235 +256,49 @@ function safeJson(value: unknown) {
 }
 
 /**
- * Error thrown for a non-OK model HTTP response. Carries whether the status is
- * worth retrying so {@link callModel}'s retry loop can tell a transient 5xx/429
- * (retry) apart from a client 4xx (do not retry).
+ * Log one model step's outcome. The AI SDK drives the loop now, so instead of a
+ * hand-rolled per-attempt logger this runs from `generateText`'s onStepFinish.
+ * Reasoning is read from the SDK's unified `reasoningText` regardless of provider
+ * (OpenAI summaries, Anthropic thinking, Fireworks reasoning_content all land
+ * there); the full untruncated transcript (content + reasoning + tool calls +
+ * raw response body) is emitted only under DEBUG_LOG_TRANSCRIPT. `caller`
+ * separates the main agent (`agent.model.*`) from the curated grader, which logs
+ * its own `agent.grade.*` events.
  */
-class ModelRequestError extends Error {
-  constructor(
-    message: string,
-    readonly retryable: boolean
-  ) {
-    super(message);
-    this.name = "ModelRequestError";
-  }
-}
-
-/**
- * Identifies which logical caller is issuing a model request so its debug-log
- * events stay attributable. The agent makes model calls from two distinct places
- * that must never blur together in a transcript: the main reasoning loop and the
- * isolated per-file relevance grader (curated list mode). They share a requestId
- * and step — and a single step can grade several files — so the caller is what
- * tells them apart.
- */
-type ModelCaller = "agent" | "grader";
-
-/**
- * Debug-log event namespace for a {@link callModel} invocation. The main agent
- * loop logs under `agent.model.*`; the grader logs under `agent.grade.*` so its
- * isolated relevance judgements are never mistaken for the agent's own reasoning
- * turns (and align with the `agent.grade.failed` event the grader already emits).
- */
-export function modelEventPrefix(caller: ModelCaller) {
-  return caller === "grader" ? "agent.grade" : "agent.model";
-}
-
-/**
- * Pull a model turn's chain-of-thought out of whichever field the provider used.
- * Reasoning/thinking models return it separately from `content` (which is null
- * on tool-call turns): Fireworks/DeepSeek/vLLM use `reasoning_content`,
- * OpenRouter and some others use `reasoning`. Returning it lets the transcript
- * log show the rationale regardless of provider; `null` means none was given.
- */
-export function extractReasoningContent(
-  message: { reasoning_content?: string | null; reasoning?: string | null } | undefined
-): string | null {
-  return message?.reasoning_content ?? message?.reasoning ?? null;
-}
-
-/**
- * Build the assistant message replayed into the conversation for the next model
- * call, preserving the turn's chain-of-thought. Reasoning providers (Fireworks
- * et al.) require the prior assistant turn's `reasoning_content` to be sent back
- * so the model thinks *between* tool calls (interleaved thinking) rather than
- * re-reasoning from scratch after each tool result — and that interleaving is
- * exactly this agent's loop, where every follow-up request ends with a `tool`
- * message. The rationale is normalised across provider field names via
- * {@link extractReasoningContent} and re-emitted as `reasoning_content` (the
- * field Fireworks reads). It is included only when present, so turns from
- * non-reasoning models (and providers that never return it) are left untouched
- * and the field is never sent where it would be meaningless.
- */
-export function assistantTurnMessage(
-  message: CompletionMessage
-): Extract<ChatMessage, { role: "assistant" }> {
-  const reasoning = extractReasoningContent(message);
-  return {
-    role: "assistant",
-    content: message.content,
-    tool_calls: message.tool_calls,
-    ...(reasoning !== null ? { reasoning_content: reasoning } : {})
-  };
-}
-
-/**
- * Debug-log attribution for a single {@link callModel} invocation: which caller
- * issued it (so grader calls log distinctly under `agent.grade.*`) and any extra
- * fields merged into every one of that call's events. The grader passes the
- * hashed key of the file it is judging, so a grade's request/completed/
- * transcript/error entries are self-correlating even when several files are
- * graded within one step.
- */
-type ModelCallLog = {
-  caller?: ModelCaller;
-  fields?: Record<string, unknown>;
-};
-
-async function callModel(
-  settings: EffectiveModelSettings,
-  messages: ChatMessage[],
+async function logModelStep(
   requestId: string,
-  step: number,
-  offeredTools: ToolDefinition[] | null = null,
-  log: ModelCallLog = {}
+  settings: { model: string; provider: ModelProvider; source: "default" | "custom" },
+  step: StepResult<ToolSet>
 ) {
-  const startedAt = Date.now();
-  const toolsEnabled = Boolean(offeredTools?.length);
-  // Grader calls log under agent.grade.* (see modelEventPrefix) so they are
-  // never confused with the main agent's agent.model.* turns; logFields tags
-  // every event for this call (e.g. the grader's file hash) for correlation.
-  const eventPrefix = modelEventPrefix(log.caller ?? "agent");
-  const logFields = log.fields ?? {};
-
+  const reasoning = step.reasoningText ?? null;
   await writeDebugLog({
-    event: `${eventPrefix}.request`,
+    event: "agent.model.completed",
     requestId,
-    step,
+    step: step.stepNumber,
     model: settings.model,
+    provider: settings.provider,
     modelSettingsSource: settings.source,
-    messageCount: messages.length,
-    toolsEnabled,
-    ...logFields
+    finishReason: step.finishReason,
+    toolCallCount: step.toolCalls.length,
+    responseContentLength: step.text.length,
+    reasoningContentLength: reasoning?.length ?? 0,
+    warningCount: step.warnings?.length ?? 0
   });
-
-  let lastError: unknown;
-  for (let attempt = 0; attempt <= MODEL_REQUEST_MAX_RETRIES; attempt += 1) {
-    try {
-      const response = await undiciFetch(`${settings.baseUrl.replace(/\/$/, "")}/chat/completions`, {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${settings.apiKey}`,
-          "content-type": "application/json"
-        },
-        // The base URL is validated as a public HTTPS host (see
-        // validatePublicHttpsBaseUrl), but a validated host can still answer with a
-        // redirect to an internal/metadata address (e.g. 169.254.169.254). Refuse to
-        // follow redirects, and for user-supplied endpoints validate the resolved IP
-        // at connect time (ssrfSafeDispatcher) to also close the DNS-rebinding window.
-        redirect: "error",
-        signal: AbortSignal.timeout(MODEL_REQUEST_TIMEOUT_MS),
-        ...(settings.source === "custom" ? { dispatcher: ssrfSafeDispatcher } : {}),
-        body: JSON.stringify({
-          model: settings.model,
-          messages,
-          ...(toolsEnabled ? { tools: offeredTools, tool_choice: "auto" } : {}),
-          temperature: 0.2
-        })
-      });
-      if (!response.ok) {
-        const responseBody = await response.text();
-        await writeDebugLog({
-          event: `${eventPrefix}.failed`,
-          level: "error",
-          requestId,
-          step,
-          model: settings.model,
-          modelSettingsSource: settings.source,
-          status: response.status,
-          durationMs: Date.now() - startedAt,
-          attempt,
-          response: debugText(responseBody),
-          ...logFields
-        });
-        throw new ModelRequestError(
-          `AI request failed with status ${response.status}`,
-          isRetryableModelStatus(response.status)
-        );
-      }
-
-      const completion = (await response.json()) as ChatCompletion;
-      const message = completion.choices[0]?.message;
-      // Reasoning models (e.g. gpt-oss on Fireworks) put their chain-of-thought
-      // in reasoning_content/reasoning, not content — and content is null on
-      // tool-call turns. extractReasoningContent falls back across the field
-      // names so the rationale is captured regardless of provider.
-      const reasoning = extractReasoningContent(message);
-      await writeDebugLog({
-        event: `${eventPrefix}.completed`,
-        requestId,
-        step,
-        model: settings.model,
-        modelSettingsSource: settings.source,
-        durationMs: Date.now() - startedAt,
-        toolCallCount: message?.tool_calls?.length ?? 0,
-        responseContentLength: message?.content?.length ?? 0,
-        reasoningContentLength: reasoning?.length ?? 0,
-        ...logFields
-      });
-      // Full transcript dump (DEBUG_LOG_TRANSCRIPT only): the model's raw,
-      // untruncated reasoning text (reasoningContent) plus the tool calls it
-      // issued this step (names and arguments). This is what makes curation
-      // decisions auditable — e.g. why a file was kept vs. merely reviewed —
-      // which the metadata-only completed event above cannot show. For reasoning
-      // models the rationale lives in reasoningContent since content is null
-      // whenever the model calls a tool, so both fields are logged in full. The
-      // grader logs its own agent.grade.transcript (distinct from the main
-      // agent's agent.model.transcript). Emitted for every model call (every
-      // mode, the grader, and the forced final synthesis turn) and kept
-      // independent of DEBUG_LOG_CONTENT.
-      if (isDebugTranscriptLogEnabled()) {
-        await writeDebugLog({
-          event: `${eventPrefix}.transcript`,
-          requestId,
-          step,
-          model: settings.model,
-          content: message?.content ?? null,
-          reasoningContent: reasoning,
-          toolCalls: (message?.tool_calls ?? []).map((toolCall) => ({
-            name: toolCall.function.name,
-            arguments: toolCall.function.arguments
-          })),
-          ...logFields
-        });
-      }
-      return completion;
-    } catch (error) {
-      lastError = error;
-      // HTTP errors carry their own retryability (4xx no, 5xx/429 yes); network
-      // failures, timeouts, and unparseable bodies are treated as transient.
-      const retryable = error instanceof ModelRequestError ? error.retryable : true;
-      const willRetry = retryable && attempt < MODEL_REQUEST_MAX_RETRIES;
-      await writeDebugLog({
-        event: `${eventPrefix}.error`,
-        level: willRetry ? "warn" : "error",
-        requestId,
-        step,
-        model: settings.model,
-        modelSettingsSource: settings.source,
-        durationMs: Date.now() - startedAt,
-        attempt,
-        willRetry,
-        error: debugError(error),
-        ...logFields
-      });
-      if (!willRetry) throw error;
-    }
+  if (isDebugTranscriptLogEnabled()) {
+    await writeDebugLog({
+      event: "agent.model.transcript",
+      requestId,
+      step: step.stepNumber,
+      model: settings.model,
+      content: step.text || null,
+      reasoningContent: reasoning,
+      toolCalls: step.toolCalls.map((toolCall) => ({
+        name: toolCall.toolName,
+        arguments: JSON.stringify(toolCall.input ?? {})
+      })),
+      responseBody: step.response.body ?? null
+    });
   }
-
-  // The loop returns on success and throws on a final/non-retryable error, so
-  // this only guards the otherwise-unreachable case of exhausting the bound.
-  throw lastError ?? new Error("AI request failed");
 }
 
 /**
@@ -606,96 +310,93 @@ export type GradeVerdict = { relevant: boolean; reason: string };
 
 const MAX_GRADE_REASON_CHARS = 300;
 
+/** Structured verdict the curated grader is asked to produce. */
+const gradeSchema = z.object({
+  relevant: z
+    .boolean()
+    .describe("True if the document would help answer or directly concerns the query."),
+  reason: z.string().optional().describe("One short sentence justifying the decision.")
+});
+
+const GRADE_SYSTEM_PROMPT = `You decide whether a single document is relevant to a user's search query.
+Relevant means the document's content would help answer or directly concerns the query — sharing a keyword alone is not enough.`;
+
 /**
- * Build the isolated conversation used to grade a single file. This is a fresh,
- * minimal context — system instruction plus one user message holding only the
- * query and this one file — so the judgement never sees (or is polluted by) the
- * other files the agent is reviewing. The content is already capped upstream by
- * the Drive reader (MAX_FILE_CHARS), so this stays a small, bounded prompt.
+ * Normalize the grader's structured output into a {@link GradeVerdict}: trim and
+ * cap the reason, and supply a default sentence when the model omits one. Kept
+ * pure (and exported) so the keep/discard + reason behaviour stays unit-testable
+ * without exercising the model call.
  */
-function buildGradeMessages(query: string, file: DriveFile, content: string): ChatMessage[] {
-  return [
-    {
-      role: "system",
-      content: `You decide whether a single document is relevant to a user's search query.
-Relevant means the document's content would help answer or directly concerns the query — sharing a keyword alone is not enough.
-Respond with ONLY a JSON object and nothing else (no prose, no code fences):
-{"relevant": true or false, "reason": "<one short sentence>"}`
-    },
-    {
-      role: "user",
-      content: `Query: ${query}
+export function normalizeGradeVerdict(object: { relevant: boolean; reason?: string | null }): GradeVerdict {
+  const reason =
+    typeof object.reason === "string" && object.reason.trim()
+      ? object.reason.trim().slice(0, MAX_GRADE_REASON_CHARS)
+      : object.relevant
+        ? "Judged relevant."
+        : "Judged not relevant.";
+  return { relevant: object.relevant, reason };
+}
+
+/**
+ * Build the single user prompt for grading one file. A fresh, minimal context —
+ * just the query and this one file — so the judgement is never polluted by the
+ * other files the agent is reviewing. Content is already capped upstream by the
+ * Drive reader (MAX_FILE_CHARS), so this stays a small, bounded prompt.
+ */
+function buildGradePrompt(query: string, file: DriveFile, content: string) {
+  return `Query: ${query}
 
 File name: ${file.name}
 File type: ${formatMimeType(file.mimeType)}
 
 Content:
-${content}`
-    }
-  ];
-}
-
-/**
- * Parse the grader's reply into a verdict. The grader is instructed to return a
- * bare JSON object, but models sometimes wrap it in prose or code fences, so we
- * extract the first JSON object and read `relevant`/`reason` leniently. If the
- * reply cannot be parsed at all, we default to KEEPING the file: a malformed
- * grade should not silently drop a file that might be relevant (favouring recall
- * mirrors the rest of the agent's "return something useful" behaviour), and the
- * reason records that it was a default so the decision stays auditable.
- */
-export function parseGradeResponse(content: string | null): GradeVerdict {
-  const raw = (content ?? "").trim();
-  const match = raw.match(/\{[\s\S]*\}/);
-  if (match) {
-    try {
-      const parsed = JSON.parse(match[0]) as { relevant?: unknown; reason?: unknown };
-      const relevant =
-        parsed.relevant === true || /^(true|yes|relevant)$/i.test(String(parsed.relevant).trim());
-      const reason =
-        typeof parsed.reason === "string" && parsed.reason.trim()
-          ? parsed.reason.trim().slice(0, MAX_GRADE_REASON_CHARS)
-          : relevant
-            ? "Judged relevant."
-            : "Judged not relevant.";
-      return { relevant, reason };
-    } catch {
-      // Fall through to the default-keep behaviour below.
-    }
-  }
-  return { relevant: true, reason: "Relevance grade could not be parsed; kept by default." };
+${content}`;
 }
 
 /**
  * Grade one already-read file against the query using an isolated, single-shot
- * model call (no tools, its own minimal conversation). On any failure — the
- * grader request erroring out after retries, or an unparseable reply — we keep
- * the file rather than abort or drop it, so a transient grader problem degrades
- * to extra recall instead of a missing result.
+ * structured model call (`generateObject`, no tools, its own minimal prompt).
+ * The file's content never enters the main agent loop's context — only this
+ * verdict does. On any failure — the request erroring out after retries, or
+ * output that fails schema validation — we KEEP the file rather than abort or
+ * drop it, so a transient grader problem degrades to extra recall instead of a
+ * missing result. Logs under `agent.grade.*`, distinct from the main loop's
+ * `agent.model.*`, tagged with the file it is judging.
  */
 export async function gradeFileRelevance(
-  modelSettings: EffectiveModelSettings,
+  resolved: ResolvedModel,
   query: string,
   file: DriveFile,
   content: string,
   requestId: string,
   step: number
 ): Promise<GradeVerdict> {
-  // The grader is a separate model call from the main agent loop: route its logs
-  // under agent.grade.* (caller: "grader") and tag every event with the file it
-  // is judging so each grade stays attributable even when several files share a
-  // step.
   const fileKeyHash = hashForDebug(fileKey(file));
   try {
-    const completion = await callModel(
-      modelSettings,
-      buildGradeMessages(query, file, content),
+    const { object } = await generateObject({
+      model: resolved.model,
+      providerOptions: resolved.providerOptions,
+      ...(resolved.temperature !== undefined ? { temperature: resolved.temperature } : {}),
+      maxRetries: MODEL_REQUEST_MAX_RETRIES,
+      schema: gradeSchema,
+      schemaName: "FileRelevance",
+      schemaDescription: "Whether a document is relevant to the user's search query.",
+      system: GRADE_SYSTEM_PROMPT,
+      prompt: buildGradePrompt(query, file, content)
+    });
+    const { relevant, reason } = normalizeGradeVerdict(object);
+    await writeDebugLog({
+      event: "agent.grade.completed",
       requestId,
       step,
-      null,
-      { caller: "grader", fields: { fileKeyHash } }
-    );
-    return parseGradeResponse(completion.choices[0]?.message?.content ?? null);
+      fileKeyHash,
+      relevant,
+      // The grader's justification is auditable (see GradeVerdict); surface it
+      // at the metadata tier (gated via debugText) so a keep/discard decision is
+      // explained even without the full DEBUG_LOG_TRANSCRIPT dump.
+      reason: debugText(reason)
+    });
+    return { relevant, reason };
   } catch (error) {
     await writeDebugLog({
       event: "agent.grade.failed",
@@ -768,15 +469,6 @@ function isRetryableToolError(error: unknown) {
   return /\b(408|409|429|500|502|503|504)\b/.test(error.message);
 }
 
-/**
- * Model-endpoint HTTP statuses worth retrying: 5xx (server-side) and 429 (rate
- * limited). 4xx (bad request, auth, bad config) will not fix themselves, so an
- * identical retry would only fail again.
- */
-export function isRetryableModelStatus(status: number) {
-  return status === 429 || status >= 500;
-}
-
 async function withToolRetries<T>(
   operation: () => Promise<T>,
   retryCount: number
@@ -792,13 +484,6 @@ async function withToolRetries<T>(
   }
   throw lastError;
 }
-
-/**
- * Tool result appended to the chat transcript after a tool call. Each tool
- * handler returns exactly one of these so the main loop can stay a thin
- * dispatcher.
- */
-type ToolResultMessage = Extract<ChatMessage, { role: "tool" }>;
 
 function errorText(error: unknown) {
   return error instanceof Error ? error.message : "unknown error";
@@ -904,6 +589,12 @@ export type AgentRunState = {
   reviewFileCallCount: number;
   lowProgressSearchCount: number;
   stopAfterToolUseReason: string | null;
+  /**
+   * Zero-based index of the step currently executing, set by `prepareStep`
+   * before each step so the tool handlers (which the SDK may run in parallel
+   * within a step) can attribute their debug logs to the right step.
+   */
+  currentStep: number;
 };
 
 /**
@@ -1330,42 +1021,150 @@ export async function handleReviewFileTool(
   };
 }
 
+/** Shared JSON schema for the connectionId/fileId pair open_file and review_file take. */
+const ID_ARGS_SCHEMA = {
+  type: "object",
+  properties: {
+    connectionId: { type: "string" },
+    fileId: { type: "string" }
+  },
+  required: ["connectionId", "fileId"],
+  additionalProperties: false
+};
+
 /**
- * Route one tool call from the model to its handler. Centralised so the run loop
- * stays a thin iterator and — crucially — so every tool call produces a
- * tool-result message, including tool names the model invents. An unanswered
- * tool call leaves the next request a malformed conversation (an assistant
- * `tool_calls` entry with no matching `tool` reply), which providers reject,
- * aborting the run.
+ * Model-facing schema for a tool whose validation is deferred to its handler.
+ * The model still sees the expected shape, but validation is a pass-through so
+ * malformed/extra fields never raise an InvalidToolInputError (which would abort
+ * the SDK's loop). The handler's own `parseToolArgs` does the strict zod check
+ * and returns a recoverable observation on failure — preserving the "bad args ->
+ * retry, never abort" behaviour across every provider, including non-strict ones.
  */
-export async function dispatchToolCall(
+function looseToolSchema(schema: Record<string, unknown>) {
+  return jsonSchema<Record<string, unknown>>(schema as Parameters<typeof jsonSchema>[0], {
+    validate: (value) => ({ success: true, value: (value ?? {}) as Record<string, unknown> })
+  });
+}
+
+/**
+ * Adapt a tested tool handler (written against the OpenAI-style {@link ToolCall}
+ * shape) into an AI SDK tool `execute`. The SDK passes already-parsed `input`,
+ * which we re-serialize so the handler's strict zod validation still runs and
+ * still turns bad arguments into a recoverable observation. The handler's
+ * tool-result `content` (a JSON string) is parsed back into the value returned
+ * to the model. Handlers never throw, so a single bad file/argument can never
+ * abort the run.
+ */
+async function runToolHandler(
+  handler: (
+    context: AgentRunContext,
+    state: AgentRunState,
+    step: number,
+    toolCall: ToolCall
+  ) => Promise<ToolResultMessage>,
   context: AgentRunContext,
   state: AgentRunState,
-  step: number,
-  toolCall: ToolCall
-): Promise<ToolResultMessage> {
-  // The completion is cast from the wire, so the union type does not actually
-  // constrain the runtime value — the model can emit any tool name.
-  const name: string = toolCall.function.name;
-  if (name === "search_drive") return handleSearchTool(context, state, step, toolCall);
-  if (name === "open_file") return handleOpenFileTool(context, state, step, toolCall);
-  if (name === "review_file") return handleReviewFileTool(context, state, step, toolCall);
+  name: ToolCall["function"]["name"],
+  toolCallId: string,
+  input: unknown
+): Promise<unknown> {
+  const toolCall: ToolCall = {
+    id: toolCallId,
+    type: "function",
+    function: { name, arguments: JSON.stringify(input ?? {}) }
+  };
+  const result = await handler(context, state, state.currentStep, toolCall);
+  return JSON.parse(result.content);
+}
 
-  await writeDebugLog({
-    event: "agent.tool.unknown",
-    level: "warn",
-    requestId: context.requestId,
-    step,
-    tool: name,
-    toolCallIdHash: hashForDebug(toolCall.id)
+/**
+ * Build the AI SDK tool set for a run, closing over its context and state.
+ * Curated list mode swaps `open_file` for `review_file` (file contents are graded
+ * in isolation and never enter this loop's context). Each tool defers to its
+ * tested handler via {@link runToolHandler}.
+ */
+function buildAgentTools(context: AgentRunContext, state: AgentRunState): ToolSet {
+  const searchDrive = tool({
+    description:
+      "Search the user's selected Google Drive connections for files relevant to a query.",
+    inputSchema: looseToolSchema({
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description: "A concise Google Drive search query. Try alternate wording when needed."
+        },
+        limit: { type: "number", description: "Maximum results per connected Drive, up to 20." }
+      },
+      required: ["query"],
+      additionalProperties: false
+    }),
+    execute: (input, { toolCallId }) =>
+      runToolHandler(handleSearchTool, context, state, "search_drive", toolCallId, input)
   });
-  const available = toolsForRequest(context.input)
-    .map((tool) => tool.function.name)
-    .join(", ");
-  return toolErrorObservation(
-    toolCall.id,
-    `Unknown tool "${name}". Use only these tools: ${available}.`
-  );
+
+  if (isCuratingRequest(context.input)) {
+    const reviewFile = tool({
+      description:
+        "Open a file returned by search_drive, read it, and judge whether it is relevant to the query. Relevant files are kept in the curated results automatically; irrelevant ones are discarded. Copy connectionId and fileId verbatim from a single search_drive result — never invent, guess, or modify an id, and never pair the connectionId of one file with the fileId of another. connectionId must be one of the selected Drive connection IDs.",
+      inputSchema: looseToolSchema(ID_ARGS_SCHEMA),
+      execute: (input, { toolCallId }) =>
+        runToolHandler(handleReviewFileTool, context, state, "review_file", toolCallId, input)
+    });
+    return { search_drive: searchDrive, review_file: reviewFile };
+  }
+
+  const openFile = tool({
+    description:
+      "Open and read a file returned by search_drive. Copy connectionId and fileId verbatim from a single search_drive result — never invent, guess, or modify an id, and never pair the connectionId of one file with the fileId of another. connectionId must be one of the selected Drive connection IDs.",
+    inputSchema: looseToolSchema(ID_ARGS_SCHEMA),
+    execute: (input, { toolCallId }) =>
+      runToolHandler(handleOpenFileTool, context, state, "open_file", toolCallId, input)
+  });
+  return { search_drive: searchDrive, open_file: openFile };
+}
+
+/**
+ * Force one final, tool-free synthesis turn after the loop ends without a usable
+ * answer (e.g. the step budget was hit mid-tool-use). Without it, a synthesis run
+ * that ran out of steps would return only the raw files read. Reuses the run's
+ * conversation (system + the original question + the SDK's response messages) and
+ * offers no tools, so the model must produce prose. Returns null on failure so
+ * the caller falls back to a partial answer.
+ */
+async function forceSynthesis(
+  resolved: ResolvedModel,
+  systemPromptText: string,
+  userText: string,
+  priorMessages: ModelMessage[],
+  reason: string,
+  requestId: string,
+  logSettings: { model: string; provider: ModelProvider; source: "default" | "custom" }
+): Promise<string | null> {
+  try {
+    const forced = await generateText({
+      model: resolved.model,
+      providerOptions: resolved.providerOptions,
+      ...(resolved.temperature !== undefined ? { temperature: resolved.temperature } : {}),
+      maxRetries: MODEL_REQUEST_MAX_RETRIES,
+      system: systemPromptText,
+      messages: [
+        { role: "user", content: userText },
+        ...priorMessages,
+        { role: "user", content: `${reason} Stop using tools and return the final result now.` }
+      ],
+      onStepFinish: (step) => logModelStep(requestId, logSettings, step)
+    });
+    return forced.text;
+  } catch (error) {
+    await writeDebugLog({
+      event: "agent.final_turn.failed",
+      level: "error",
+      requestId,
+      error: debugError(error)
+    });
+    return null;
+  }
 }
 
 export function parseAgentRequest(value: unknown) {
@@ -1382,6 +1181,12 @@ export async function runDriveAgent(
   const startedAt = Date.now();
   const budget = resolveAgentBudget(input.mode, options.budget);
   const modelSettings = await getEffectiveModelSettings(ownerSub);
+  const resolved = resolveModel(modelSettings);
+  const logSettings = {
+    model: modelSettings.model,
+    provider: modelSettings.provider,
+    source: modelSettings.source
+  };
   await writeDebugLog({
     event: "agent.started",
     requestId,
@@ -1391,6 +1196,7 @@ export async function runDriveAgent(
     requestedDriveCount: input.driveIds.length,
     ownerSubHash: hashForDebug(ownerSub),
     modelSettingsSource: modelSettings.source,
+    provider: modelSettings.provider,
     model: modelSettings.model,
     budget
   });
@@ -1428,7 +1234,7 @@ export async function runDriveAgent(
     requestId,
     emit,
     gradeFile: (file, content, step) =>
-      gradeFileRelevance(modelSettings, input.query, file, content, requestId, step)
+      gradeFileRelevance(resolved, input.query, file, content, requestId, step)
   };
   const state: AgentRunState = {
     referencedFiles: [],
@@ -1444,166 +1250,128 @@ export async function runDriveAgent(
     openFileCallCount: 0,
     reviewFileCallCount: 0,
     lowProgressSearchCount: 0,
-    stopAfterToolUseReason: null
+    stopAfterToolUseReason: null,
+    currentStep: 0
   };
   const curating = isCuratingRequest(input);
-  // In curated mode the curated result is exactly the set of files the grader
-  // kept, built up live as review_file runs rather than parsed from a final
-  // message. An empty kept set is a valid "nothing relevant" result, so there is
-  // no opened-files fallback.
-  const curatedResult = () => uniqueFiles(state.keptFiles);
-  const activeTools = toolsForRequest(input);
-  const messages: ChatMessage[] = [
-    { role: "system", content: systemPrompt(input, selectedDriveIds, budget) },
-    {
-      role: "user",
-      content: `Query: ${input.query}\nMode: ${input.mode}\nCurate list: ${input.curateList}`
-    }
-  ];
-  let stopInstructionSent = false;
+  // In curated mode the result is exactly the set of files the grader kept, built
+  // up live as review_file runs. An empty kept set is a valid "nothing relevant"
+  // result, so there is no opened-files fallback. Uncurated/synthesis runs return
+  // every referenced file.
+  const finalFiles = () =>
+    curating ? uniqueFiles(state.keptFiles) : uniqueFiles(state.referencedFiles);
+  const systemPromptText = systemPrompt(input, selectedDriveIds, budget);
+  const userText = `Query: ${input.query}\nMode: ${input.mode}\nCurate list: ${input.curateList}`;
+  const tools = buildAgentTools(context, state);
+  const stopReason = `Agent stopped after reaching the ${budget.maxToolSteps}-step tool-use budget.`;
 
   await emit({
     type: "progress",
     message: `Agent started with ${selectedDriveIds.length} Drive connection(s).`
   });
 
-  for (let step = 0; step < budget.maxToolSteps; step += 1) {
-    if (state.stopAfterToolUseReason && !stopInstructionSent) {
-      messages.push({
-        role: "user",
-        content: curating
-          ? `${state.stopAfterToolUseReason} Stop searching. Review any remaining promising files with review_file, then reply to finish.`
-          : `${state.stopAfterToolUseReason} Stop using tools and return the final result now.`
-      });
-      stopInstructionSent = true;
-    }
-
-    // Once a budget has forced a stop, drop search so the model winds down
-    // instead of issuing calls that would only be skipped. In curated mode keep
-    // offering review_file so a promising file found right before the stop can
-    // still be reviewed; a review past the review budget just returns a skipped
-    // observation, so this can't run away.
-    const offeredTools = stopInstructionSent
-      ? curating
-        ? [reviewFileTool]
-        : null
-      : activeTools;
-    const completion = await callModel(modelSettings, messages, requestId, step, offeredTools);
-    const message = completion.choices[0]?.message;
-    if (!message) {
-      // A completion with no choices/message is malformed, but aborting would
-      // discard everything gathered so far. Finalize gracefully with the files
-      // already found (plus, in synthesis, a partial-answer note), exactly as
-      // the budget-exhausted path does.
-      const reason = "The AI returned an empty response.";
-      const { answer, answerFormat } = partialAnswer(reason, input.mode);
-      const files = curating ? curatedResult() : uniqueFiles(state.referencedFiles);
-      await writeDebugLog({
-        event: "agent.completed",
-        requestId,
-        reason: "model_returned_no_message",
-        durationMs: Date.now() - startedAt,
-        step,
-        searchCallCount: state.searchCallCount,
-        openFileCallCount: state.openFileCallCount,
-        referencedFileCount: state.referencedFiles.length,
-        keptFileCount: state.keptFiles.length,
-        reviewedFileCount: state.reviewedFiles.length,
-        returnedFileCount: files.length,
-        answerFormat,
-        answerLength: answer.length
-      });
-      await emit({ type: "final", answer, answerFormat, files });
-      return;
-    }
-
-    // Replay the assistant turn — including its reasoning_content — so the model
-    // can continue its chain-of-thought across tool calls (interleaved thinking)
-    // instead of restarting after each tool result. See assistantTurnMessage.
-    messages.push(assistantTurnMessage(message));
-
-    if (!message.tool_calls?.length) {
-      const { answer, answerFormat } = parseFinalAnswer(message.content, input.mode);
-      const files = curating ? curatedResult() : uniqueFiles(state.referencedFiles);
-      await writeDebugLog({
-        event: "agent.completed",
-        requestId,
-        reason: "final_message",
-        durationMs: Date.now() - startedAt,
-        step,
-        searchCallCount: state.searchCallCount,
-        openFileCallCount: state.openFileCallCount,
-        referencedFileCount: state.referencedFiles.length,
-        keptFileCount: state.keptFiles.length,
-        reviewedFileCount: state.reviewedFiles.length,
-        returnedFileCount: files.length,
-        answerFormat,
-        answerLength: answer.length
-      });
-      await emit({ type: "final", answer, answerFormat, files });
-      return;
-    }
-
-    for (const toolCall of message.tool_calls) {
-      messages.push(await dispatchToolCall(context, state, step, toolCall));
-    }
-  }
-
-  const reason = `Agent stopped after reaching the ${budget.maxToolSteps}-step tool-use budget.`;
-
-  // Budget exhausted: force one final, tool-free turn so the agent still
-  // respects the requested mode. Without this, synthesis runs that ran out of
-  // steps would skip synthesis and return only the raw list of files read.
-  // List mode needs no model turn: un-curated returns the files found, and
-  // curated returns the files the grader already kept live via review_file. So
-  // only synthesis needs the extra call.
-  const needsFinalModelTurn = input.mode === "synthesis";
-  let finalContent: string | null = null;
-  if (needsFinalModelTurn) {
-    messages.push({
-      role: "user",
-      content: `${reason} Stop using tools and return the final result now.`
+  try {
+    // The SDK drives the whole multi-step tool loop: it appends each assistant
+    // turn (carrying reasoning, round-tripped automatically per provider) and the
+    // tool results, re-prompts, and stops at the step budget. Our per-tool
+    // budgets/dedup/emit and the run-resilience invariant live inside the tool
+    // handlers (see buildAgentTools); state is mutated in place so a throw can
+    // still finalize with whatever was gathered.
+    const result = await generateText({
+      model: resolved.model,
+      providerOptions: resolved.providerOptions,
+      ...(resolved.temperature !== undefined ? { temperature: resolved.temperature } : {}),
+      maxRetries: MODEL_REQUEST_MAX_RETRIES,
+      system: systemPromptText,
+      messages: [{ role: "user", content: userText }],
+      tools,
+      toolChoice: "auto",
+      stopWhen: stepCountIs(budget.maxToolSteps),
+      // Set the step index before each step (so the possibly-parallel tool
+      // executes can attribute their logs) and gate tools once a budget forces a
+      // stop: drop search so the model winds down, but in curated mode keep
+      // review_file so a promising file found just before the stop is still
+      // reviewable (a review past budget just returns a skipped observation).
+      prepareStep: ({ stepNumber }) => {
+        state.currentStep = stepNumber;
+        if (!state.stopAfterToolUseReason) return undefined;
+        return { activeTools: curating ? ["review_file"] : [] };
+      },
+      onStepFinish: (step) => logModelStep(requestId, logSettings, step)
     });
-    try {
-      const completion = await callModel(
-        modelSettings,
-        messages,
-        requestId,
-        budget.maxToolSteps,
-        null
-      );
-      finalContent = completion.choices[0]?.message?.content ?? null;
-    } catch (error) {
-      await writeDebugLog({
-        event: "agent.final_turn.failed",
-        level: "error",
-        requestId,
-        durationMs: Date.now() - startedAt,
-        error: debugError(error)
-      });
-    }
-  }
 
-  const { answer, answerFormat } =
-    finalContent !== null
-      ? parseFinalAnswer(finalContent, input.mode)
-      : partialAnswer(reason, input.mode);
-  const files = curating ? curatedResult() : uniqueFiles(state.referencedFiles);
-  await writeDebugLog({
-    event: "agent.completed",
-    requestId,
-    reason: "max_tool_steps_reached",
-    durationMs: Date.now() - startedAt,
-    finalModelTurn: needsFinalModelTurn,
-    forcedFinalAnswer: finalContent !== null,
-    searchCallCount: state.searchCallCount,
-    openFileCallCount: state.openFileCallCount,
-    referencedFileCount: state.referencedFiles.length,
-    keptFileCount: state.keptFiles.length,
-    reviewedFileCount: state.reviewedFiles.length,
-    returnedFileCount: files.length,
-    answerFormat,
-    answerLength: answer.length
-  });
-  await emit({ type: "final", answer, answerFormat, files });
+    // List mode answers are always empty (results come from state). For synthesis,
+    // use the model's text; if the loop hit the step cap mid-tool-use (no text),
+    // force one tool-free turn so we still synthesize instead of returning blank.
+    let finalText: string | null = result.text;
+    let forcedFinalAnswer = false;
+    if (input.mode === "synthesis" && !result.text.trim()) {
+      finalText = await forceSynthesis(
+        resolved,
+        systemPromptText,
+        userText,
+        result.response.messages,
+        stopReason,
+        requestId,
+        logSettings
+      );
+      forcedFinalAnswer = finalText !== null;
+    }
+
+    const { answer, answerFormat } =
+      finalText !== null && finalText.trim()
+        ? parseFinalAnswer(finalText, input.mode)
+        : partialAnswer(stopReason, input.mode);
+    const files = finalFiles();
+    await writeDebugLog({
+      event: "agent.completed",
+      requestId,
+      reason: result.finishReason,
+      durationMs: Date.now() - startedAt,
+      steps: result.steps.length,
+      forcedFinalAnswer,
+      searchCallCount: state.searchCallCount,
+      openFileCallCount: state.openFileCallCount,
+      reviewFileCallCount: state.reviewFileCallCount,
+      referencedFileCount: state.referencedFiles.length,
+      keptFileCount: state.keptFiles.length,
+      reviewedFileCount: state.reviewedFiles.length,
+      returnedFileCount: files.length,
+      answerFormat,
+      answerLength: answer.length
+    });
+    await emit({ type: "final", answer, answerFormat, files });
+  } catch (error) {
+    // Never discard gathered work: a throw (model error after retries, an
+    // unrepairable/hallucinated tool call, a timeout) finalizes with whatever the
+    // in-place state already collected — mirroring the old empty-response path.
+    await writeDebugLog({
+      event: "agent.run.error",
+      level: "error",
+      requestId,
+      durationMs: Date.now() - startedAt,
+      error: debugError(error)
+    });
+    const { answer, answerFormat } = partialAnswer(
+      "The agent run ended early due to an error.",
+      input.mode
+    );
+    const files = finalFiles();
+    await writeDebugLog({
+      event: "agent.completed",
+      requestId,
+      reason: "run_error",
+      durationMs: Date.now() - startedAt,
+      searchCallCount: state.searchCallCount,
+      openFileCallCount: state.openFileCallCount,
+      reviewFileCallCount: state.reviewFileCallCount,
+      referencedFileCount: state.referencedFiles.length,
+      keptFileCount: state.keptFiles.length,
+      reviewedFileCount: state.reviewedFiles.length,
+      returnedFileCount: files.length,
+      answerFormat,
+      answerLength: answer.length
+    });
+    await emit({ type: "final", answer, answerFormat, files });
+  }
 }
