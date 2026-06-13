@@ -1,0 +1,24 @@
+import { getServerSession } from "next-auth";
+import { authOptions } from "@/lib/auth";
+import { listDriveConnections } from "@/lib/drive-connections";
+import { SearchApp } from "@/components/search-app";
+
+export default async function Home() {
+  const session = await getServerSession(authOptions);
+  const connections = session?.user?.id ? await listDriveConnections(session.user.id) : [];
+
+  return (
+    <SearchApp
+      user={
+        session?.user
+          ? {
+              name: session.user.name ?? null,
+              email: session.user.email ?? null,
+              image: session.user.image ?? null
+            }
+          : null
+      }
+      initialConnections={connections}
+    />
+  );
+}

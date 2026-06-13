@@ -1,0 +1,58 @@
+# Stateless GDrive Search
+
+A production-oriented Next.js app for Google-login users to connect one or more Google Drive accounts and query them with a constrained AI agent.
+
+The agent has exactly two app tools:
+
+- `search_drive`: search connected Google Drives with read-only Drive scopes.
+- `open_file`: read a selected file's contents.
+
+The only durable application data is encrypted Google Drive OAuth token material and its metadata.
+
+## Stack
+
+- Next.js App Router and TypeScript
+- NextAuth Google login with stateless JWT sessions
+- PostgreSQL for encrypted Drive OAuth tokens only
+- Google Drive REST API with read-only scopes
+- OpenAI-compatible Chat Completions tool calling
+
+## Environment
+
+Copy `.env.example` to `.env.local` and fill in:
+
+```bash
+NEXTAUTH_URL=http://localhost:3000
+NEXTAUTH_SECRET=replace-with-32+-random-bytes
+GOOGLE_CLIENT_ID=...
+GOOGLE_CLIENT_SECRET=...
+DATABASE_URL=postgres://user:password@localhost:5432/stateless_gdrive_search
+TOKEN_ENCRYPTION_KEY=base64-encoded-32-byte-key
+AI_API_KEY=...
+AI_BASE_URL=https://api.openai.com/v1
+AI_MODEL=gpt-4.1-mini
+```
+
+Create the database table:
+
+```bash
+psql "$DATABASE_URL" -f db/schema.sql
+```
+
+Run locally:
+
+```bash
+npm install
+npm run dev
+```
+
+## Google OAuth setup
+
+Create one Google OAuth client. Add these redirect URIs:
+
+- `http://localhost:3000/api/auth/callback/google`
+- `http://localhost:3000/api/drive/oauth/callback`
+
+For production, add the same paths on your deployed hostname.
+
+The login flow requests `openid email profile`. The Drive connection flow requests `openid email profile https://www.googleapis.com/auth/drive.metadata.readonly https://www.googleapis.com/auth/drive.readonly`.

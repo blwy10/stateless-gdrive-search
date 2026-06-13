@@ -1,0 +1,270 @@
+import JSZip from "jszip";
+import mammoth from "mammoth";
+import pdfParse from "pdf-parse";
+import {
+  getDriveConnection,
+  updateDriveAccessToken,
+  type DriveConnection
+} from "@/lib/drive-connections";
+import { expiresAtFromNow, refreshDriveToken } from "@/lib/google-oauth";
+
+export type DriveFile = {
+  connectionId: string;
+  driveEmail: string;
+  id: string;
+  name: string;
+  mimeType: string;
+  webViewLink?: string;
+  modifiedTime?: string;
+  size?: string;
+};
+
+const MAX_FILE_CHARS = 32_000;
+
+function escapeDriveQuery(value: string) {
+  return value.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+}
+
+async function ensureAccessToken(connection: DriveConnection): Promise<DriveConnection> {
+  if (!connection.expiresAt || connection.expiresAt.getTime() > Date.now() + 30_000) {
+    return connection;
+  }
+  if (!connection.refreshToken) {
+    throw new Error(`Drive ${connection.driveEmail} has no refresh token; reconnect it.`);
+  }
+  const refreshed = await refreshDriveToken(connection.refreshToken);
+  const expiresAt = expiresAtFromNow(refreshed.expires_in);
+  await updateDriveAccessToken({
+    id: connection.id,
+    ownerSub: connection.ownerSub,
+    accessToken: refreshed.access_token,
+    expiresAt,
+    scope: refreshed.scope
+  });
+  return {
+    ...connection,
+    accessToken: refreshed.access_token,
+    expiresAt,
+    scope: refreshed.scope ?? connection.scope
+  };
+}
+
+async function googleFetch(connection: DriveConnection, url: URL) {
+  const active = await ensureAccessToken(connection);
+  const response = await fetch(url, {
+    headers: { authorization: `Bearer ${active.accessToken}` }
+  });
+  if (!response.ok) {
+    throw new Error(`Google Drive request failed: ${response.status} ${await response.text()}`);
+  }
+  return response;
+}
+
+export async function searchDriveFiles(input: {
+  ownerSub: string;
+  connectionIds: string[];
+  query: string;
+  limit?: number;
+}): Promise<DriveFile[]> {
+  const query = escapeDriveQuery(input.query.trim());
+  const limit = Math.min(input.limit ?? 10, 20);
+  const files: DriveFile[] = [];
+
+  for (const connectionId of input.connectionIds) {
+    const connection = await getDriveConnection(input.ownerSub, connectionId);
+    if (!connection) continue;
+    const url = new URL("https://www.googleapis.com/drive/v3/files");
+    url.searchParams.set(
+      "q",
+      `trashed = false and (name contains '${query}' or fullText contains '${query}')`
+    );
+    url.searchParams.set("pageSize", String(limit));
+    url.searchParams.set(
+      "fields",
+      "files(id,name,mimeType,webViewLink,modifiedTime,size)"
+    );
+    url.searchParams.set("supportsAllDrives", "true");
+    url.searchParams.set("includeItemsFromAllDrives", "true");
+    const response = await googleFetch(connection, url);
+    const data = (await response.json()) as { files?: Omit<DriveFile, "connectionId" | "driveEmail">[] };
+    for (const file of data.files ?? []) {
+      files.push({
+        ...file,
+        connectionId,
+        driveEmail: connection.driveEmail
+      });
+    }
+  }
+
+  return files;
+}
+
+async function getDriveFileMetadata(connection: DriveConnection, fileId: string) {
+  const url = new URL(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}`);
+  url.searchParams.set("fields", "id,name,mimeType,webViewLink,modifiedTime,size");
+  url.searchParams.set("supportsAllDrives", "true");
+  const response = await googleFetch(connection, url);
+  return (await response.json()) as Omit<DriveFile, "connectionId" | "driveEmail">;
+}
+
+async function downloadBuffer(connection: DriveConnection, fileId: string) {
+  const url = new URL(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}`);
+  url.searchParams.set("alt", "media");
+  url.searchParams.set("supportsAllDrives", "true");
+  const response = await googleFetch(connection, url);
+  return Buffer.from(await response.arrayBuffer());
+}
+
+async function exportBuffer(connection: DriveConnection, fileId: string, mimeType: string) {
+  const url = new URL(
+    `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}/export`
+  );
+  url.searchParams.set("mimeType", mimeType);
+  const response = await googleFetch(connection, url);
+  return Buffer.from(await response.arrayBuffer());
+}
+
+async function extractPptxText(buffer: Buffer) {
+  const zip = await JSZip.loadAsync(buffer);
+  const slidePaths = Object.keys(zip.files)
+    .filter((path) => /^ppt\/slides\/slide\d+\.xml$/.test(path))
+    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+  const chunks: string[] = [];
+  for (const path of slidePaths) {
+    const xml = await zip.files[path].async("text");
+    const text = [...xml.matchAll(/<a:t>(.*?)<\/a:t>/g)]
+      .map((match) =>
+        match[1]
+          .replace(/&amp;/g, "&")
+          .replace(/&lt;/g, "<")
+          .replace(/&gt;/g, ">")
+          .replace(/&quot;/g, '"')
+          .replace(/&apos;/g, "'")
+      )
+      .join(" ");
+    if (text.trim()) chunks.push(text);
+  }
+  return chunks.join("\n\n");
+}
+
+function xmlText(value: string) {
+  return value
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'");
+}
+
+async function extractXlsxText(buffer: Buffer) {
+  const zip = await JSZip.loadAsync(buffer);
+  const sharedStringsXml = zip.files["xl/sharedStrings.xml"]
+    ? await zip.files["xl/sharedStrings.xml"].async("text")
+    : "";
+  const sharedStrings = [...sharedStringsXml.matchAll(/<si>([\s\S]*?)<\/si>/g)].map((match) =>
+    [...match[1].matchAll(/<t[^>]*>([\s\S]*?)<\/t>/g)]
+      .map((textMatch) => xmlText(textMatch[1]))
+      .join("")
+  );
+
+  const sheetNames = new Map<string, string>();
+  if (zip.files["xl/workbook.xml"]) {
+    const workbookXml = await zip.files["xl/workbook.xml"].async("text");
+    for (const match of workbookXml.matchAll(/<sheet[^>]*name="([^"]+)"[^>]*sheetId="([^"]+)"/g)) {
+      sheetNames.set(`xl/worksheets/sheet${match[2]}.xml`, xmlText(match[1]));
+    }
+  }
+
+  const sheetPaths = Object.keys(zip.files)
+    .filter((path) => /^xl\/worksheets\/sheet\d+\.xml$/.test(path))
+    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+  const chunks: string[] = [];
+  for (const path of sheetPaths) {
+    const xml = await zip.files[path].async("text");
+    const rows: string[] = [];
+    for (const rowMatch of xml.matchAll(/<row[^>]*>([\s\S]*?)<\/row>/g)) {
+      const cells = [...rowMatch[1].matchAll(/<c([^>]*)>([\s\S]*?)<\/c>/g)].map(
+        (cellMatch) => {
+          const attrs = cellMatch[1];
+          const cellXml = cellMatch[2];
+          const inline = cellXml.match(/<t[^>]*>([\s\S]*?)<\/t>/)?.[1];
+          if (inline) return xmlText(inline);
+          const raw = cellXml.match(/<v>([\s\S]*?)<\/v>/)?.[1] ?? "";
+          if (attrs.includes('t="s"')) return sharedStrings[Number(raw)] ?? "";
+          return xmlText(raw);
+        }
+      );
+      if (cells.some(Boolean)) rows.push(cells.join(","));
+    }
+    chunks.push(`Sheet: ${sheetNames.get(path) ?? path}\n${rows.join("\n")}`);
+  }
+  return chunks.join("\n\n");
+}
+
+function trimContent(content: string) {
+  const normalized = content.replace(/\u0000/g, "").trim();
+  if (normalized.length <= MAX_FILE_CHARS) return normalized;
+  return `${normalized.slice(0, MAX_FILE_CHARS)}\n\n[Truncated at ${MAX_FILE_CHARS} characters]`;
+}
+
+export async function openDriveFile(input: {
+  ownerSub: string;
+  connectionId: string;
+  fileId: string;
+}): Promise<{ file: DriveFile; content: string }> {
+  const connection = await getDriveConnection(input.ownerSub, input.connectionId);
+  if (!connection) {
+    throw new Error("Drive connection not found");
+  }
+
+  const metadata = await getDriveFileMetadata(connection, input.fileId);
+  let content: string;
+
+  switch (metadata.mimeType) {
+    case "application/vnd.google-apps.document":
+      content = (await exportBuffer(connection, input.fileId, "text/plain")).toString("utf8");
+      break;
+    case "application/vnd.google-apps.spreadsheet":
+      content = (await exportBuffer(connection, input.fileId, "text/csv")).toString("utf8");
+      break;
+    case "application/vnd.google-apps.presentation":
+      content = (await exportBuffer(connection, input.fileId, "text/plain")).toString("utf8");
+      break;
+    case "application/pdf":
+      content = (await pdfParse(await downloadBuffer(connection, input.fileId))).text;
+      break;
+    case "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+    case "application/msword":
+      content = (await mammoth.extractRawText({ buffer: await downloadBuffer(connection, input.fileId) }))
+        .value;
+      break;
+    case "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":
+      content = await extractXlsxText(await downloadBuffer(connection, input.fileId));
+      break;
+    case "application/vnd.ms-excel":
+      content =
+        "Legacy .xls parsing is not enabled. Export this file to .xlsx or Google Sheets to read it.";
+      break;
+    case "application/vnd.openxmlformats-officedocument.presentationml.presentation":
+    case "application/vnd.ms-powerpoint":
+      content = await extractPptxText(await downloadBuffer(connection, input.fileId));
+      break;
+    case "text/plain":
+    case "text/markdown":
+    case "text/csv":
+    case "application/json":
+      content = (await downloadBuffer(connection, input.fileId)).toString("utf8");
+      break;
+    default:
+      content = (await downloadBuffer(connection, input.fileId)).toString("utf8");
+  }
+
+  return {
+    file: {
+      ...metadata,
+      connectionId: connection.id,
+      driveEmail: connection.driveEmail
+    },
+    content: trimContent(content)
+  };
+}
