@@ -1,7 +1,8 @@
 import { z } from "zod";
 import { listDriveConnections } from "@/lib/drive-connections";
 import { openDriveFile, searchDriveFiles, type DriveFile } from "@/lib/drive";
-import { env } from "@/lib/env";
+import { formatMimeType } from "@/lib/file-types";
+import { getEffectiveModelSettings, type EffectiveModelSettings } from "@/lib/model-settings";
 import {
   createDebugRequestId,
   debugError,
@@ -207,27 +208,32 @@ function safeJson(value: unknown) {
   return JSON.stringify(value, null, 2);
 }
 
-async function callModel(messages: ChatMessage[], requestId: string, step: number) {
+async function callModel(
+  settings: EffectiveModelSettings,
+  messages: ChatMessage[],
+  requestId: string,
+  step: number
+) {
   const startedAt = Date.now();
-  const model = env.aiModel();
 
   await writeDebugLog({
     event: "agent.model.request",
     requestId,
     step,
-    model,
+    model: settings.model,
+    modelSettingsSource: settings.source,
     messageCount: messages.length
   });
 
   try {
-    const response = await fetch(`${env.aiBaseUrl().replace(/\/$/, "")}/chat/completions`, {
+    const response = await fetch(`${settings.baseUrl.replace(/\/$/, "")}/chat/completions`, {
       method: "POST",
       headers: {
-        authorization: `Bearer ${env.aiApiKey()}`,
+        authorization: `Bearer ${settings.apiKey}`,
         "content-type": "application/json"
       },
       body: JSON.stringify({
-        model,
+        model: settings.model,
         messages,
         tools,
         tool_choice: "auto",
@@ -241,12 +247,13 @@ async function callModel(messages: ChatMessage[], requestId: string, step: numbe
         level: "error",
         requestId,
         step,
-        model,
+        model: settings.model,
+        modelSettingsSource: settings.source,
         status: response.status,
         durationMs: Date.now() - startedAt,
         response: debugText(responseBody)
       });
-      throw new Error(`AI request failed: ${response.status} ${responseBody}`);
+      throw new Error(`AI request failed with status ${response.status}`);
     }
 
     const completion = (await response.json()) as ChatCompletion;
@@ -255,7 +262,8 @@ async function callModel(messages: ChatMessage[], requestId: string, step: numbe
       event: "agent.model.completed",
       requestId,
       step,
-      model,
+      model: settings.model,
+      modelSettingsSource: settings.source,
       durationMs: Date.now() - startedAt,
       toolCallCount: message?.tool_calls?.length ?? 0,
       responseContentLength: message?.content?.length ?? 0
@@ -267,7 +275,8 @@ async function callModel(messages: ChatMessage[], requestId: string, step: numbe
       level: "error",
       requestId,
       step,
-      model,
+      model: settings.model,
+      modelSettingsSource: settings.source,
       durationMs: Date.now() - startedAt,
       error: debugError(error)
     });
@@ -287,6 +296,10 @@ function uniqueFiles(files: DriveFile[]) {
 
 function fileKey(file: Pick<DriveFile, "connectionId" | "id">) {
   return `${file.connectionId}:${file.id}`;
+}
+
+function formatFileProgressLabel(file: DriveFile) {
+  return `${formatMimeType(file.mimeType)} "${file.name}"`;
 }
 
 function normalizeSearchQuery(query: string) {
@@ -385,6 +398,7 @@ export async function runDriveAgent(
   const requestId = createDebugRequestId("agent");
   const startedAt = Date.now();
   const budget = resolveAgentBudget(input.mode, options.budget);
+  const modelSettings = await getEffectiveModelSettings(ownerSub);
   await writeDebugLog({
     event: "agent.started",
     requestId,
@@ -393,6 +407,8 @@ export async function runDriveAgent(
     query: debugText(input.query),
     requestedDriveCount: input.driveIds.length,
     ownerSubHash: hashForDebug(ownerSub),
+    modelSettingsSource: modelSettings.source,
+    model: modelSettings.model,
     budget
   });
 
@@ -453,7 +469,7 @@ export async function runDriveAgent(
       stopInstructionSent = true;
     }
 
-    const completion = await callModel(messages, requestId, step);
+    const completion = await callModel(modelSettings, messages, requestId, step);
     const message = completion.choices[0]?.message;
     if (!message) {
       await writeDebugLog({
@@ -659,7 +675,6 @@ export async function runDriveAgent(
           continue;
         }
 
-        await emit({ type: "progress", message: `Opening file ${args.fileId}` });
         openFileCallCount += 1;
         openedFileKeys.add(key);
         const toolStartedAt = Date.now();
@@ -701,6 +716,7 @@ export async function runDriveAgent(
         knownFileKeys.add(fileKey(opened.file));
         referencedFiles.push(opened.file);
         openedFiles.push(opened.file);
+        await emit({ type: "progress", message: `Opened ${formatFileProgressLabel(opened.file)}` });
         await emit({ type: "file", file: opened.file });
         messages.push({
           role: "tool",

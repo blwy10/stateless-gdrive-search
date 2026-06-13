@@ -7,7 +7,8 @@ The agent has exactly two app tools:
 - `search_drive`: search connected Google Drives with read-only Drive scopes.
 - `open_file`: read a selected file's contents.
 
-The only durable application data is encrypted Google Drive OAuth token material and its metadata.
+Durable application data is limited to encrypted Google Drive OAuth token material,
+optional encrypted per-user model API keys, and their metadata.
 
 ## Stack
 

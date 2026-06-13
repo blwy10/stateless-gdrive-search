@@ -1,7 +1,15 @@
 "use client";
 
+import { formatMimeType } from "@/lib/file-types";
 import { signIn, signOut } from "next-auth/react";
-import { useEffect, useMemo, useState, type CSSProperties, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+  type CSSProperties,
+  type ReactNode
+} from "react";
 
 type User = {
   name: string | null;
@@ -17,6 +25,14 @@ type DriveConnection = {
   scope: string;
   createdAt: string;
   updatedAt: string;
+};
+
+type ModelSettingsSummary = {
+  hasCustomModel: boolean;
+  apiKeyConfigured: boolean;
+  baseUrl: string | null;
+  model: string | null;
+  updatedAt: string | null;
 };
 
 type DriveFile = {
@@ -56,12 +72,17 @@ const STORAGE_KEY = "stateless-gdrive-search:queries:v1";
 
 export function SearchApp({
   user,
-  initialConnections
+  initialConnections,
+  initialModelSettings
 }: {
   user: User | null;
   initialConnections: DriveConnection[];
+  initialModelSettings: ModelSettingsSummary | null;
 }) {
   const [connections, setConnections] = useState(initialConnections);
+  const [modelSettings, setModelSettings] = useState<ModelSettingsSummary | null>(
+    initialModelSettings
+  );
   const [selectedDrive, setSelectedDrive] = useState("all");
   const [mode, setMode] = useState<"synthesis" | "list">("synthesis");
   const [curateList, setCurateList] = useState(false);
@@ -69,6 +90,14 @@ export function SearchApp({
   const [sessions, setSessions] = useState<QuerySession[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [hasLoadedSessions, setHasLoadedSessions] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsBaseUrl, setSettingsBaseUrl] = useState("");
+  const [settingsModel, setSettingsModel] = useState("");
+  const [settingsApiKey, setSettingsApiKey] = useState("");
+  const [settingsMessage, setSettingsMessage] = useState("");
+  const [settingsError, setSettingsError] = useState("");
+  const [settingsSaving, setSettingsSaving] = useState(false);
+  const [progressOpen, setProgressOpen] = useState(false);
 
   useEffect(() => {
     try {
@@ -126,6 +155,7 @@ export function SearchApp({
   }, [activeSession]);
 
   const runningSessionCount = sessions.filter((session) => session.status === "running").length;
+  const hasCustomModel = modelSettings?.hasCustomModel ?? false;
 
   const statusState = activeSession?.status === "running"
     ? "running"
@@ -170,6 +200,103 @@ export function SearchApp({
   async function disconnectDrive(id: string) {
     await fetch(`/api/drive/connections?id=${encodeURIComponent(id)}`, { method: "DELETE" });
     await refreshConnections();
+  }
+
+  const resetSettingsDraft = useCallback((settings: ModelSettingsSummary | null) => {
+    setSettingsBaseUrl(settings?.hasCustomModel ? (settings.baseUrl ?? "") : "");
+    setSettingsModel(settings?.hasCustomModel ? (settings.model ?? "") : "");
+    setSettingsApiKey("");
+    setSettingsMessage("");
+    setSettingsError("");
+  }, []);
+
+  function openSettings() {
+    resetSettingsDraft(modelSettings);
+    setSettingsOpen(true);
+  }
+
+  const closeSettings = useCallback(() => {
+    resetSettingsDraft(modelSettings);
+    setSettingsOpen(false);
+  }, [modelSettings, resetSettingsDraft]);
+
+  useEffect(() => {
+    if (!settingsOpen) return;
+
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        closeSettings();
+      }
+    }
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [settingsOpen, closeSettings]);
+
+  async function saveModelSettings() {
+    setSettingsSaving(true);
+    setSettingsMessage("");
+    setSettingsError("");
+
+    try {
+      const body: { baseUrl: string; model: string; apiKey?: string } = {
+        baseUrl: settingsBaseUrl,
+        model: settingsModel
+      };
+      if (settingsApiKey.trim()) {
+        body.apiKey = settingsApiKey;
+      }
+
+      const response = await fetch("/api/settings/model", {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      const data = (await response.json()) as {
+        settings?: ModelSettingsSummary;
+        error?: string;
+      };
+      if (!response.ok || !data.settings) {
+        throw new Error(data.error || "Unable to save model settings");
+      }
+
+      setModelSettings(data.settings);
+      setSettingsBaseUrl(data.settings.baseUrl ?? "");
+      setSettingsModel(data.settings.model ?? "");
+      setSettingsApiKey("");
+      setSettingsMessage("Custom model settings saved.");
+    } catch (caught) {
+      setSettingsError(caught instanceof Error ? caught.message : "Unable to save model settings");
+    } finally {
+      setSettingsSaving(false);
+    }
+  }
+
+  async function deleteModelSettings() {
+    setSettingsSaving(true);
+    setSettingsMessage("");
+    setSettingsError("");
+
+    try {
+      const response = await fetch("/api/settings/model", { method: "DELETE" });
+      const data = (await response.json()) as {
+        settings?: ModelSettingsSummary;
+        error?: string;
+      };
+      if (!response.ok || !data.settings) {
+        throw new Error(data.error || "Unable to delete model settings");
+      }
+
+      setModelSettings(data.settings);
+      setSettingsBaseUrl("");
+      setSettingsModel("");
+      setSettingsApiKey("");
+      setSettingsMessage("Default provider restored.");
+    } catch (caught) {
+      setSettingsError(caught instanceof Error ? caught.message : "Unable to delete model settings");
+    } finally {
+      setSettingsSaving(false);
+    }
   }
 
   function newQuery() {
@@ -231,6 +358,7 @@ export function SearchApp({
     setMode(session.mode);
     setCurateList(session.curateList);
     setSelectedDrive(session.selectedDrive);
+    setProgressOpen(session.status === "running");
   }
 
   function updateQuery(value: string) {
@@ -320,6 +448,7 @@ export function SearchApp({
 
     setActiveSessionId(session.id);
     upsertSession(session);
+    setProgressOpen(true);
     let receivedTerminalEvent = false;
 
     try {
@@ -372,6 +501,7 @@ export function SearchApp({
             );
           } else if (event.type === "final") {
             receivedTerminalEvent = true;
+            setProgressOpen(false);
             setSessions((current) =>
               current.map((item) =>
                 item.id === session.id
@@ -444,6 +574,9 @@ export function SearchApp({
           {user ? (
             <div className="button-row">
               <span className="muted">{user.email}</span>
+              <button className="button secondary" type="button" onClick={openSettings}>
+                Settings
+              </button>
               <button className="button secondary" type="button" onClick={() => signOut()}>
                 Sign out
               </button>
@@ -468,6 +601,151 @@ export function SearchApp({
           </section>
         ) : (
           <>
+            {settingsOpen ? (
+              <section className="settings-panel" aria-labelledby="settings-title">
+                <div className="settings-backdrop" onClick={closeSettings} />
+                <div className="settings-dialog">
+                  <div className="panel-header">
+                    <h2 id="settings-title">Settings</h2>
+                    <button
+                      className="icon-button"
+                      type="button"
+                      aria-label="Close settings"
+                      onClick={closeSettings}
+                    >
+                      <svg
+                        aria-hidden="true"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        strokeWidth="2.4"
+                      >
+                        <path d="M18 6 6 18" />
+                        <path d="m6 6 12 12" />
+                      </svg>
+                    </button>
+                  </div>
+                  <div className="panel-body form-grid">
+                    <section className="settings-current-provider" aria-labelledby="current-provider-title">
+                      <div className="settings-section-heading">
+                        <h3 id="current-provider-title">Current provider</h3>
+                        <span className={`provider-badge ${hasCustomModel ? "custom" : "default"}`}>
+                          {hasCustomModel ? "Custom" : "Default"}
+                        </span>
+                      </div>
+                      <p>
+                        {hasCustomModel
+                          ? "Searches are using your saved endpoint and model."
+                          : "Searches are using the app-managed model provider."}
+                      </p>
+                      {hasCustomModel ? (
+                        <dl className="provider-details">
+                          <div>
+                            <dt>Endpoint</dt>
+                            <dd>{modelSettings?.baseUrl}</dd>
+                          </div>
+                          <div>
+                            <dt>Model</dt>
+                            <dd>{modelSettings?.model}</dd>
+                          </div>
+                          <div>
+                            <dt>API key</dt>
+                            <dd>Configured</dd>
+                          </div>
+                        </dl>
+                      ) : null}
+                    </section>
+
+                    <div className="settings-note">
+                      API keys are write-only. After saving, the key cannot be viewed here again.
+                    </div>
+
+                    <section className="settings-form-section" aria-labelledby="custom-provider-title">
+                      <div className="settings-section-heading">
+                        <h3 id="custom-provider-title">Custom provider</h3>
+                      </div>
+                      <p className="settings-help">
+                        {hasCustomModel
+                          ? "Update your saved OpenAI-compatible endpoint, model, or API key."
+                          : "Add your own OpenAI-compatible endpoint, model, and API key."}
+                      </p>
+
+                    <div className="field">
+                      <label htmlFor="model-base-url">OpenAI-compatible endpoint</label>
+                      <input
+                        id="model-base-url"
+                        type="url"
+                        value={settingsBaseUrl}
+                        onChange={(event) => setSettingsBaseUrl(event.target.value)}
+                        placeholder="https://api.openai.com/v1"
+                      />
+                    </div>
+
+                    <div className="field">
+                      <label htmlFor="model-name">Model name</label>
+                      <input
+                        id="model-name"
+                        value={settingsModel}
+                        onChange={(event) => setSettingsModel(event.target.value)}
+                        placeholder="gpt-4.1-mini"
+                      />
+                    </div>
+
+                    <div className="field">
+                      <label htmlFor="model-api-key">
+                        API key
+                        {modelSettings?.apiKeyConfigured ? (
+                          <span className="inline-status">configured</span>
+                        ) : null}
+                      </label>
+                      <input
+                        id="model-api-key"
+                        type="password"
+                        value={settingsApiKey}
+                        onChange={(event) => setSettingsApiKey(event.target.value)}
+                        placeholder={
+                          modelSettings?.apiKeyConfigured
+                            ? "Leave blank to keep existing key"
+                            : "Required for custom provider"
+                        }
+                        autoComplete="new-password"
+                        spellCheck={false}
+                      />
+                    </div>
+
+                    {settingsError ? <div className="form-message error">{settingsError}</div> : null}
+                    {settingsMessage ? (
+                      <div className="form-message success">{settingsMessage}</div>
+                    ) : null}
+
+                    <div className="settings-actions">
+                      <button
+                        className="button"
+                        type="button"
+                        onClick={saveModelSettings}
+                        disabled={settingsSaving}
+                      >
+                        {hasCustomModel ? "Update custom provider" : "Save custom provider"}
+                      </button>
+                      {hasCustomModel ? (
+                        <button
+                          className="button secondary"
+                          type="button"
+                          onClick={deleteModelSettings}
+                          disabled={settingsSaving}
+                        >
+                          Use default provider
+                        </button>
+                      ) : null}
+                    </div>
+                    </section>
+                  </div>
+                </div>
+              </section>
+            ) : null}
+
             <section className="connections-strip">
               <div className="connections-strip-main">
                 <strong>Connected Drives</strong>
@@ -649,17 +927,28 @@ export function SearchApp({
               </section>
 
               {(activeSession?.events.length ?? 0) > 0 ? (
-                <section className="panel">
+                <section className="panel progress-panel">
                   <div className="panel-header">
                     <h2>Progress</h2>
+                    <button
+                      className="progress-toggle"
+                      type="button"
+                      aria-expanded={progressOpen}
+                      onClick={() => setProgressOpen((open) => !open)}
+                    >
+                      {progressOpen ? "Hide" : "Show"}
+                      <span className="muted">({activeSession?.events.length ?? 0})</span>
+                    </button>
                   </div>
-                  <div className="panel-body stream">
-                    {activeSession?.events.map((event, index) => (
-                      <div className="stream-line" key={`${event}-${index}`}>
-                        {event}
-                      </div>
-                    ))}
-                  </div>
+                  {progressOpen ? (
+                    <div className="panel-body stream">
+                      {activeSession?.events.map((event, index) => (
+                        <div className="stream-line" key={`${event}-${index}`}>
+                          {event}
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
                 </section>
               ) : null}
 
@@ -690,8 +979,8 @@ export function SearchApp({
                           ) : (
                             <strong>{file.name}</strong>
                           )}
-                          <span className="muted">{file.driveEmail}</span>
-                          <span className="muted">{file.mimeType}</span>
+                          <span className="muted">Drive account: {file.driveEmail}</span>
+                          <span className="muted">Type: {formatMimeType(file.mimeType)}</span>
                         </li>
                       ))}
                     </ul>

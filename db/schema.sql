@@ -16,3 +16,12 @@ create index if not exists drive_connections_owner_sub_idx
 
 create unique index if not exists drive_connections_owner_email_idx
   on drive_connections(owner_sub, drive_email);
+
+create table if not exists user_model_settings (
+  owner_sub text primary key,
+  api_key_ciphertext text not null,
+  base_url text not null,
+  model text not null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);

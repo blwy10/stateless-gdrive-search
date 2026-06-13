@@ -1,11 +1,13 @@
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
 import { listDriveConnections } from "@/lib/drive-connections";
+import { getModelSettingsSummary } from "@/lib/model-settings";
 import { SearchApp } from "@/components/search-app";
 
 export default async function Home() {
   const session = await getServerSession(authOptions);
   const connections = session?.user?.id ? await listDriveConnections(session.user.id) : [];
+  const modelSettings = session?.user?.id ? await getModelSettingsSummary(session.user.id) : null;
 
   return (
     <SearchApp
@@ -19,6 +21,7 @@ export default async function Home() {
           : null
       }
       initialConnections={connections}
+      initialModelSettings={modelSettings}
     />
   );
 }
