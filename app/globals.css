@@ -445,6 +445,33 @@ a {
   background: #ffffff;
 }
 
+.checkbox-card {
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 11px 12px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+  background: #ffffff;
+}
+
+.checkbox-card > span {
+  display: grid;
+  gap: 3px;
+}
+
+.checkbox-card strong {
+  color: var(--text);
+  font-size: 14px;
+}
+
+.checkbox-card span span {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.35;
+}
+
 .run-status {
   border: 1px solid var(--line);
   border-left-width: 5px;

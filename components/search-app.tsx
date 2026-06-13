@@ -40,6 +40,7 @@ type QuerySession = {
   id: string;
   query: string;
   mode: "synthesis" | "list";
+  curateList: boolean;
   selectedDrive: string;
   createdAt: string;
   updatedAt: string;
@@ -63,6 +64,7 @@ export function SearchApp({
   const [connections, setConnections] = useState(initialConnections);
   const [selectedDrive, setSelectedDrive] = useState("all");
   const [mode, setMode] = useState<"synthesis" | "list">("synthesis");
+  const [curateList, setCurateList] = useState(false);
   const [query, setQuery] = useState("");
   const [sessions, setSessions] = useState<QuerySession[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
@@ -76,6 +78,7 @@ export function SearchApp({
         if (Array.isArray(parsed)) {
           const restored = parsed.map((session) => ({
             ...session,
+            curateList: session.curateList ?? false,
             answerFormat: session.answerFormat ?? ("plain" as const),
             ...(session.status === "running"
               ? {
@@ -89,6 +92,7 @@ export function SearchApp({
           if (restored[0]) {
             setQuery(restored[0].query);
             setMode(restored[0].mode);
+            setCurateList(restored[0].curateList);
             setSelectedDrive(restored[0].selectedDrive);
           }
         }
@@ -171,7 +175,7 @@ export function SearchApp({
   function newQuery() {
     if (activeSession?.status === "draft") {
       if (query.trim()) {
-        saveDraft(activeSession.id, { query, mode, selectedDrive });
+        saveDraft(activeSession.id, { query, mode, curateList, selectedDrive });
       }
       return;
     }
@@ -181,6 +185,7 @@ export function SearchApp({
       setActiveSessionId(existingDraft.id);
       setQuery(existingDraft.query);
       setMode(existingDraft.mode);
+      setCurateList(existingDraft.curateList);
       setSelectedDrive(existingDraft.selectedDrive);
       return;
     }
@@ -190,6 +195,7 @@ export function SearchApp({
       id: crypto.randomUUID(),
       query: "",
       mode: "synthesis",
+      curateList: false,
       selectedDrive: "all",
       createdAt: now,
       updatedAt: now,
@@ -205,6 +211,7 @@ export function SearchApp({
     setActiveSessionId(session.id);
     setQuery("");
     setMode("synthesis");
+    setCurateList(false);
     setSelectedDrive("all");
   }
 
@@ -213,7 +220,7 @@ export function SearchApp({
 
     if (activeSession?.status === "draft") {
       if (query.trim()) {
-        saveDraft(activeSession.id, { query, mode, selectedDrive });
+        saveDraft(activeSession.id, { query, mode, curateList, selectedDrive });
       } else {
         setSessions((current) => current.filter((item) => item.id !== activeSession.id));
       }
@@ -222,6 +229,7 @@ export function SearchApp({
     setActiveSessionId(session.id);
     setQuery(session.query);
     setMode(session.mode);
+    setCurateList(session.curateList);
     setSelectedDrive(session.selectedDrive);
   }
 
@@ -239,6 +247,13 @@ export function SearchApp({
     }
   }
 
+  function updateCurateList(value: boolean) {
+    setCurateList(value);
+    if (activeSession?.status === "draft") {
+      saveDraft(activeSession.id, { curateList: value });
+    }
+  }
+
   function updateSelectedDrive(value: string) {
     setSelectedDrive(value);
     if (activeSession?.status === "draft") {
@@ -248,7 +263,9 @@ export function SearchApp({
 
   function saveDraft(
     sessionId: string,
-    updates: Pick<QuerySession, "query" | "mode" | "selectedDrive"> | Partial<Pick<QuerySession, "query" | "mode" | "selectedDrive">>
+    updates:
+      | Pick<QuerySession, "query" | "mode" | "curateList" | "selectedDrive">
+      | Partial<Pick<QuerySession, "query" | "mode" | "curateList" | "selectedDrive">>
   ) {
     setSessions((current) =>
       current.map((item) =>
@@ -276,6 +293,7 @@ export function SearchApp({
     setActiveSessionId(nextSession?.id ?? null);
     setQuery(nextSession?.query ?? "");
     setMode(nextSession?.mode ?? "synthesis");
+    setCurateList(nextSession?.curateList ?? false);
     setSelectedDrive(nextSession?.selectedDrive ?? "all");
   }
 
@@ -288,6 +306,7 @@ export function SearchApp({
       id: activeSession?.status === "draft" ? activeSession.id : crypto.randomUUID(),
       query: trimmedQuery,
       mode,
+      curateList,
       selectedDrive,
       createdAt: activeSession?.status === "draft" ? activeSession.createdAt : now,
       updatedAt: now,
@@ -310,6 +329,7 @@ export function SearchApp({
         body: JSON.stringify({
           query: trimmedQuery,
           mode,
+          curateList,
           driveIds: [selectedDrive]
         })
       });
@@ -576,6 +596,20 @@ export function SearchApp({
                       </label>
                     </div>
                   </div>
+
+                  {mode === "list" ? (
+                    <label className="checkbox-card">
+                      <input
+                        type="checkbox"
+                        checked={curateList}
+                        onChange={(event) => updateCurateList(event.target.checked)}
+                      />
+                      <span>
+                        <strong>Curate opened files</strong>
+                        <span>Return only files the model opens and keeps as relevant.</span>
+                      </span>
+                    </label>
+                  ) : null}
 
                   <div className="field">
                     <label htmlFor="query">Question</label>

@@ -6,7 +6,8 @@ import { env } from "@/lib/env";
 const AgentRequest = z.object({
   query: z.string().trim().min(1).max(2000),
   mode: z.enum(["list", "synthesis"]),
-  driveIds: z.array(z.string().min(1)).min(1).max(20)
+  driveIds: z.array(z.string().min(1)).min(1).max(20),
+  curateList: z.boolean().optional().default(false)
 });
 
 type AgentRequest = z.infer<typeof AgentRequest>;
@@ -134,22 +135,7 @@ export function resolveAgentBudget(
   };
 }
 
-function systemPrompt(mode: AgentRequest["mode"], allowedDriveIds: string[], budget: AgentBudget) {
-  const answerInstruction =
-    mode === "synthesis"
-      ? `Return a concise synthesis answering the user's query, followed by the source files you relied on.
-Your final response must start with exactly one format line:
-FORMAT: markdown
-or
-FORMAT: plain
-Then put the answer body after that line.
-Use markdown only when headings, lists, links, or other markdown structure materially improve readability.
-Never return HTML or any format other than markdown or plain.`
-      : `Find relevant files only. Do not synthesize an answer.
-When you are done, return exactly:
-FORMAT: plain
-FILE_LIST_COMPLETE`;
-
+function basePrompt(allowedDriveIds: string[], budget: AgentBudget) {
   return `You are a Google Drive research agent.
 
 You have exactly two tools: search_drive and open_file.
@@ -158,12 +144,56 @@ Use at most ${budget.maxSearchCalls} search_drive calls.
 Use at most ${budget.maxOpenFileCalls} open_file calls.
 Search using targeted query variants before deciding there is not enough evidence.
 Do not repeat equivalent searches.
-Open files when their titles or snippets appear relevant. In list mode, opening files is allowed when needed to judge relevance.
 If searches stop producing new relevant files, answer with the evidence found.
 Never claim you searched outside Google Drive.
 Never ask for permissions or tokens.
-If evidence is weak, say that directly.
-${answerInstruction}`;
+If evidence is weak, say that directly.`;
+}
+
+function synthesisSystemPrompt(allowedDriveIds: string[], budget: AgentBudget) {
+  return `${basePrompt(allowedDriveIds, budget)}
+
+Open files when their titles or snippets appear relevant.
+Return a concise synthesis answering the user's query, followed by the source files you relied on.
+Your final response must start with exactly one format line:
+FORMAT: markdown
+or
+FORMAT: plain
+Then put the answer body after that line.
+Use markdown only when headings, lists, links, or other markdown structure materially improve readability.
+Never return HTML or any format other than markdown or plain.`;
+}
+
+function listSystemPrompt(
+  allowedDriveIds: string[],
+  budget: AgentBudget,
+  curateList: boolean
+) {
+  if (curateList) {
+    return `${basePrompt(allowedDriveIds, budget)}
+
+Find relevant files only. Do not synthesize an answer.
+Open files that may be relevant, then curate the final list from opened files only.
+Only include a file in your final selection if its opened content is relevant to the query.
+When you are done, return exactly:
+FORMAT: plain
+CURATED_FILE_LIST: [{"connectionId":"...","fileId":"..."}]
+Use an empty array if no opened files are relevant.`;
+  }
+
+  return `${basePrompt(allowedDriveIds, budget)}
+
+Find relevant files only. Do not synthesize an answer.
+Open files when their titles or snippets appear relevant and opening is needed to judge relevance.
+When you are done, return exactly:
+FORMAT: plain
+FILE_LIST_COMPLETE`;
+}
+
+function systemPrompt(input: AgentRequest, allowedDriveIds: string[], budget: AgentBudget) {
+  return input.mode === "synthesis"
+    ? synthesisSystemPrompt(allowedDriveIds, budget)
+    : listSystemPrompt(allowedDriveIds, budget, input.curateList);
 }
 
 function safeJson(value: unknown) {
@@ -241,6 +271,32 @@ function parseFinalAnswer(content: string | null, mode: AgentRequest["mode"]) {
   };
 }
 
+function curatedListFiles(content: string | null, openedFiles: DriveFile[]) {
+  const raw = content?.trim() ?? "";
+  const match = raw.match(/CURATED_FILE_LIST:\s*(\[[\s\S]*\])\s*$/);
+  if (!match) return uniqueFiles(openedFiles);
+
+  const openedByKey = new Map(openedFiles.map((file) => [fileKey(file), file]));
+  try {
+    const selected = z
+      .array(
+        z.object({
+          connectionId: z.string().min(1),
+          fileId: z.string().min(1).optional(),
+          id: z.string().min(1).optional()
+        })
+      )
+      .parse(JSON.parse(match[1]));
+    return uniqueFiles(
+      selected
+        .map((file) => openedByKey.get(`${file.connectionId}:${file.fileId ?? file.id}`))
+        .filter((file): file is DriveFile => Boolean(file))
+    );
+  } catch {
+    return uniqueFiles(openedFiles);
+  }
+}
+
 function isRetryableToolError(error: unknown) {
   if (!(error instanceof Error)) return false;
   return /\b(408|409|429|500|502|503|504)\b/.test(error.message);
@@ -284,11 +340,12 @@ export async function runDriveAgent(
   }
 
   const referencedFiles: DriveFile[] = [];
+  const openedFiles: DriveFile[] = [];
   const messages: ChatMessage[] = [
-    { role: "system", content: systemPrompt(input.mode, selectedDriveIds, budget) },
+    { role: "system", content: systemPrompt(input, selectedDriveIds, budget) },
     {
       role: "user",
-      content: `Query: ${input.query}\nMode: ${input.mode}`
+      content: `Query: ${input.query}\nMode: ${input.mode}\nCurate list: ${input.curateList}`
     }
   ];
   const searchedQueries = new Set<string>();
@@ -328,7 +385,11 @@ export async function runDriveAgent(
 
     if (!message.tool_calls?.length) {
       const { answer, answerFormat } = parseFinalAnswer(message.content, input.mode);
-      await emit({ type: "final", answer, answerFormat, files: uniqueFiles(referencedFiles) });
+      const files =
+        input.mode === "list" && input.curateList
+          ? curatedListFiles(message.content, openedFiles)
+          : uniqueFiles(referencedFiles);
+      await emit({ type: "final", answer, answerFormat, files });
       return;
     }
 
@@ -374,9 +435,11 @@ export async function runDriveAgent(
         if (lowProgressSearchCount >= budget.maxLowProgressSearches) {
           stopAfterToolUseReason = `Searches stopped producing new files after ${lowProgressSearchCount} low-progress search(es).`;
         }
-        referencedFiles.push(...files);
-        for (const file of files) {
-          await emit({ type: "file", file });
+        if (!input.curateList) {
+          referencedFiles.push(...files);
+          for (const file of files) {
+            await emit({ type: "file", file });
+          }
         }
         messages.push({
           role: "tool",
@@ -424,6 +487,7 @@ export async function runDriveAgent(
         );
         knownFileKeys.add(fileKey(opened.file));
         referencedFiles.push(opened.file);
+        openedFiles.push(opened.file);
         await emit({ type: "file", file: opened.file });
         messages.push({
           role: "tool",
@@ -439,5 +503,9 @@ export async function runDriveAgent(
 
   const reason = `Agent stopped after reaching the ${budget.maxToolSteps}-step tool-use budget.`;
   const { answer, answerFormat } = partialAnswer(reason, input.mode);
-  await emit({ type: "final", answer, answerFormat, files: uniqueFiles(referencedFiles) });
+  const files =
+    input.mode === "list" && input.curateList
+      ? uniqueFiles(openedFiles)
+      : uniqueFiles(referencedFiles);
+  await emit({ type: "final", answer, answerFormat, files });
 }
