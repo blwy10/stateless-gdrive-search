@@ -746,7 +746,8 @@ a {
   border-top: 1px solid var(--line);
 }
 
-.progress-toggle {
+.progress-toggle,
+.download-button {
   min-height: 30px;
   border-radius: 6px;
   padding: 0 10px;
