@@ -48,11 +48,44 @@ type ChatCompletion = {
   }>;
 };
 
+/**
+ * Per-run limits that bound how much work the agent may do before it must stop
+ * and return a (possibly partial) answer. Defaults live in
+ * {@link defaultAgentBudgets} and can be overridden via {@link resolveAgentBudget}.
+ */
 export type AgentBudget = {
+  /**
+   * Maximum number of model tool-use iterations (assistant turns that may issue
+   * tool calls). Once this many steps elapse without the agent finishing, tools
+   * are disabled and the model is given one final turn to return a result that
+   * respects the mode (e.g. synthesis still synthesizes rather than returning
+   * only the raw list of files read).
+   */
   maxToolSteps: number;
+  /**
+   * Maximum total number of `search_drive` calls allowed across the run. Also
+   * communicated to the model in the system prompt; further searches are
+   * skipped once the limit is hit.
+   */
   maxSearchCalls: number;
+  /**
+   * Maximum total number of `open_file` calls allowed across the run. Also
+   * communicated to the model in the system prompt; further opens are skipped
+   * once the limit is hit.
+   */
   maxOpenFileCalls: number;
+  /**
+   * Maximum number of *consecutive* low-progress searches (a repeated query, or
+   * one that returns no new files) tolerated before the agent is instructed to
+   * stop searching. The counter resets to zero whenever a search surfaces new
+   * files.
+   */
   maxLowProgressSearches: number;
+  /**
+   * Number of *additional* retry attempts for a failed tool call, on top of the
+   * initial attempt (e.g. `1` means up to two attempts total). Only retryable
+   * errors (HTTP 408/409/429/5xx) are retried.
+   */
   maxToolRetries: number;
 };
 
@@ -121,16 +154,16 @@ const tools = [
 
 export const defaultAgentBudgets: Record<AgentRequest["mode"], AgentBudget> = {
   list: {
-    maxToolSteps: 8,
-    maxSearchCalls: 4,
-    maxOpenFileCalls: 6,
+    maxToolSteps: 20,
+    maxSearchCalls: 10,
+    maxOpenFileCalls: 15,
     maxLowProgressSearches: 2,
     maxToolRetries: 1
   },
   synthesis: {
-    maxToolSteps: 8,
-    maxSearchCalls: 5,
-    maxOpenFileCalls: 8,
+    maxToolSteps: 20,
+    maxSearchCalls: 10,
+    maxOpenFileCalls: 20,
     maxLowProgressSearches: 2,
     maxToolRetries: 1
   }
@@ -215,7 +248,8 @@ async function callModel(
   settings: EffectiveModelSettings,
   messages: ChatMessage[],
   requestId: string,
-  step: number
+  step: number,
+  allowTools: boolean = true
 ) {
   const startedAt = Date.now();
 
@@ -225,7 +259,8 @@ async function callModel(
     step,
     model: settings.model,
     modelSettingsSource: settings.source,
-    messageCount: messages.length
+    messageCount: messages.length,
+    toolsEnabled: allowTools
   });
 
   try {
@@ -238,8 +273,7 @@ async function callModel(
       body: JSON.stringify({
         model: settings.model,
         messages,
-        tools,
-        tool_choice: "auto",
+        ...(allowTools ? { tools, tool_choice: "auto" } : {}),
         temperature: 0.2
       })
     });
@@ -472,7 +506,16 @@ export async function runDriveAgent(
       stopInstructionSent = true;
     }
 
-    const completion = await callModel(modelSettings, messages, requestId, step);
+    // Once a budget has forced a stop, disable tools so the model must produce
+    // the final result on this turn (respecting the mode, e.g. synthesis)
+    // instead of issuing more tool calls that would only be skipped.
+    const completion = await callModel(
+      modelSettings,
+      messages,
+      requestId,
+      step,
+      !stopInstructionSent
+    );
     const message = completion.choices[0]?.message;
     if (!message) {
       await writeDebugLog({
@@ -734,16 +777,57 @@ export async function runDriveAgent(
   }
 
   const reason = `Agent stopped after reaching the ${budget.maxToolSteps}-step tool-use budget.`;
-  const { answer, answerFormat } = partialAnswer(reason, input.mode);
+
+  // Budget exhausted: force one final, tool-free turn so the agent still
+  // respects the requested mode. Without this, synthesis runs that ran out of
+  // steps would skip synthesis and return only the raw list of files read.
+  // List mode without curation needs no model turn (its answer is the file
+  // list itself), so we skip the extra call there.
+  const needsFinalModelTurn =
+    input.mode === "synthesis" || (input.mode === "list" && input.curateList);
+  let finalContent: string | null = null;
+  if (needsFinalModelTurn) {
+    messages.push({
+      role: "user",
+      content: `${reason} Stop using tools and return the final result now.`
+    });
+    try {
+      const completion = await callModel(
+        modelSettings,
+        messages,
+        requestId,
+        budget.maxToolSteps,
+        false
+      );
+      finalContent = completion.choices[0]?.message?.content ?? null;
+    } catch (error) {
+      await writeDebugLog({
+        event: "agent.final_turn.failed",
+        level: "error",
+        requestId,
+        durationMs: Date.now() - startedAt,
+        error: debugError(error)
+      });
+    }
+  }
+
+  const { answer, answerFormat } =
+    finalContent !== null
+      ? parseFinalAnswer(finalContent, input.mode)
+      : partialAnswer(reason, input.mode);
   const files =
     input.mode === "list" && input.curateList
-      ? uniqueFiles(openedFiles)
+      ? finalContent !== null
+        ? curatedListFiles(finalContent, openedFiles)
+        : uniqueFiles(openedFiles)
       : uniqueFiles(referencedFiles);
   await writeDebugLog({
     event: "agent.completed",
     requestId,
     reason: "max_tool_steps_reached",
     durationMs: Date.now() - startedAt,
+    finalModelTurn: needsFinalModelTurn,
+    forcedFinalAnswer: finalContent !== null,
     searchCallCount,
     openFileCallCount,
     referencedFileCount: referencedFiles.length,
