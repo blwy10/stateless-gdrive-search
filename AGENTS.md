@@ -10,12 +10,31 @@
   `encryptSecret`/`decryptSecret`, the SSRF guard
   (`validatePublicHttpsBaseUrl`/`isPrivateIpv4`/`isPrivateIpv6`/`isPrivateAddress`),
   `escapeDriveQuery`, `emptyExtractionNote`, `parseFinalAnswer`,
-  and the debug-log redaction helpers (`debugText`/`isDebugContentLogEnabled`, which
-  force content previews off when `NODE_ENV=production`). `test/agent.test.ts` also
+  and the debug-log gating helpers (`debugText`/`isDebugLogEnabled`/
+  `isDebugContentLogEnabled`/`isDebugTranscriptLogEnabled`, which force all debug
+  logging — metadata, content previews, and the full transcript dump — off when
+  `NODE_ENV=production`). `test/agent.test.ts` also
   covers `handleOpenFileTool`'s failure path with a mocked `openDriveFile` (a tool
-  execution error must become a tool-result observation, never abort the run) and
+  execution error must become a tool-result observation, never abort the run), its
+  out-of-scope-connectionId path (a connectionId not in `selectedDriveIds` — usually
+  the model hallucinating an id — is likewise rejected as an observation without
+  opening the file, never thrown), invalid tool arguments (malformed JSON or a
+  schema violation, via `parseToolArgs`, in all three handlers), `dispatchToolCall`
+  (unknown/hallucinated tool names are answered with an observation so every
+  `tool_call` gets a reply), `isRetryableModelStatus` (the model-retry policy), and
   the curated `keep_file` flow via `handleKeepFileTool`. Add new tests here when you
   touch these functions.
+
+  Run-resilience invariant: anything that processes a model tool call must return a
+  tool-result observation, never throw — a throw bubbles out of `runDriveAgent` and
+  aborts the whole run (discarding everything gathered). This covers bad arguments,
+  out-of-scope/unknown ids, unknown tool names, and per-tool execution errors.
+  `dispatchToolCall` centralises routing and guarantees every `tool_call` is
+  answered (an unanswered one makes the next request a malformed conversation the
+  provider rejects). `callModel` retries transient failures — network errors,
+  timeouts, HTTP 5xx, and 429 — up to `MODEL_REQUEST_MAX_RETRIES` (4xx is never
+  retried; see `isRetryableModelStatus`), and an empty model response finalizes
+  gracefully with partial results instead of throwing.
 
   Curated file-list mode does live curation: opening a file emits a provisional
   `reviewing` event, and the model promotes relevant files with the `keep_file`

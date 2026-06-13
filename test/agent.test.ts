@@ -4,14 +4,17 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   curatedResultFiles,
+  dispatchToolCall,
   handleKeepFileTool,
   handleOpenFileTool,
+  handleSearchTool,
+  isRetryableModelStatus,
   parseFinalAnswer,
   type AgentProgress,
   type AgentRunContext,
   type AgentRunState
 } from "@/lib/agent";
-import { openDriveFile } from "@/lib/drive";
+import { openDriveFile, searchDriveFiles } from "@/lib/drive";
 import type { DriveFile } from "@/lib/drive";
 
 vi.mock("@/lib/drive", () => ({
@@ -199,6 +202,72 @@ describe("handleOpenFileTool", () => {
     expect(runState.referencedFiles).toHaveLength(0);
   });
 
+  it("rejects an out-of-scope connectionId as an observation instead of throwing", async () => {
+    const runState = makeState();
+    const outOfScope = {
+      id: "call-scope",
+      type: "function" as const,
+      function: {
+        name: "open_file" as const,
+        // selectedDriveIds is ["c1"], so "c2" is outside the selected scope —
+        // exactly what happens when the model hallucinates a connectionId.
+        arguments: JSON.stringify({ connectionId: "c2", fileId: "f1" })
+      }
+    };
+
+    // A hallucinated/out-of-scope connectionId must not abort the run (which a
+    // throw would, bubbling out of runDriveAgent): it is surfaced as a
+    // recoverable observation, and the file is never opened.
+    const result = await handleOpenFileTool(makeContext(), runState, 0, outOfScope);
+
+    expect(result.role).toBe("tool");
+    expect(result.tool_call_id).toBe("call-scope");
+    const payload = JSON.parse(result.content) as { error?: boolean; message?: string };
+    expect(payload.error).toBe(true);
+    expect(payload.message).toContain("not one of the selected");
+    expect(openDriveFile).not.toHaveBeenCalled();
+    // The out-of-scope call must not consume budget or be recorded as opened.
+    expect(runState.openFileCallCount).toBe(0);
+    expect(runState.openedFiles).toHaveLength(0);
+    expect(runState.referencedFiles).toHaveLength(0);
+  });
+
+  it("returns an error observation for malformed JSON arguments instead of throwing", async () => {
+    const runState = makeState();
+    const malformed = {
+      id: "call-bad-json",
+      type: "function" as const,
+      function: { name: "open_file" as const, arguments: "{ not valid json" }
+    };
+
+    // Malformed tool arguments must not abort the run: the parse failure becomes
+    // a recoverable observation and the file is never opened.
+    const result = await handleOpenFileTool(makeContext(), runState, 0, malformed);
+
+    const payload = JSON.parse(result.content) as { error?: boolean; message?: string };
+    expect(payload.error).toBe(true);
+    expect(payload.message).toContain("Invalid arguments for open_file");
+    expect(openDriveFile).not.toHaveBeenCalled();
+    expect(runState.openFileCallCount).toBe(0);
+  });
+
+  it("returns an error observation for schema-invalid arguments (missing fileId)", async () => {
+    const runState = makeState();
+    const missingField = {
+      id: "call-missing",
+      type: "function" as const,
+      function: { name: "open_file" as const, arguments: JSON.stringify({ connectionId: "c1" }) }
+    };
+
+    const result = await handleOpenFileTool(makeContext(), runState, 0, missingField);
+
+    const payload = JSON.parse(result.content) as { error?: boolean; message?: string };
+    expect(payload.error).toBe(true);
+    expect(payload.message).toContain("Invalid arguments for open_file");
+    expect(openDriveFile).not.toHaveBeenCalled();
+    expect(runState.openFileCallCount).toBe(0);
+  });
+
   it("returns the file content as an observation on a successful open", async () => {
     vi.mocked(openDriveFile).mockResolvedValue({
       file: file("c1", "f1", "Doc"),
@@ -286,5 +355,90 @@ describe("handleKeepFileTool", () => {
     expect(payload.kept).toBe(true);
     expect(payload.alreadyKept).toBe(true);
     expect(runState.keptFiles).toHaveLength(1);
+  });
+});
+
+describe("handleSearchTool", () => {
+  it("returns an error observation for schema-invalid arguments without searching", async () => {
+    vi.mocked(searchDriveFiles).mockReset();
+    const runState = makeState();
+    const missingQuery = {
+      id: "s-bad",
+      type: "function" as const,
+      // searchArgs requires `query`; omitting it is a ZodError, which must not
+      // abort the run.
+      function: { name: "search_drive" as const, arguments: JSON.stringify({ limit: 5 }) }
+    };
+
+    const result = await handleSearchTool(makeContext(), runState, 0, missingQuery);
+
+    const payload = JSON.parse(result.content) as { error?: boolean; message?: string };
+    expect(payload.error).toBe(true);
+    expect(payload.message).toContain("Invalid arguments for search_drive");
+    expect(searchDriveFiles).not.toHaveBeenCalled();
+    expect(runState.searchCallCount).toBe(0);
+  });
+});
+
+describe("dispatchToolCall", () => {
+  beforeEach(() => {
+    vi.mocked(openDriveFile).mockReset();
+    vi.mocked(searchDriveFiles).mockReset();
+  });
+
+  it("answers an unknown tool name with a recoverable observation", async () => {
+    const runState = makeState();
+    // The wire type constrains tool names, but the model can emit anything; cast
+    // to simulate a hallucinated tool the contract forbids. Leaving it
+    // unanswered would corrupt the next request and abort the run.
+    const unknownCall = {
+      id: "call-unknown",
+      type: "function" as const,
+      function: { name: "delete_everything", arguments: "{}" }
+    } as unknown as Parameters<typeof dispatchToolCall>[3];
+
+    const result = await dispatchToolCall(makeContext(), runState, 0, unknownCall);
+
+    expect(result.role).toBe("tool");
+    expect(result.tool_call_id).toBe("call-unknown");
+    const payload = JSON.parse(result.content) as { error?: boolean; message?: string };
+    expect(payload.error).toBe(true);
+    expect(payload.message).toContain('Unknown tool "delete_everything"');
+    expect(payload.message).toContain("search_drive");
+    expect(openDriveFile).not.toHaveBeenCalled();
+    expect(searchDriveFiles).not.toHaveBeenCalled();
+  });
+
+  it("routes a known tool name to its handler", async () => {
+    vi.mocked(openDriveFile).mockResolvedValue({
+      file: file("c1", "f1", "Doc"),
+      content: "hi"
+    });
+    const runState = makeState();
+    const openCall = {
+      id: "call-route",
+      type: "function" as const,
+      function: {
+        name: "open_file" as const,
+        arguments: JSON.stringify({ connectionId: "c1", fileId: "f1" })
+      }
+    };
+
+    const result = await dispatchToolCall(makeContext(), runState, 0, openCall);
+
+    const payload = JSON.parse(result.content) as { content?: string };
+    expect(payload.content).toBe("hi");
+    expect(openDriveFile).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("isRetryableModelStatus", () => {
+  it("retries 5xx and 429 but not 4xx or success", () => {
+    for (const status of [500, 502, 503, 504, 429]) {
+      expect(isRetryableModelStatus(status), String(status)).toBe(true);
+    }
+    for (const status of [200, 400, 401, 403, 404, 422]) {
+      expect(isRetryableModelStatus(status), String(status)).toBe(false);
+    }
   });
 });

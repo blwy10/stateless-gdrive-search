@@ -17,6 +17,14 @@ function enabled(value: string | undefined) {
 }
 
 export function isDebugLogEnabled() {
+  // The master switch for all debug logging. Even the metadata-only traces
+  // (hashed identifiers, durations, counts) are for local debugging only, so
+  // disable every debug log when NODE_ENV is "production", regardless of the
+  // flag. The check is written inline (rather than via a shared helper) on
+  // purpose: in a production build Next inlines process.env.NODE_ENV, so this
+  // constant-folds to `return false` and lets the bundler strip writeDebugLog's
+  // body — and the content/transcript flag reads — out of the deployed output.
+  if (process.env.NODE_ENV === "production") return false;
   return enabled(process.env.DEBUG_LOGS);
 }
 
@@ -24,10 +32,22 @@ export function isDebugContentLogEnabled() {
   // Content previews can include short query / file-name / error snippets, so
   // they are strictly for local emergency debugging (see README). Enforce the
   // documented "do not enable in production" guidance in code: never emit
-  // previews when NODE_ENV is "production", regardless of the flag. Metadata
-  // logging (DEBUG_LOGS) is unaffected and still works in any environment.
+  // previews when NODE_ENV is "production", regardless of the flag. (Debug
+  // logging as a whole is likewise production-disabled via isDebugLogEnabled.)
   if (process.env.NODE_ENV === "production") return false;
   return enabled(process.env.DEBUG_LOG_CONTENT);
+}
+
+export function isDebugTranscriptLogEnabled() {
+  // Separate, opt-in switch for a full model-transcript dump: the assistant's
+  // raw reasoning text plus the tool calls (names + arguments) it issued each
+  // step. This is the most verbose / sensitive log we emit — it exposes the
+  // model's unredacted reasoning, not just the short previews DEBUG_LOG_CONTENT
+  // adds — so it is independent of DEBUG_LOG_CONTENT and, like content previews,
+  // is force-disabled whenever NODE_ENV is "production". Still gated by the
+  // DEBUG_LOGS master switch, since nothing is written without it.
+  if (process.env.NODE_ENV === "production") return false;
+  return enabled(process.env.DEBUG_LOG_TRANSCRIPT);
 }
 
 export function createDebugRequestId(prefix = "req") {

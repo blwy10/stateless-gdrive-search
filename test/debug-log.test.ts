@@ -2,12 +2,41 @@
 // SPDX-License-Identifier: MIT
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { debugText, hashForDebug, isDebugContentLogEnabled } from "@/lib/debug-log";
+import {
+  debugText,
+  hashForDebug,
+  isDebugContentLogEnabled,
+  isDebugLogEnabled,
+  isDebugTranscriptLogEnabled
+} from "@/lib/debug-log";
 
-// debug-log.ts reads DEBUG_LOG_CONTENT / NODE_ENV lazily (inside the functions),
-// so stubbing per-test is sufficient. Restore the real env after each test.
+// debug-log.ts reads DEBUG_LOGS / DEBUG_LOG_CONTENT / DEBUG_LOG_TRANSCRIPT /
+// NODE_ENV lazily (inside the functions), so stubbing per-test is sufficient.
+// Restore the real env after each test.
 afterEach(() => {
   vi.unstubAllEnvs();
+});
+
+describe("isDebugLogEnabled", () => {
+  it("is off when the flag is unset", () => {
+    vi.stubEnv("NODE_ENV", "development");
+    vi.stubEnv("DEBUG_LOGS", "");
+    expect(isDebugLogEnabled()).toBe(false);
+  });
+
+  it("can be enabled outside production", () => {
+    vi.stubEnv("NODE_ENV", "development");
+    for (const value of ["1", "true", "TRUE"]) {
+      vi.stubEnv("DEBUG_LOGS", value);
+      expect(isDebugLogEnabled()).toBe(true);
+    }
+  });
+
+  it("is forced off in production even when the flag is set", () => {
+    vi.stubEnv("NODE_ENV", "production");
+    vi.stubEnv("DEBUG_LOGS", "1");
+    expect(isDebugLogEnabled()).toBe(false);
+  });
 });
 
 describe("isDebugContentLogEnabled", () => {
@@ -28,6 +57,40 @@ describe("isDebugContentLogEnabled", () => {
   it("is forced off in production even when the flag is set", () => {
     vi.stubEnv("NODE_ENV", "production");
     vi.stubEnv("DEBUG_LOG_CONTENT", "1");
+    expect(isDebugContentLogEnabled()).toBe(false);
+  });
+});
+
+describe("isDebugTranscriptLogEnabled", () => {
+  it("is off when the flag is unset", () => {
+    vi.stubEnv("NODE_ENV", "development");
+    vi.stubEnv("DEBUG_LOG_TRANSCRIPT", "");
+    expect(isDebugTranscriptLogEnabled()).toBe(false);
+  });
+
+  it("can be enabled outside production", () => {
+    vi.stubEnv("NODE_ENV", "development");
+    for (const value of ["1", "true", "TRUE"]) {
+      vi.stubEnv("DEBUG_LOG_TRANSCRIPT", value);
+      expect(isDebugTranscriptLogEnabled()).toBe(true);
+    }
+  });
+
+  it("is forced off in production even when the flag is set", () => {
+    vi.stubEnv("NODE_ENV", "production");
+    vi.stubEnv("DEBUG_LOG_TRANSCRIPT", "1");
+    expect(isDebugTranscriptLogEnabled()).toBe(false);
+  });
+
+  it("is independent of DEBUG_LOG_CONTENT", () => {
+    vi.stubEnv("NODE_ENV", "development");
+    vi.stubEnv("DEBUG_LOG_CONTENT", "1");
+    vi.stubEnv("DEBUG_LOG_TRANSCRIPT", "");
+    expect(isDebugTranscriptLogEnabled()).toBe(false);
+
+    vi.stubEnv("DEBUG_LOG_CONTENT", "");
+    vi.stubEnv("DEBUG_LOG_TRANSCRIPT", "1");
+    expect(isDebugTranscriptLogEnabled()).toBe(true);
     expect(isDebugContentLogEnabled()).toBe(false);
   });
 });

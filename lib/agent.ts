@@ -13,6 +13,7 @@ import {
   debugError,
   debugText,
   hashForDebug,
+  isDebugTranscriptLogEnabled,
   writeDebugLog
 } from "@/lib/debug-log";
 
@@ -23,6 +24,16 @@ import {
  * bounds connect + response-body read for each individual attempt.
  */
 const MODEL_REQUEST_TIMEOUT_MS = 60_000;
+
+/**
+ * Additional retry attempts for a failed model call, on top of the initial
+ * attempt (so `2` ⇒ up to three attempts total). Only transient failures are
+ * retried — network errors, timeouts, HTTP 5xx, and 429 — mirroring
+ * {@link withToolRetries} for the Drive tools, which the model call previously
+ * lacked. Client errors (4xx) are never retried: an identical bad request will
+ * only fail again and waste time and tokens.
+ */
+const MODEL_REQUEST_MAX_RETRIES = 2;
 
 const AgentRequest = z.object({
   query: z.string().trim().min(1).max(2000),
@@ -168,7 +179,7 @@ const openFileTool: ToolDefinition = {
   function: {
     name: "open_file",
     description:
-      "Open and read a file returned by search_drive. Use the exact connectionId and fileId from search results.",
+      "Open and read a file returned by search_drive. Copy connectionId and fileId verbatim from a single search_drive result — never invent, guess, or modify an id, and never pair the connectionId of one file with the fileId of another. connectionId must be one of the selected Drive connection IDs.",
     parameters: {
       type: "object",
       properties: {
@@ -190,7 +201,7 @@ const keepFileTool: ToolDefinition = {
   function: {
     name: "keep_file",
     description:
-      "Mark an already-opened file as relevant so it is included in the curated results. Call this immediately after reading a file whose content is relevant to the query. Only files you have opened can be kept.",
+      "Mark an already-opened file as relevant so it is included in the curated results. Call this immediately after reading a file whose content is relevant to the query. Only files you have opened can be kept. Pass the same connectionId and fileId you opened it with, copied verbatim from the search_drive result.",
     parameters: {
       type: "object",
       properties: {
@@ -249,10 +260,20 @@ function basePrompt(allowedDriveIds: string[], budget: AgentBudget, curating = f
   const toolList = curating
     ? "You have exactly three tools: search_drive, open_file, and keep_file."
     : "You have exactly two tools: search_drive and open_file.";
+  // Smaller models occasionally fabricate a connectionId — e.g. inventing a
+  // second connection even when only one exists. Spell out that ids are opaque
+  // values to be copied verbatim, and when there is a single connection pin it
+  // to one literal so there is nothing to "guess".
+  const idRule =
+    allowedDriveIds.length === 1
+      ? `There is exactly one connection: every connectionId you pass must be exactly "${allowedDriveIds[0]}" — never any other value.`
+      : `Every connectionId you pass must be exactly one of those IDs.`;
   return `You are a Google Drive research agent.
 
 ${toolList}
 You may only work with these selected Drive connection IDs: ${allowedDriveIds.join(", ")}.
+Every connectionId and fileId you pass to a tool is an opaque identifier you must copy verbatim from a search_drive result — never invent, guess, modify, or take an id from a different file.
+${idRule}
 Use at most ${budget.maxSearchCalls} search_drive calls.
 Use at most ${budget.maxOpenFileCalls} open_file calls.
 Search using targeted query variants before deciding there is not enough evidence.
@@ -313,6 +334,21 @@ function safeJson(value: unknown) {
   return JSON.stringify(value, null, 2);
 }
 
+/**
+ * Error thrown for a non-OK model HTTP response. Carries whether the status is
+ * worth retrying so {@link callModel}'s retry loop can tell a transient 5xx/429
+ * (retry) apart from a client 4xx (do not retry).
+ */
+class ModelRequestError extends Error {
+  constructor(
+    message: string,
+    readonly retryable: boolean
+  ) {
+    super(message);
+    this.name = "ModelRequestError";
+  }
+}
+
 async function callModel(
   settings: EffectiveModelSettings,
   messages: ChatMessage[],
@@ -333,70 +369,108 @@ async function callModel(
     toolsEnabled
   });
 
-  try {
-    const response = await undiciFetch(`${settings.baseUrl.replace(/\/$/, "")}/chat/completions`, {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${settings.apiKey}`,
-        "content-type": "application/json"
-      },
-      // The base URL is validated as a public HTTPS host (see
-      // validatePublicHttpsBaseUrl), but a validated host can still answer with a
-      // redirect to an internal/metadata address (e.g. 169.254.169.254). Refuse to
-      // follow redirects, and for user-supplied endpoints validate the resolved IP
-      // at connect time (ssrfSafeDispatcher) to also close the DNS-rebinding window.
-      redirect: "error",
-      signal: AbortSignal.timeout(MODEL_REQUEST_TIMEOUT_MS),
-      ...(settings.source === "custom" ? { dispatcher: ssrfSafeDispatcher } : {}),
-      body: JSON.stringify({
-        model: settings.model,
-        messages,
-        ...(toolsEnabled ? { tools: offeredTools, tool_choice: "auto" } : {}),
-        temperature: 0.2
-      })
-    });
-    if (!response.ok) {
-      const responseBody = await response.text();
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= MODEL_REQUEST_MAX_RETRIES; attempt += 1) {
+    try {
+      const response = await undiciFetch(`${settings.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${settings.apiKey}`,
+          "content-type": "application/json"
+        },
+        // The base URL is validated as a public HTTPS host (see
+        // validatePublicHttpsBaseUrl), but a validated host can still answer with a
+        // redirect to an internal/metadata address (e.g. 169.254.169.254). Refuse to
+        // follow redirects, and for user-supplied endpoints validate the resolved IP
+        // at connect time (ssrfSafeDispatcher) to also close the DNS-rebinding window.
+        redirect: "error",
+        signal: AbortSignal.timeout(MODEL_REQUEST_TIMEOUT_MS),
+        ...(settings.source === "custom" ? { dispatcher: ssrfSafeDispatcher } : {}),
+        body: JSON.stringify({
+          model: settings.model,
+          messages,
+          ...(toolsEnabled ? { tools: offeredTools, tool_choice: "auto" } : {}),
+          temperature: 0.2
+        })
+      });
+      if (!response.ok) {
+        const responseBody = await response.text();
+        await writeDebugLog({
+          event: "agent.model.failed",
+          level: "error",
+          requestId,
+          step,
+          model: settings.model,
+          modelSettingsSource: settings.source,
+          status: response.status,
+          durationMs: Date.now() - startedAt,
+          attempt,
+          response: debugText(responseBody)
+        });
+        throw new ModelRequestError(
+          `AI request failed with status ${response.status}`,
+          isRetryableModelStatus(response.status)
+        );
+      }
+
+      const completion = (await response.json()) as ChatCompletion;
+      const message = completion.choices[0]?.message;
       await writeDebugLog({
-        event: "agent.model.failed",
-        level: "error",
+        event: "agent.model.completed",
         requestId,
         step,
         model: settings.model,
         modelSettingsSource: settings.source,
-        status: response.status,
         durationMs: Date.now() - startedAt,
-        response: debugText(responseBody)
+        toolCallCount: message?.tool_calls?.length ?? 0,
+        responseContentLength: message?.content?.length ?? 0
       });
-      throw new Error(`AI request failed with status ${response.status}`);
+      // Full transcript dump (DEBUG_LOG_TRANSCRIPT only): the model's raw,
+      // untruncated reasoning text plus the tool calls it issued this step (names
+      // and arguments). This is what makes curation decisions auditable — e.g.
+      // why a file was kept vs. merely reviewed — which the metadata-only
+      // agent.model.completed event above cannot show. Emitted for every model
+      // call (every mode, including the forced final synthesis turn) and kept
+      // independent of DEBUG_LOG_CONTENT.
+      if (isDebugTranscriptLogEnabled()) {
+        await writeDebugLog({
+          event: "agent.model.transcript",
+          requestId,
+          step,
+          model: settings.model,
+          content: message?.content ?? null,
+          toolCalls: (message?.tool_calls ?? []).map((toolCall) => ({
+            name: toolCall.function.name,
+            arguments: toolCall.function.arguments
+          }))
+        });
+      }
+      return completion;
+    } catch (error) {
+      lastError = error;
+      // HTTP errors carry their own retryability (4xx no, 5xx/429 yes); network
+      // failures, timeouts, and unparseable bodies are treated as transient.
+      const retryable = error instanceof ModelRequestError ? error.retryable : true;
+      const willRetry = retryable && attempt < MODEL_REQUEST_MAX_RETRIES;
+      await writeDebugLog({
+        event: "agent.model.error",
+        level: willRetry ? "warn" : "error",
+        requestId,
+        step,
+        model: settings.model,
+        modelSettingsSource: settings.source,
+        durationMs: Date.now() - startedAt,
+        attempt,
+        willRetry,
+        error: debugError(error)
+      });
+      if (!willRetry) throw error;
     }
-
-    const completion = (await response.json()) as ChatCompletion;
-    const message = completion.choices[0]?.message;
-    await writeDebugLog({
-      event: "agent.model.completed",
-      requestId,
-      step,
-      model: settings.model,
-      modelSettingsSource: settings.source,
-      durationMs: Date.now() - startedAt,
-      toolCallCount: message?.tool_calls?.length ?? 0,
-      responseContentLength: message?.content?.length ?? 0
-    });
-    return completion;
-  } catch (error) {
-    await writeDebugLog({
-      event: "agent.model.error",
-      level: "error",
-      requestId,
-      step,
-      model: settings.model,
-      modelSettingsSource: settings.source,
-      durationMs: Date.now() - startedAt,
-      error: debugError(error)
-    });
-    throw error;
   }
+
+  // The loop returns on success and throws on a final/non-retryable error, so
+  // this only guards the otherwise-unreachable case of exhausting the bound.
+  throw lastError ?? new Error("AI request failed");
 }
 
 function uniqueFiles(files: DriveFile[]) {
@@ -474,6 +548,15 @@ function isRetryableToolError(error: unknown) {
   return /\b(408|409|429|500|502|503|504)\b/.test(error.message);
 }
 
+/**
+ * Model-endpoint HTTP statuses worth retrying: 5xx (server-side) and 429 (rate
+ * limited). 4xx (bad request, auth, bad config) will not fix themselves, so an
+ * identical retry would only fail again.
+ */
+export function isRetryableModelStatus(status: number) {
+  return status === 429 || status >= 500;
+}
+
 async function withToolRetries<T>(
   operation: () => Promise<T>,
   retryCount: number
@@ -515,6 +598,42 @@ function toolErrorObservation(toolCallId: string, message: string): ToolResultMe
     tool_call_id: toolCallId,
     content: safeJson({ error: true, message })
   };
+}
+
+/**
+ * Parse a tool call's JSON arguments against its zod schema, converting any
+ * failure — malformed JSON (`SyntaxError`) or a schema violation (`ZodError`,
+ * e.g. a missing/empty field or out-of-range value) — into a recoverable
+ * observation instead of throwing. A throw here would bubble out of the
+ * tool-dispatch loop and abort the whole run over a single malformed call the
+ * model could simply re-issue with corrected arguments.
+ */
+async function parseToolArgs<T>(
+  context: AgentRunContext,
+  step: number,
+  toolCall: ToolCall,
+  schema: z.ZodType<T>
+): Promise<{ ok: true; args: T } | { ok: false; observation: ToolResultMessage }> {
+  try {
+    return { ok: true, args: schema.parse(JSON.parse(toolCall.function.arguments || "{}")) };
+  } catch (error) {
+    await writeDebugLog({
+      event: "agent.tool.invalid_args",
+      level: "warn",
+      requestId: context.requestId,
+      step,
+      tool: toolCall.function.name,
+      toolCallIdHash: hashForDebug(toolCall.id),
+      error: debugError(error)
+    });
+    return {
+      ok: false,
+      observation: toolErrorObservation(
+        toolCall.id,
+        `Invalid arguments for ${toolCall.function.name}: ${errorText(error)}. Reply with a JSON object containing the required fields and call the tool again.`
+      )
+    };
+  }
 }
 
 /**
@@ -565,7 +684,9 @@ export async function handleSearchTool(
   toolCall: ToolCall
 ): Promise<ToolResultMessage> {
   const { requestId, budget, selectedDriveIds, ownerSub, input, emit } = context;
-  const args = searchArgs.parse(JSON.parse(toolCall.function.arguments || "{}"));
+  const parsed = await parseToolArgs(context, step, toolCall, searchArgs);
+  if (!parsed.ok) return parsed.observation;
+  const args = parsed.args;
   const normalizedQuery = normalizeSearchQuery(args.query);
   await writeDebugLog({
     event: "agent.tool.search_drive.requested",
@@ -674,6 +795,11 @@ export async function handleSearchTool(
  * Handle a single `open_file` tool call: enforce drive scope, dedupe already
  * opened files, enforce the open-file budget, read the file, and emit progress.
  * Mutates {@link state} in place and returns the tool message to append.
+ *
+ * An out-of-scope connectionId (the model fabricating an id instead of copying
+ * one from a search result) is rejected as a tool-result observation, not
+ * thrown — the file is never opened, but the run continues so the model can
+ * retry with a valid connectionId instead of aborting the entire run.
  */
 export async function handleOpenFileTool(
   context: AgentRunContext,
@@ -683,7 +809,9 @@ export async function handleOpenFileTool(
 ): Promise<ToolResultMessage> {
   const { requestId, budget, selectedDriveIds, ownerSub, input, emit } = context;
   const curating = isCuratingRequest(input);
-  const args = openArgs.parse(JSON.parse(toolCall.function.arguments || "{}"));
+  const parsed = await parseToolArgs(context, step, toolCall, openArgs);
+  if (!parsed.ok) return parsed.observation;
+  const args = parsed.args;
   await writeDebugLog({
     event: "agent.tool.open_file.requested",
     requestId,
@@ -703,7 +831,17 @@ export async function handleOpenFileTool(
       connectionIdHash: hashForDebug(args.connectionId),
       fileIdHash: hashForDebug(args.fileId)
     });
-    throw new Error("AI attempted to open a file outside the selected Drive scope");
+    // Security boundary: we never open a file outside the user's selected
+    // drives (we return before openDriveFile is ever called). But an
+    // out-of-scope connectionId is almost always the model fabricating an id
+    // instead of copying it from a search result, so surface it as a
+    // recoverable observation rather than throwing — a throw bubbles out of
+    // runDriveAgent and aborts the whole run, discarding every file already
+    // reviewed. Returning lets the model retry with a valid connectionId.
+    return toolErrorObservation(
+      toolCall.id,
+      `connectionId "${args.connectionId}" is not one of the selected Drive connections, so this file cannot be opened. Use the exact connectionId from a search_drive result. Selected connectionIds: ${selectedDriveIds.join(", ")}.`
+    );
   }
   const key = `${args.connectionId}:${args.fileId}`;
   if (state.openedFileKeys.has(key)) {
@@ -820,7 +958,9 @@ export async function handleKeepFileTool(
   toolCall: ToolCall
 ): Promise<ToolResultMessage> {
   const { requestId, emit } = context;
-  const args = keepArgs.parse(JSON.parse(toolCall.function.arguments || "{}"));
+  const parsed = await parseToolArgs(context, step, toolCall, keepArgs);
+  if (!parsed.ok) return parsed.observation;
+  const args = parsed.args;
   const key = `${args.connectionId}:${args.fileId}`;
   await writeDebugLog({
     event: "agent.tool.keep_file.requested",
@@ -878,6 +1018,44 @@ export async function handleKeepFileTool(
     tool_call_id: toolCall.id,
     content: safeJson({ kept: true })
   };
+}
+
+/**
+ * Route one tool call from the model to its handler. Centralised so the run loop
+ * stays a thin iterator and — crucially — so every tool call produces a
+ * tool-result message, including tool names the model invents. An unanswered
+ * tool call leaves the next request a malformed conversation (an assistant
+ * `tool_calls` entry with no matching `tool` reply), which providers reject,
+ * aborting the run.
+ */
+export async function dispatchToolCall(
+  context: AgentRunContext,
+  state: AgentRunState,
+  step: number,
+  toolCall: ToolCall
+): Promise<ToolResultMessage> {
+  // The completion is cast from the wire, so the union type does not actually
+  // constrain the runtime value — the model can emit any tool name.
+  const name: string = toolCall.function.name;
+  if (name === "search_drive") return handleSearchTool(context, state, step, toolCall);
+  if (name === "open_file") return handleOpenFileTool(context, state, step, toolCall);
+  if (name === "keep_file") return handleKeepFileTool(context, state, step, toolCall);
+
+  await writeDebugLog({
+    event: "agent.tool.unknown",
+    level: "warn",
+    requestId: context.requestId,
+    step,
+    tool: name,
+    toolCallIdHash: hashForDebug(toolCall.id)
+  });
+  const available = toolsForRequest(context.input)
+    .map((tool) => tool.function.name)
+    .join(", ");
+  return toolErrorObservation(
+    toolCall.id,
+    `Unknown tool "${name}". Use only these tools: ${available}.`
+  );
 }
 
 export function parseAgentRequest(value: unknown) {
@@ -997,15 +1175,37 @@ export async function runDriveAgent(
     const completion = await callModel(modelSettings, messages, requestId, step, offeredTools);
     const message = completion.choices[0]?.message;
     if (!message) {
+      // A completion with no choices/message is malformed, but aborting would
+      // discard everything gathered so far. Finalize gracefully with the files
+      // already found (plus, in synthesis, a partial-answer note), exactly as
+      // the budget-exhausted path does.
+      const reason = "The AI returned an empty response.";
+      const { answer, answerFormat } = partialAnswer(reason, input.mode);
+      const curated = curating ? curatedResult() : null;
+      const files = curated ? curated.files : uniqueFiles(state.referencedFiles);
+      if (curated?.fallback) {
+        await emit({
+          type: "progress",
+          message: "No files were explicitly kept; returning all reviewed files."
+        });
+      }
       await writeDebugLog({
-        event: "agent.failed",
-        level: "error",
+        event: "agent.completed",
         requestId,
         reason: "model_returned_no_message",
+        durationMs: Date.now() - startedAt,
         step,
-        durationMs: Date.now() - startedAt
+        searchCallCount: state.searchCallCount,
+        openFileCallCount: state.openFileCallCount,
+        referencedFileCount: state.referencedFiles.length,
+        keptFileCount: state.keptFiles.length,
+        curatedFallback: curated?.fallback ?? false,
+        returnedFileCount: files.length,
+        answerFormat,
+        answerLength: answer.length
       });
-      throw new Error("AI returned no message");
+      await emit({ type: "final", answer, answerFormat, files });
+      return;
     }
 
     messages.push({
@@ -1044,13 +1244,7 @@ export async function runDriveAgent(
     }
 
     for (const toolCall of message.tool_calls) {
-      if (toolCall.function.name === "search_drive") {
-        messages.push(await handleSearchTool(context, state, step, toolCall));
-      } else if (toolCall.function.name === "open_file") {
-        messages.push(await handleOpenFileTool(context, state, step, toolCall));
-      } else if (toolCall.function.name === "keep_file") {
-        messages.push(await handleKeepFileTool(context, state, step, toolCall));
-      }
+      messages.push(await dispatchToolCall(context, state, step, toolCall));
     }
   }
 
