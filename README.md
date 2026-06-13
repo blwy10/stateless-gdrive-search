@@ -5,6 +5,10 @@
 
 A production-oriented Next.js app for Google-login users to connect one or more Google Drive accounts and query them with a constrained AI agent.
 
+## Created with Codex
+
+This project was created with Codex. The repository, application structure, and implementation were generated and edited through Codex-assisted development.
+
 The agent has exactly two app tools:
 
 - `search_drive`: search connected Google Drives with read-only Drive scopes.
