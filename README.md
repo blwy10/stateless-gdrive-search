@@ -54,6 +54,31 @@ npm install
 npm run dev
 ```
 
+## Deployment
+
+This app is platform-neutral and can run anywhere that supports a Node.js Next.js
+server plus PostgreSQL. The standard production command remains:
+
+```bash
+npm run build
+npm run start
+```
+
+The official project hosting target is Railway. Railway should track the remote
+`release` branch and use this service start command:
+
+```bash
+npm run start:standalone
+```
+
+Railway also needs a PostgreSQL service connected through `DATABASE_URL`, plus
+the environment variables listed above. After generating the Railway public
+domain, set `NEXTAUTH_URL` to that origin and add these Google OAuth redirect
+paths on the production hostname:
+
+- `/api/auth/callback/google`
+- `/api/drive/oauth/callback`
+
 ## Google OAuth setup
 
 Create one Google OAuth client. Add these redirect URIs:
