@@ -46,6 +46,7 @@ export function SearchApp({
     activeSessionId,
     activeSession,
     uniqueFiles,
+    reviewingFiles,
     runningSessionCount,
     query,
     mode,
@@ -404,6 +405,35 @@ export function SearchApp({
                     <ul className="file-list">
                       {uniqueFiles.map((file) => (
                         <li className="file-card" key={`${file.connectionId}:${file.id}`}>
+                          {file.webViewLink ? (
+                            <a href={file.webViewLink} target="_blank" rel="noreferrer">
+                              {file.name}
+                            </a>
+                          ) : (
+                            <strong>{file.name}</strong>
+                          )}
+                          <span className="muted">Drive account: {file.driveEmail}</span>
+                          <span className="muted">Type: {formatMimeType(file.mimeType)}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                </section>
+              ) : null}
+
+              {reviewingFiles.length > 0 ? (
+                <section className="panel">
+                  <div className="panel-header">
+                    <h2>Reviewing</h2>
+                    <p className="panel-subtitle">
+                      Opened files the agent is still judging. Only the ones it keeps appear above.
+                    </p>
+                  </div>
+                  <div className="panel-body">
+                    <ul className="file-list">
+                      {reviewingFiles.map((file) => (
+                        <li className="file-card reviewing" key={`${file.connectionId}:${file.id}`}>
+                          <span className="reviewing-badge">Reviewing</span>
                           {file.webViewLink ? (
                             <a href={file.webViewLink} target="_blank" rel="noreferrer">
                               {file.name}

@@ -43,8 +43,17 @@ type ToolCall = {
   id: string;
   type: "function";
   function: {
-    name: "search_drive" | "open_file";
+    name: "search_drive" | "open_file" | "keep_file";
     arguments: string;
+  };
+};
+
+type ToolDefinition = {
+  type: "function";
+  function: {
+    name: ToolCall["function"]["name"];
+    description: string;
+    parameters: Record<string, unknown>;
   };
 };
 
@@ -106,6 +115,12 @@ export type AgentOptions = {
 export type AgentProgress =
   | { type: "progress"; message: string }
   | { type: "file"; file: DriveFile }
+  // Curated list mode only: a file the agent opened and is evaluating for
+  // relevance. It is provisional and may never be kept.
+  | { type: "reviewing"; file: DriveFile }
+  // Curated list mode only: a file the agent explicitly kept as relevant via
+  // keep_file. The set of kept files is the authoritative curated result.
+  | { type: "kept"; file: DriveFile }
   | { type: "final"; answer: string; answerFormat: "markdown" | "plain"; files: DriveFile[] }
   | { type: "error"; message: string };
 
@@ -119,48 +134,89 @@ const openArgs = z.object({
   fileId: z.string().min(1)
 });
 
-const tools = [
-  {
-    type: "function",
-    function: {
-      name: "search_drive",
-      description:
-        "Search the user's selected Google Drive connections for files relevant to a query.",
-      parameters: {
-        type: "object",
-        properties: {
-          query: {
-            type: "string",
-            description: "A concise Google Drive search query. Try alternate wording when needed."
-          },
-          limit: {
-            type: "number",
-            description: "Maximum results per connected Drive, up to 20."
-          }
+const keepArgs = z.object({
+  connectionId: z.string().min(1),
+  fileId: z.string().min(1)
+});
+
+const searchTool: ToolDefinition = {
+  type: "function",
+  function: {
+    name: "search_drive",
+    description:
+      "Search the user's selected Google Drive connections for files relevant to a query.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description: "A concise Google Drive search query. Try alternate wording when needed."
         },
-        required: ["query"],
-        additionalProperties: false
-      }
-    }
-  },
-  {
-    type: "function",
-    function: {
-      name: "open_file",
-      description:
-        "Open and read a file returned by search_drive. Use the exact connectionId and fileId from search results.",
-      parameters: {
-        type: "object",
-        properties: {
-          connectionId: { type: "string" },
-          fileId: { type: "string" }
-        },
-        required: ["connectionId", "fileId"],
-        additionalProperties: false
-      }
+        limit: {
+          type: "number",
+          description: "Maximum results per connected Drive, up to 20."
+        }
+      },
+      required: ["query"],
+      additionalProperties: false
     }
   }
-];
+};
+
+const openFileTool: ToolDefinition = {
+  type: "function",
+  function: {
+    name: "open_file",
+    description:
+      "Open and read a file returned by search_drive. Use the exact connectionId and fileId from search results.",
+    parameters: {
+      type: "object",
+      properties: {
+        connectionId: { type: "string" },
+        fileId: { type: "string" }
+      },
+      required: ["connectionId", "fileId"],
+      additionalProperties: false
+    }
+  }
+};
+
+// Curated list mode only. Lets the model commit a relevance decision per file
+// the moment it has read it, instead of emitting one list at the very end. The
+// set of kept files is the authoritative curated result, so the UI can promote
+// files from "reviewing" to "kept" live as the agent works.
+const keepFileTool: ToolDefinition = {
+  type: "function",
+  function: {
+    name: "keep_file",
+    description:
+      "Mark an already-opened file as relevant so it is included in the curated results. Call this immediately after reading a file whose content is relevant to the query. Only files you have opened can be kept.",
+    parameters: {
+      type: "object",
+      properties: {
+        connectionId: { type: "string" },
+        fileId: { type: "string" }
+      },
+      required: ["connectionId", "fileId"],
+      additionalProperties: false
+    }
+  }
+};
+
+const baseTools: ToolDefinition[] = [searchTool, openFileTool];
+
+function isCuratingRequest(input: AgentRequest) {
+  return input.mode === "list" && input.curateList;
+}
+
+/**
+ * Tools offered to the model for a given request. `keep_file` is only useful
+ * (and only enabled) when curating a file list; offering it elsewhere would
+ * just tempt the model into calls that have no effect.
+ */
+function toolsForRequest(input: AgentRequest): ToolDefinition[] {
+  return isCuratingRequest(input) ? [...baseTools, keepFileTool] : baseTools;
+}
 
 export const defaultAgentBudgets: Record<AgentRequest["mode"], AgentBudget> = {
   list: {
@@ -189,10 +245,13 @@ export function resolveAgentBudget(
   };
 }
 
-function basePrompt(allowedDriveIds: string[], budget: AgentBudget) {
+function basePrompt(allowedDriveIds: string[], budget: AgentBudget, curating = false) {
+  const toolList = curating
+    ? "You have exactly three tools: search_drive, open_file, and keep_file."
+    : "You have exactly two tools: search_drive and open_file.";
   return `You are a Google Drive research agent.
 
-You have exactly two tools: search_drive and open_file.
+${toolList}
 You may only work with these selected Drive connection IDs: ${allowedDriveIds.join(", ")}.
 Use at most ${budget.maxSearchCalls} search_drive calls.
 Use at most ${budget.maxOpenFileCalls} open_file calls.
@@ -224,15 +283,15 @@ function listSystemPrompt(
   curateList: boolean
 ) {
   if (curateList) {
-    return `${basePrompt(allowedDriveIds, budget)}
+    return `${basePrompt(allowedDriveIds, budget, true)}
 
 Find relevant files only. Do not synthesize an answer.
-Open files that may be relevant, then curate the final list from opened files only.
-Only include a file in your final selection if its opened content is relevant to the query.
-When you are done, return exactly:
+Open files that may be relevant. The moment you read a file whose content is relevant to the query, call keep_file with its connectionId and fileId.
+Only keep files you have actually opened and judged relevant; never keep a file you have not opened.
+The files you keep are the entire curated result. A file you never keep will not be returned, so be sure to keep every relevant file as you go.
+When you have opened the promising files and kept the relevant ones, stop calling tools and reply with exactly:
 FORMAT: plain
-CURATED_FILE_LIST: [{"connectionId":"...","fileId":"..."}]
-Use an empty array if no opened files are relevant.`;
+DONE`;
   }
 
   return `${basePrompt(allowedDriveIds, budget)}
@@ -259,9 +318,10 @@ async function callModel(
   messages: ChatMessage[],
   requestId: string,
   step: number,
-  allowTools: boolean = true
+  offeredTools: ToolDefinition[] | null = null
 ) {
   const startedAt = Date.now();
+  const toolsEnabled = Boolean(offeredTools?.length);
 
   await writeDebugLog({
     event: "agent.model.request",
@@ -270,7 +330,7 @@ async function callModel(
     model: settings.model,
     modelSettingsSource: settings.source,
     messageCount: messages.length,
-    toolsEnabled: allowTools
+    toolsEnabled
   });
 
   try {
@@ -291,7 +351,7 @@ async function callModel(
       body: JSON.stringify({
         model: settings.model,
         messages,
-        ...(allowTools ? { tools, tool_choice: "auto" } : {}),
+        ...(toolsEnabled ? { tools: offeredTools, tool_choice: "auto" } : {}),
         temperature: 0.2
       })
     });
@@ -393,30 +453,20 @@ export function parseFinalAnswer(content: string | null, mode: AgentRequest["mod
   };
 }
 
-export function curatedListFiles(content: string | null, openedFiles: DriveFile[]) {
-  const raw = content?.trim() ?? "";
-  const match = raw.match(/CURATED_FILE_LIST:\s*(\[[\s\S]*\])\s*$/);
-  if (!match) return uniqueFiles(openedFiles);
-
-  const openedByKey = new Map(openedFiles.map((file) => [fileKey(file), file]));
-  try {
-    const selected = z
-      .array(
-        z.object({
-          connectionId: z.string().min(1),
-          fileId: z.string().min(1).optional(),
-          id: z.string().min(1).optional()
-        })
-      )
-      .parse(JSON.parse(match[1]));
-    return uniqueFiles(
-      selected
-        .map((file) => openedByKey.get(`${file.connectionId}:${file.fileId ?? file.id}`))
-        .filter((file): file is DriveFile => Boolean(file))
-    );
-  } catch {
-    return uniqueFiles(openedFiles);
+/**
+ * Resolve the curated file list for list mode. Normally this is the set of files
+ * the model explicitly kept via keep_file. As a safety net, if the model opened
+ * files but kept none — usually because it ignored keep_file rather than judging
+ * everything irrelevant — fall back to the reviewed (opened) files so the run
+ * still returns something useful instead of an empty list. The `fallback` flag
+ * reports whether that substitution happened (for logging / progress).
+ */
+export function curatedResultFiles(keptFiles: DriveFile[], openedFiles: DriveFile[]) {
+  if (keptFiles.length > 0) {
+    return { files: uniqueFiles(keptFiles), fallback: false };
   }
+  const reviewed = uniqueFiles(openedFiles);
+  return { files: reviewed, fallback: reviewed.length > 0 };
 }
 
 function isRetryableToolError(error: unknown) {
@@ -447,6 +497,26 @@ async function withToolRetries<T>(
  */
 type ToolResultMessage = Extract<ChatMessage, { role: "tool" }>;
 
+function errorText(error: unknown) {
+  return error instanceof Error ? error.message : "unknown error";
+}
+
+/**
+ * Build a tool-result observation for a tool call that failed to execute.
+ * Returning this to the model (instead of throwing) keeps a single bad file or
+ * transient Drive error from aborting the entire run: the model sees the
+ * failure as an observation and can route around it — open a different file, or
+ * synthesize from the evidence it already gathered. Mirrors the `skipped`
+ * observations the handlers already return when a budget is exhausted.
+ */
+function toolErrorObservation(toolCallId: string, message: string): ToolResultMessage {
+  return {
+    role: "tool",
+    tool_call_id: toolCallId,
+    content: safeJson({ error: true, message })
+  };
+}
+
 /**
  * Immutable per-run context shared by the tool handlers: everything that is
  * fixed for the lifetime of a single {@link runDriveAgent} call.
@@ -468,9 +538,15 @@ export type AgentRunContext = {
 export type AgentRunState = {
   referencedFiles: DriveFile[];
   openedFiles: DriveFile[];
+  /**
+   * Curated list mode only: files the model kept via `keep_file`. This is the
+   * authoritative curated result, populated live as the run progresses.
+   */
+  keptFiles: DriveFile[];
   searchedQueries: Set<string>;
   knownFileKeys: Set<string>;
   openedFileKeys: Set<string>;
+  keptFileKeys: Set<string>;
   searchCallCount: number;
   openFileCallCount: number;
   lowProgressSearchCount: number;
@@ -547,7 +623,10 @@ export async function handleSearchTool(
       searchCallCount: state.searchCallCount,
       error: debugError(error)
     });
-    throw error;
+    return toolErrorObservation(
+      toolCall.id,
+      `Search failed: ${errorText(error)}. Try a different query or use the files already found.`
+    );
   }
   const newFiles = files.filter((file) => !state.knownFileKeys.has(fileKey(file)));
   await writeDebugLog({
@@ -602,7 +681,8 @@ export async function handleOpenFileTool(
   step: number,
   toolCall: ToolCall
 ): Promise<ToolResultMessage> {
-  const { requestId, budget, selectedDriveIds, ownerSub, emit } = context;
+  const { requestId, budget, selectedDriveIds, ownerSub, input, emit } = context;
+  const curating = isCuratingRequest(input);
   const args = openArgs.parse(JSON.parse(toolCall.function.arguments || "{}"));
   await writeDebugLog({
     event: "agent.tool.open_file.requested",
@@ -686,7 +766,10 @@ export async function handleOpenFileTool(
       openFileCallCount: state.openFileCallCount,
       error: debugError(error)
     });
-    throw error;
+    return toolErrorObservation(
+      toolCall.id,
+      `Could not open this file: ${errorText(error)}. It may be inaccessible; continue with the other files.`
+    );
   }
   await writeDebugLog({
     event: "agent.tool.open_file.completed",
@@ -699,10 +782,19 @@ export async function handleOpenFileTool(
     openFileCallCount: state.openFileCallCount
   });
   state.knownFileKeys.add(fileKey(opened.file));
-  state.referencedFiles.push(opened.file);
   state.openedFiles.push(opened.file);
-  await emit({ type: "progress", message: `Opened ${formatFileProgressLabel(opened.file)}` });
-  await emit({ type: "file", file: opened.file });
+  // When curating, an opened file is only a candidate: it becomes a result only
+  // if the model later keeps it. The authoritative list is state.keptFiles, so
+  // we surface the open as a provisional "reviewing" event and leave it out of
+  // referencedFiles. Otherwise an open is itself a result the UI should show.
+  if (curating) {
+    await emit({ type: "progress", message: `Reviewing ${formatFileProgressLabel(opened.file)}` });
+    await emit({ type: "reviewing", file: opened.file });
+  } else {
+    state.referencedFiles.push(opened.file);
+    await emit({ type: "progress", message: `Opened ${formatFileProgressLabel(opened.file)}` });
+    await emit({ type: "file", file: opened.file });
+  }
   return {
     role: "tool",
     tool_call_id: toolCall.id,
@@ -710,6 +802,81 @@ export async function handleOpenFileTool(
       file: opened.file,
       content: opened.content
     })
+  };
+}
+
+/**
+ * Handle a single `keep_file` tool call (curated list mode only): record the
+ * model's decision to keep an already-opened file as relevant. This is the
+ * authoritative curation signal — the kept set becomes the final result — so it
+ * runs live, emitting a `kept` event the UI uses to promote the file out of the
+ * provisional "reviewing" state. Keeping a file that was never opened is
+ * rejected as a tool-result observation (not thrown) so the model can recover.
+ */
+export async function handleKeepFileTool(
+  context: AgentRunContext,
+  state: AgentRunState,
+  step: number,
+  toolCall: ToolCall
+): Promise<ToolResultMessage> {
+  const { requestId, emit } = context;
+  const args = keepArgs.parse(JSON.parse(toolCall.function.arguments || "{}"));
+  const key = `${args.connectionId}:${args.fileId}`;
+  await writeDebugLog({
+    event: "agent.tool.keep_file.requested",
+    requestId,
+    step,
+    toolCallIdHash: hashForDebug(toolCall.id),
+    fileKeyHash: hashForDebug(key),
+    keptFileCount: state.keptFiles.length
+  });
+
+  const opened = state.openedFiles.find((candidate) => fileKey(candidate) === key);
+  if (!opened) {
+    await writeDebugLog({
+      event: "agent.tool.keep_file.rejected",
+      level: "warn",
+      requestId,
+      step,
+      reason: "not_opened",
+      fileKeyHash: hashForDebug(key)
+    });
+    return toolErrorObservation(
+      toolCall.id,
+      "Open this file with open_file before keeping it. Only files you have opened can be kept."
+    );
+  }
+
+  if (state.keptFileKeys.has(key)) {
+    await writeDebugLog({
+      event: "agent.tool.keep_file.skipped",
+      requestId,
+      step,
+      reason: "already_kept",
+      fileKeyHash: hashForDebug(key)
+    });
+    return {
+      role: "tool",
+      tool_call_id: toolCall.id,
+      content: safeJson({ kept: true, alreadyKept: true })
+    };
+  }
+
+  state.keptFileKeys.add(key);
+  state.keptFiles.push(opened);
+  await writeDebugLog({
+    event: "agent.tool.keep_file.completed",
+    requestId,
+    step,
+    fileKeyHash: hashForDebug(key),
+    keptFileCount: state.keptFiles.length
+  });
+  await emit({ type: "progress", message: `Kept ${formatFileProgressLabel(opened)}` });
+  await emit({ type: "kept", file: opened });
+  return {
+    role: "tool",
+    tool_call_id: toolCall.id,
+    content: safeJson({ kept: true })
   };
 }
 
@@ -776,14 +943,22 @@ export async function runDriveAgent(
   const state: AgentRunState = {
     referencedFiles: [],
     openedFiles: [],
+    keptFiles: [],
     searchedQueries: new Set<string>(),
     knownFileKeys: new Set<string>(),
     openedFileKeys: new Set<string>(),
+    keptFileKeys: new Set<string>(),
     searchCallCount: 0,
     openFileCallCount: 0,
     lowProgressSearchCount: 0,
     stopAfterToolUseReason: null
   };
+  const curating = isCuratingRequest(input);
+  // In curated mode the curated result is the set of kept files, built up live
+  // via keep_file rather than parsed from a final message. See curatedResultFiles
+  // for the empty-keep fallback.
+  const curatedResult = () => curatedResultFiles(state.keptFiles, state.openedFiles);
+  const activeTools = toolsForRequest(input);
   const messages: ChatMessage[] = [
     { role: "system", content: systemPrompt(input, selectedDriveIds, budget) },
     {
@@ -802,21 +977,24 @@ export async function runDriveAgent(
     if (state.stopAfterToolUseReason && !stopInstructionSent) {
       messages.push({
         role: "user",
-        content: `${state.stopAfterToolUseReason} Stop using tools and return the final result now.`
+        content: curating
+          ? `${state.stopAfterToolUseReason} Stop searching and opening files. Keep any remaining relevant opened files with keep_file, then reply to finish.`
+          : `${state.stopAfterToolUseReason} Stop using tools and return the final result now.`
       });
       stopInstructionSent = true;
     }
 
-    // Once a budget has forced a stop, disable tools so the model must produce
-    // the final result on this turn (respecting the mode, e.g. synthesis)
-    // instead of issuing more tool calls that would only be skipped.
-    const completion = await callModel(
-      modelSettings,
-      messages,
-      requestId,
-      step,
-      !stopInstructionSent
-    );
+    // Once a budget has forced a stop, drop the search/open tools so the model
+    // must wind down instead of issuing calls that would only be skipped. In
+    // curated mode keep_file is free and is the curation signal itself, so we
+    // keep offering it until the model finishes — otherwise a file opened right
+    // before the stop could never be kept.
+    const offeredTools = stopInstructionSent
+      ? curating
+        ? [keepFileTool]
+        : null
+      : activeTools;
+    const completion = await callModel(modelSettings, messages, requestId, step, offeredTools);
     const message = completion.choices[0]?.message;
     if (!message) {
       await writeDebugLog({
@@ -838,10 +1016,14 @@ export async function runDriveAgent(
 
     if (!message.tool_calls?.length) {
       const { answer, answerFormat } = parseFinalAnswer(message.content, input.mode);
-      const files =
-        input.mode === "list" && input.curateList
-          ? curatedListFiles(message.content, state.openedFiles)
-          : uniqueFiles(state.referencedFiles);
+      const curated = curating ? curatedResult() : null;
+      const files = curated ? curated.files : uniqueFiles(state.referencedFiles);
+      if (curated?.fallback) {
+        await emit({
+          type: "progress",
+          message: "No files were explicitly kept; returning all reviewed files."
+        });
+      }
       await writeDebugLog({
         event: "agent.completed",
         requestId,
@@ -851,6 +1033,8 @@ export async function runDriveAgent(
         searchCallCount: state.searchCallCount,
         openFileCallCount: state.openFileCallCount,
         referencedFileCount: state.referencedFiles.length,
+        keptFileCount: state.keptFiles.length,
+        curatedFallback: curated?.fallback ?? false,
         returnedFileCount: files.length,
         answerFormat,
         answerLength: answer.length
@@ -864,6 +1048,8 @@ export async function runDriveAgent(
         messages.push(await handleSearchTool(context, state, step, toolCall));
       } else if (toolCall.function.name === "open_file") {
         messages.push(await handleOpenFileTool(context, state, step, toolCall));
+      } else if (toolCall.function.name === "keep_file") {
+        messages.push(await handleKeepFileTool(context, state, step, toolCall));
       }
     }
   }
@@ -873,10 +1059,10 @@ export async function runDriveAgent(
   // Budget exhausted: force one final, tool-free turn so the agent still
   // respects the requested mode. Without this, synthesis runs that ran out of
   // steps would skip synthesis and return only the raw list of files read.
-  // List mode without curation needs no model turn (its answer is the file
-  // list itself), so we skip the extra call there.
-  const needsFinalModelTurn =
-    input.mode === "synthesis" || (input.mode === "list" && input.curateList);
+  // List mode needs no model turn: un-curated returns the files found, and
+  // curated returns the files already kept live via keep_file. So only
+  // synthesis needs the extra call.
+  const needsFinalModelTurn = input.mode === "synthesis";
   let finalContent: string | null = null;
   if (needsFinalModelTurn) {
     messages.push({
@@ -889,7 +1075,7 @@ export async function runDriveAgent(
         messages,
         requestId,
         budget.maxToolSteps,
-        false
+        null
       );
       finalContent = completion.choices[0]?.message?.content ?? null;
     } catch (error) {
@@ -907,12 +1093,14 @@ export async function runDriveAgent(
     finalContent !== null
       ? parseFinalAnswer(finalContent, input.mode)
       : partialAnswer(reason, input.mode);
-  const files =
-    input.mode === "list" && input.curateList
-      ? finalContent !== null
-        ? curatedListFiles(finalContent, state.openedFiles)
-        : uniqueFiles(state.openedFiles)
-      : uniqueFiles(state.referencedFiles);
+  const curated = curating ? curatedResult() : null;
+  const files = curated ? curated.files : uniqueFiles(state.referencedFiles);
+  if (curated?.fallback) {
+    await emit({
+      type: "progress",
+      message: "No files were explicitly kept; returning all reviewed files."
+    });
+  }
   await writeDebugLog({
     event: "agent.completed",
     requestId,
@@ -923,6 +1111,8 @@ export async function runDriveAgent(
     searchCallCount: state.searchCallCount,
     openFileCallCount: state.openFileCallCount,
     referencedFileCount: state.referencedFiles.length,
+    keptFileCount: state.keptFiles.length,
+    curatedFallback: curated?.fallback ?? false,
     returnedFileCount: files.length,
     answerFormat,
     answerLength: answer.length

@@ -6,13 +6,26 @@
 - Do not run browser-based tests or browser automation for this project.
 - Prefer non-browser verification such as `npm run typecheck`, `npm run lint`, or targeted unit-level checks when they are relevant.
 - Unit tests live in `test/` and run with Vitest (`npm test`, or `npm run test:watch`).
-  They cover pure helpers only (no network/DB/browser): `formatMimeType`,
+  They cover mostly pure helpers (no network/DB/browser): `formatMimeType`,
   `encryptSecret`/`decryptSecret`, the SSRF guard
   (`validatePublicHttpsBaseUrl`/`isPrivateIpv4`/`isPrivateIpv6`/`isPrivateAddress`),
-  `escapeDriveQuery`, `parseFinalAnswer`/`curatedListFiles`, and the debug-log
-  redaction helpers (`debugText`/`isDebugContentLogEnabled`, which force content
-  previews off when `NODE_ENV=production`). Add new tests here when you touch
-  these functions.
+  `escapeDriveQuery`, `emptyExtractionNote`, `parseFinalAnswer`,
+  and the debug-log redaction helpers (`debugText`/`isDebugContentLogEnabled`, which
+  force content previews off when `NODE_ENV=production`). `test/agent.test.ts` also
+  covers `handleOpenFileTool`'s failure path with a mocked `openDriveFile` (a tool
+  execution error must become a tool-result observation, never abort the run) and
+  the curated `keep_file` flow via `handleKeepFileTool`. Add new tests here when you
+  touch these functions.
+
+  Curated file-list mode does live curation: opening a file emits a provisional
+  `reviewing` event, and the model promotes relevant files with the `keep_file`
+  tool (`handleKeepFileTool`), which emits a `kept` event. The set of kept files
+  (`AgentRunState.keptFiles`) is the authoritative curated result — there is no
+  end-of-run `CURATED_FILE_LIST` marker anymore. `keep_file` is only offered to the
+  model when curating, and a file must be opened before it can be kept.
+  `curatedResultFiles(keptFiles, openedFiles)` resolves the final list and applies
+  a safety net: if the model opened files but kept none, it falls back to the
+  reviewed (opened) files rather than returning nothing (and reports `fallback`).
 
 ## Railway MCP: pin the project/environment first
 

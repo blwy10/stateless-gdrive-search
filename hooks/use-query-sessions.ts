@@ -19,6 +19,8 @@ export type DriveFile = {
 type StreamEvent =
   | { type: "progress"; message: string }
   | { type: "file"; file: DriveFile }
+  | { type: "reviewing"; file: DriveFile }
+  | { type: "kept"; file: DriveFile }
   | { type: "final"; answer: string; answerFormat: "markdown" | "plain"; files: DriveFile[] }
   | { type: "error"; message: string };
 
@@ -33,6 +35,11 @@ export type QuerySession = {
   status: "draft" | "running" | "finished" | "error";
   events: string[];
   files: DriveFile[];
+  // Curated list mode only: files the agent has opened and is still evaluating
+  // for relevance. They move into `files` once kept and are cleared when the run
+  // settles. Transient/UI-only, but kept on the session so the UI renders from a
+  // single source of truth.
+  reviewingFiles: DriveFile[];
   answer: string;
   answerFormat: "markdown" | "plain";
   error: string;
@@ -62,6 +69,7 @@ export function useQuerySessions() {
             ...session,
             curateList: session.curateList ?? false,
             answerFormat: session.answerFormat ?? ("plain" as const),
+            reviewingFiles: [],
             ...(session.status === "running"
               ? {
                   status: "error" as const,
@@ -106,6 +114,19 @@ export function useQuerySessions() {
     });
   }, [activeSession]);
 
+  // Curated mode: files still being judged, with anything already promoted to
+  // results (kept) or duplicated filtered out.
+  const reviewingFiles = useMemo(() => {
+    const resultKeys = new Set(uniqueFiles.map((file) => `${file.connectionId}:${file.id}`));
+    const seen = new Set<string>();
+    return (activeSession?.reviewingFiles ?? []).filter((file) => {
+      const key = `${file.connectionId}:${file.id}`;
+      if (resultKeys.has(key) || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }, [activeSession, uniqueFiles]);
+
   const runningSessionCount = sessions.filter((session) => session.status === "running").length;
 
   // Drive connections live outside this hook; when the last one is removed the
@@ -142,6 +163,7 @@ export function useQuerySessions() {
       status: "draft",
       events: [],
       files: [],
+      reviewingFiles: [],
       answer: "",
       answerFormat: "plain",
       error: ""
@@ -254,6 +276,7 @@ export function useQuerySessions() {
       status: "running",
       events: [],
       files: [],
+      reviewingFiles: [],
       answer: "",
       answerFormat: "plain",
       error: ""
@@ -312,6 +335,36 @@ export function useQuerySessions() {
                   : item
               )
             );
+          } else if (event.type === "reviewing") {
+            // Curated mode: a provisional candidate the agent is still judging.
+            setSessions((current) =>
+              current.map((item) =>
+                item.id === session.id
+                  ? {
+                      ...item,
+                      reviewingFiles: [...item.reviewingFiles, event.file],
+                      updatedAt: new Date().toISOString()
+                    }
+                  : item
+              )
+            );
+          } else if (event.type === "kept") {
+            // Curated mode: promote the file from "reviewing" into the results.
+            const keptKey = `${event.file.connectionId}:${event.file.id}`;
+            setSessions((current) =>
+              current.map((item) =>
+                item.id === session.id
+                  ? {
+                      ...item,
+                      files: [...item.files, event.file],
+                      reviewingFiles: item.reviewingFiles.filter(
+                        (file) => `${file.connectionId}:${file.id}` !== keptKey
+                      ),
+                      updatedAt: new Date().toISOString()
+                    }
+                  : item
+              )
+            );
           } else if (event.type === "final") {
             receivedTerminalEvent = true;
             setProgressOpen(false);
@@ -324,6 +377,7 @@ export function useQuerySessions() {
                       answer: event.answer,
                       answerFormat: event.answerFormat,
                       files: event.files,
+                      reviewingFiles: [],
                       error: "",
                       updatedAt: new Date().toISOString()
                     }
@@ -338,6 +392,7 @@ export function useQuerySessions() {
                   ? {
                       ...item,
                       status: "error",
+                      reviewingFiles: [],
                       error: event.message,
                       updatedAt: new Date().toISOString()
                     }
@@ -379,6 +434,7 @@ export function useQuerySessions() {
     activeSessionId,
     activeSession,
     uniqueFiles,
+    reviewingFiles,
     runningSessionCount,
     query,
     mode,

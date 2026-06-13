@@ -422,6 +422,18 @@ function unsupportedGoogleAppsContent(file: Omit<DriveFile, "connectionId" | "dr
   ].join("\n");
 }
 
+/**
+ * Note returned in place of empty extracted content. Some files open
+ * successfully but yield no readable text — an image-only/scanned PDF, an empty
+ * document, or a layout this parser does not understand. Returning "" would
+ * silently tell the agent the file had nothing relevant; this explicit note
+ * lets the model report the gap (and point the user at the original file).
+ */
+export function emptyExtractionNote(file: Pick<DriveFile, "name" | "webViewLink">) {
+  const linkText = file.webViewLink ? ` Open it in Drive to view it: ${file.webViewLink}` : "";
+  return `No readable text could be extracted from "${file.name}". It may be empty, image-only (such as a scanned PDF), or in a format this app cannot parse.${linkText}`;
+}
+
 export async function openDriveFile(input: {
   ownerSub: string;
   connectionId: string;
@@ -505,6 +517,8 @@ export async function openDriveFile(input: {
   }
 
   const trimmedContent = trimContent(content);
+  const emptyExtraction = trimmedContent.length === 0;
+  const finalContent = emptyExtraction ? emptyExtractionNote(metadata) : trimmedContent;
   await writeDebugLog({
     event: "drive.open.completed",
     requestId: input.debugRequestId,
@@ -513,7 +527,8 @@ export async function openDriveFile(input: {
     fileIdHash: hashForDebug(input.fileId),
     mimeType: metadata.mimeType,
     rawContentLength: content.length,
-    returnedContentLength: trimmedContent.length
+    returnedContentLength: finalContent.length,
+    emptyExtraction
   });
 
   return {
@@ -522,6 +537,6 @@ export async function openDriveFile(input: {
       connectionId: connection.id,
       driveEmail: connection.driveEmail
     },
-    content: trimmedContent
+    content: finalContent
   };
 }

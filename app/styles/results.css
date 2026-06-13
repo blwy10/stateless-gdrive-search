@@ -145,3 +145,27 @@
   color: var(--accent-strong);
   overflow-wrap: anywhere;
 }
+
+.file-card.reviewing {
+  border-style: dashed;
+  background: #fbfcfb;
+  opacity: 0.85;
+}
+
+.reviewing-badge {
+  justify-self: start;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 1px 8px;
+}
+
+.panel-subtitle {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+}

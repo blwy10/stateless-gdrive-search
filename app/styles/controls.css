@@ -132,18 +132,20 @@
 
 .radio-row {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   gap: 8px;
 }
 
 .radio-card {
   border: 1px solid var(--line);
   border-radius: 7px;
-  padding: 10px 12px;
+  padding: 8px 11px;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 7px;
   background: #ffffff;
+  font-size: 14px;
+  white-space: nowrap;
 }
 
 .checkbox-card {

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import { describe, expect, it } from "vitest";
-import { escapeDriveQuery } from "@/lib/drive";
+import { emptyExtractionNote, escapeDriveQuery } from "@/lib/drive";
 
 describe("escapeDriveQuery", () => {
   it("leaves ordinary text untouched", () => {
@@ -27,5 +27,26 @@ describe("escapeDriveQuery", () => {
 
   it("escapes every occurrence", () => {
     expect(escapeDriveQuery("'a'b'")).toBe("\\'a\\'b\\'");
+  });
+});
+
+describe("emptyExtractionNote", () => {
+  it("states that no text was extracted and names the file", () => {
+    const note = emptyExtractionNote({ name: "Scan.pdf" });
+    expect(note).toContain("No readable text");
+    expect(note).toContain("Scan.pdf");
+  });
+
+  it("appends a Drive link when webViewLink is present", () => {
+    const note = emptyExtractionNote({
+      name: "Scan.pdf",
+      webViewLink: "https://drive.example/abc"
+    });
+    expect(note).toContain("Open it in Drive");
+    expect(note).toContain("https://drive.example/abc");
+  });
+
+  it("omits the link clause when there is no webViewLink", () => {
+    expect(emptyExtractionNote({ name: "Empty.txt" })).not.toContain("Open it in Drive");
   });
 });
