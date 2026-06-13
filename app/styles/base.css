@@ -1,0 +1,62 @@
+/*
+ * Copyright (c) 2026 Benjamin Lau
+ * SPDX-License-Identifier: MIT
+ */
+
+/* Design tokens, global resets, base element defaults, and the .muted helper. */
+
+:root {
+  color-scheme: light;
+  --bg: #f7f8f6;
+  --panel: #ffffff;
+  --panel-strong: #f0f3ef;
+  --text: #1e2420;
+  --muted: #667067;
+  --line: #dfe5dd;
+  --accent: #176b5b;
+  --accent-strong: #0f4f44;
+  --success: #1e7a43;
+  --warning: #915f00;
+  --danger: #a83d3d;
+  --shadow: 0 18px 40px rgba(31, 43, 36, 0.08);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  min-height: 100%;
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    sans-serif;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+button {
+  border: 0;
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+a {
+  color: inherit;
+}
+
+.muted {
+  color: var(--muted);
+}

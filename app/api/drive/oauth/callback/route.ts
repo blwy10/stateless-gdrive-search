@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import { NextRequest, NextResponse } from "next/server";
-import { requireSession } from "@/lib/auth";
+import { requireSession, withAuth } from "@/lib/auth";
 import {
   assertDriveOAuthState,
   exchangeDriveCode,
@@ -10,9 +10,10 @@ import {
   getGoogleUserInfo
 } from "@/lib/google-oauth";
 import { upsertDriveConnection } from "@/lib/drive-connections";
+import { debugError, writeDebugLog } from "@/lib/debug-log";
 import { env } from "@/lib/env";
 
-export async function GET(request: NextRequest) {
+export const GET = withAuth(async (request: NextRequest) => {
   const session = await requireSession();
   const code = request.nextUrl.searchParams.get("code");
   const state = request.nextUrl.searchParams.get("state");
@@ -25,18 +26,27 @@ export async function GET(request: NextRequest) {
     return NextResponse.redirect(`${env.nextAuthUrl()}?drive_error=missing_code`);
   }
 
-  await assertDriveOAuthState(session.user.id, state);
-  const tokens = await exchangeDriveCode(code);
-  const userInfo = await getGoogleUserInfo(tokens.access_token);
-  await upsertDriveConnection({
-    ownerSub: session.user.id,
-    driveEmail: userInfo.email,
-    driveName: userInfo.name ?? null,
-    accessToken: tokens.access_token,
-    refreshToken: tokens.refresh_token ?? null,
-    expiresAt: expiresAtFromNow(tokens.expires_in),
-    scope: tokens.scope
-  });
+  try {
+    await assertDriveOAuthState(session.user.id, state);
+    const tokens = await exchangeDriveCode(code);
+    const userInfo = await getGoogleUserInfo(tokens.access_token);
+    await upsertDriveConnection({
+      ownerSub: session.user.id,
+      driveEmail: userInfo.email,
+      driveName: userInfo.name ?? null,
+      accessToken: tokens.access_token,
+      refreshToken: tokens.refresh_token ?? null,
+      expiresAt: expiresAtFromNow(tokens.expires_in),
+      scope: tokens.scope
+    });
+  } catch (error) {
+    await writeDebugLog({
+      event: "drive.oauth.callback.error",
+      level: "error",
+      error: debugError(error)
+    });
+    return NextResponse.redirect(`${env.nextAuthUrl()}?drive_error=exchange_failed`);
+  }
 
   return NextResponse.redirect(env.nextAuthUrl());
-}
+});

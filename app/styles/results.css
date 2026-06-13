@@ -1,0 +1,147 @@
+/*
+ * Copyright (c) 2026 Benjamin Lau
+ * SPDX-License-Identifier: MIT
+ */
+
+/*
+ * Results column: run-status banner and spinner, the streaming progress panel,
+ * the progress/download pill buttons, and the matched-files list.
+ */
+
+.run-status {
+  border: 1px solid var(--line);
+  border-left-width: 5px;
+  border-radius: 8px;
+  padding: 15px 16px;
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+  background: var(--panel);
+  box-shadow: var(--shadow);
+}
+
+.run-status.ready {
+  border-left-color: var(--muted);
+}
+
+.run-status.running {
+  border-left-color: var(--warning);
+  background: #fffaf0;
+}
+
+.run-status.finished {
+  border-left-color: var(--success);
+  background: #f1faf4;
+}
+
+.run-status.error {
+  border-left-color: var(--danger);
+  background: #fff6f6;
+}
+
+.run-status strong,
+.run-status span {
+  display: block;
+}
+
+.run-status strong {
+  font-size: 16px;
+}
+
+.run-status span {
+  margin-top: 3px;
+  color: var(--muted);
+  line-height: 1.4;
+}
+
+.status-icon {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  border: 2px solid currentColor;
+  color: var(--muted);
+  font-weight: 800;
+}
+
+.run-status.running .status-icon {
+  border-top-color: transparent;
+  color: var(--warning);
+  animation: spin 0.9s linear infinite;
+}
+
+.run-status.finished .status-icon {
+  color: var(--success);
+}
+
+.run-status.error .status-icon {
+  color: var(--danger);
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.stream {
+  display: grid;
+  gap: 10px;
+  max-height: 220px;
+  overflow: auto;
+}
+
+.progress-panel .panel-header {
+  border-bottom: 0;
+}
+
+.progress-panel .panel-body {
+  border-top: 1px solid var(--line);
+}
+
+.progress-toggle,
+.download-button {
+  min-height: 30px;
+  border-radius: 6px;
+  padding: 0 10px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--panel-strong);
+  color: var(--text);
+  border: 1px solid var(--line);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.stream-line {
+  border-left: 3px solid var(--line);
+  padding: 7px 10px;
+  color: var(--muted);
+  background: #fbfcfb;
+  border-radius: 0 6px 6px 0;
+}
+
+.file-list {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.file-card {
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 12px;
+  display: grid;
+  gap: 5px;
+}
+
+.file-card a {
+  font-weight: 700;
+  color: var(--accent-strong);
+  overflow-wrap: anywhere;
+}

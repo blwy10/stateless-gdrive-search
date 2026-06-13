@@ -3,7 +3,7 @@
 
 import JSZip from "jszip";
 import mammoth from "mammoth";
-import pdfParse from "pdf-parse";
+import { extractText, getDocumentProxy } from "unpdf";
 import {
   getDriveConnection,
   updateDriveAccessToken,
@@ -25,6 +25,24 @@ export type DriveFile = {
 
 const MAX_FILE_CHARS = 32_000;
 
+/**
+ * Per-request timeout for outbound Google Drive calls. Without it, a hung
+ * connection would stall the agent run indefinitely, holding its SSE stream and
+ * server resources open. Applied via {@link AbortSignal.timeout}, so it bounds
+ * connect + response-body read for each individual request (including retries,
+ * which create a fresh signal per attempt).
+ */
+const DRIVE_REQUEST_TIMEOUT_MS = 30_000;
+
+/**
+ * Upper bound on how many Drive connections we search concurrently. Searches
+ * across connections are independent, so we fan them out in parallel instead of
+ * awaiting each in turn (which multiplied latency on a path the agent hits
+ * repeatedly). The cap keeps a user with many connected drives from opening an
+ * unbounded number of simultaneous outbound requests (and DB reads) per search.
+ */
+const MAX_SEARCH_CONCURRENCY = 5;
+
 type DriveDebugContext = {
   requestId?: string;
   operation: string;
@@ -32,7 +50,7 @@ type DriveDebugContext = {
   fileId?: string;
 };
 
-function escapeDriveQuery(value: string) {
+export function escapeDriveQuery(value: string) {
   return value.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
 }
 
@@ -88,7 +106,8 @@ async function googleFetch(connection: DriveConnection, url: URL, context: Drive
   try {
     const active = await ensureAccessToken(connection, context.requestId);
     const response = await fetch(url, {
-      headers: { authorization: `Bearer ${active.accessToken}` }
+      headers: { authorization: `Bearer ${active.accessToken}` },
+      signal: AbortSignal.timeout(DRIVE_REQUEST_TIMEOUT_MS)
     });
     if (!response.ok) {
       const responseBody = await response.text();
@@ -104,7 +123,7 @@ async function googleFetch(connection: DriveConnection, url: URL, context: Drive
         fileIdHash: context.fileId ? hashForDebug(context.fileId) : null,
         response: debugText(responseBody)
       });
-      throw new Error(`Google Drive request failed: ${response.status} ${responseBody}`);
+      throw new Error(`Google Drive request failed with status ${response.status}`);
     }
     await writeDebugLog({
       event: "drive.google.completed",
@@ -133,6 +152,81 @@ async function googleFetch(connection: DriveConnection, url: URL, context: Drive
   }
 }
 
+/**
+ * Maps over {@link items} with at most {@link limit} workers running at once,
+ * preserving input order in the returned array. Behaves like
+ * {@link Promise.all} when {@link limit} is at least the number of items, and
+ * rejects with the first error a worker throws.
+ */
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  worker: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+  const runnerCount = Math.max(1, Math.min(limit, items.length));
+  const runners = Array.from({ length: runnerCount }, async () => {
+    while (true) {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= items.length) break;
+      results[index] = await worker(items[index], index);
+    }
+  });
+  await Promise.all(runners);
+  return results;
+}
+
+async function searchDriveConnection(input: {
+  ownerSub: string;
+  connectionId: string;
+  query: string;
+  limit: number;
+  debugRequestId?: string;
+}): Promise<DriveFile[]> {
+  const { connectionId } = input;
+  const connection = await getDriveConnection(input.ownerSub, connectionId);
+  if (!connection) {
+    await writeDebugLog({
+      event: "drive.search.connection_missing",
+      level: "warn",
+      requestId: input.debugRequestId,
+      connectionIdHash: hashForDebug(connectionId)
+    });
+    return [];
+  }
+  const url = new URL("https://www.googleapis.com/drive/v3/files");
+  url.searchParams.set(
+    "q",
+    `trashed = false and (name contains '${input.query}' or fullText contains '${input.query}')`
+  );
+  url.searchParams.set("pageSize", String(input.limit));
+  url.searchParams.set(
+    "fields",
+    "files(id,name,mimeType,webViewLink,modifiedTime,size)"
+  );
+  url.searchParams.set("supportsAllDrives", "true");
+  url.searchParams.set("includeItemsFromAllDrives", "true");
+  const response = await googleFetch(connection, url, {
+    requestId: input.debugRequestId,
+    operation: "search_files",
+    connectionId
+  });
+  const data = (await response.json()) as { files?: Omit<DriveFile, "connectionId" | "driveEmail">[] };
+  await writeDebugLog({
+    event: "drive.search.connection_completed",
+    requestId: input.debugRequestId,
+    connectionIdHash: hashForDebug(connectionId),
+    resultCount: data.files?.length ?? 0
+  });
+  return (data.files ?? []).map((file) => ({
+    ...file,
+    connectionId,
+    driveEmail: connection.driveEmail
+  }));
+}
+
 export async function searchDriveFiles(input: {
   ownerSub: string;
   connectionIds: string[];
@@ -143,7 +237,6 @@ export async function searchDriveFiles(input: {
   const startedAt = Date.now();
   const query = escapeDriveQuery(input.query.trim());
   const limit = Math.min(input.limit ?? 10, 20);
-  const files: DriveFile[] = [];
 
   await writeDebugLog({
     event: "drive.search.started",
@@ -153,49 +246,21 @@ export async function searchDriveFiles(input: {
     limit
   });
 
-  for (const connectionId of input.connectionIds) {
-    const connection = await getDriveConnection(input.ownerSub, connectionId);
-    if (!connection) {
-      await writeDebugLog({
-        event: "drive.search.connection_missing",
-        level: "warn",
-        requestId: input.debugRequestId,
-        connectionIdHash: hashForDebug(connectionId)
-      });
-      continue;
-    }
-    const url = new URL("https://www.googleapis.com/drive/v3/files");
-    url.searchParams.set(
-      "q",
-      `trashed = false and (name contains '${query}' or fullText contains '${query}')`
-    );
-    url.searchParams.set("pageSize", String(limit));
-    url.searchParams.set(
-      "fields",
-      "files(id,name,mimeType,webViewLink,modifiedTime,size)"
-    );
-    url.searchParams.set("supportsAllDrives", "true");
-    url.searchParams.set("includeItemsFromAllDrives", "true");
-    const response = await googleFetch(connection, url, {
-      requestId: input.debugRequestId,
-      operation: "search_files",
-      connectionId
-    });
-    const data = (await response.json()) as { files?: Omit<DriveFile, "connectionId" | "driveEmail">[] };
-    await writeDebugLog({
-      event: "drive.search.connection_completed",
-      requestId: input.debugRequestId,
-      connectionIdHash: hashForDebug(connectionId),
-      resultCount: data.files?.length ?? 0
-    });
-    for (const file of data.files ?? []) {
-      files.push({
-        ...file,
+  // Search every connection in parallel (bounded by MAX_SEARCH_CONCURRENCY).
+  // Results stay in connection order because mapWithConcurrency preserves it.
+  const perConnectionFiles = await mapWithConcurrency(
+    input.connectionIds,
+    MAX_SEARCH_CONCURRENCY,
+    (connectionId) =>
+      searchDriveConnection({
+        ownerSub: input.ownerSub,
         connectionId,
-        driveEmail: connection.driveEmail
-      });
-    }
-  }
+        query,
+        limit,
+        debugRequestId: input.debugRequestId
+      })
+  );
+  const files = perConnectionFiles.flat();
 
   await writeDebugLog({
     event: "drive.search.completed",
@@ -254,6 +319,12 @@ async function exportBuffer(
     fileId
   });
   return Buffer.from(await response.arrayBuffer());
+}
+
+async function extractPdfText(buffer: Buffer) {
+  const pdf = await getDocumentProxy(new Uint8Array(buffer));
+  const { text } = await extractText(pdf, { mergePages: true });
+  return text;
 }
 
 async function extractPptxText(buffer: Buffer) {
@@ -401,7 +472,7 @@ export async function openDriveFile(input: {
       content = (await exportBuffer(connection, input.fileId, "text/plain", input.debugRequestId)).toString("utf8");
       break;
     case "application/pdf":
-      content = (await pdfParse(await downloadBuffer(connection, input.fileId, input.debugRequestId))).text;
+      content = await extractPdfText(await downloadBuffer(connection, input.fileId, input.debugRequestId));
       break;
     case "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
     case "application/msword":

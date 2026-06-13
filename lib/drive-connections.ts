@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Benjamin Lau
 // SPDX-License-Identifier: MIT
 
-import crypto from "node:crypto";
 import { getPool } from "@/lib/db";
 import { decryptSecret, encryptSecret } from "@/lib/crypto";
 
@@ -50,7 +49,8 @@ export async function getDriveConnection(
   id: string
 ): Promise<DriveConnection | null> {
   const result = await getPool().query(
-    `select *
+    `select id, owner_sub, drive_email, drive_name, access_token_ciphertext,
+            refresh_token_ciphertext, expires_at, scope
      from drive_connections
      where owner_sub = $1 and id = $2`,
     [ownerSub, id]
@@ -78,38 +78,29 @@ export async function upsertDriveConnection(input: {
   expiresAt: Date | null;
   scope: string;
 }) {
-  const existing = await getPool().query(
-    `select id, refresh_token_ciphertext
-     from drive_connections
-     where owner_sub = $1 and drive_email = $2`,
-    [input.ownerSub, input.driveEmail]
-  );
-  const id = existing.rows[0]?.id ?? crypto.randomUUID();
-  const refreshCiphertext = input.refreshToken
-    ? encryptSecret(input.refreshToken)
-    : existing.rows[0]?.refresh_token_ciphertext ?? null;
-
   await getPool().query(
     `insert into drive_connections (
-       id, owner_sub, drive_email, drive_name, access_token_ciphertext,
+       owner_sub, drive_email, drive_name, access_token_ciphertext,
        refresh_token_ciphertext, expires_at, scope, updated_at
      )
-     values ($1, $2, $3, $4, $5, $6, $7, $8, now())
+     values ($1, $2, $3, $4, $5, $6, $7, now())
      on conflict (owner_sub, drive_email)
      do update set
        drive_name = excluded.drive_name,
        access_token_ciphertext = excluded.access_token_ciphertext,
-       refresh_token_ciphertext = excluded.refresh_token_ciphertext,
+       refresh_token_ciphertext = coalesce(
+         excluded.refresh_token_ciphertext,
+         drive_connections.refresh_token_ciphertext
+       ),
        expires_at = excluded.expires_at,
        scope = excluded.scope,
        updated_at = now()`,
     [
-      id,
       input.ownerSub,
       input.driveEmail,
       input.driveName,
       encryptSecret(input.accessToken),
-      refreshCiphertext,
+      input.refreshToken ? encryptSecret(input.refreshToken) : null,
       input.expiresAt,
       input.scope
     ]

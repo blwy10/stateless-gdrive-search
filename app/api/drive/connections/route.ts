@@ -2,15 +2,15 @@
 // SPDX-License-Identifier: MIT
 
 import { NextRequest, NextResponse } from "next/server";
-import { requireSession } from "@/lib/auth";
+import { requireSession, withAuth } from "@/lib/auth";
 import { deleteDriveConnection, listDriveConnections } from "@/lib/drive-connections";
 
-export async function GET() {
+export const GET = withAuth(async () => {
   const session = await requireSession();
   return NextResponse.json({ connections: await listDriveConnections(session.user.id) });
-}
+});
 
-export async function DELETE(request: NextRequest) {
+export const DELETE = withAuth(async (request: NextRequest) => {
   const session = await requireSession();
   const id = request.nextUrl.searchParams.get("id");
   if (!id) {
@@ -18,4 +18,4 @@ export async function DELETE(request: NextRequest) {
   }
   await deleteDriveConnection(session.user.id, id);
   return NextResponse.json({ ok: true });
-}
+});

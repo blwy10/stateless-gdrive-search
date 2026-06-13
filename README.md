@@ -41,6 +41,20 @@ DEBUG_LOGS=0
 DEBUG_LOG_CONTENT=0
 ```
 
+Optional per-user abuse protection on `/api/agent` (in-memory, keyed by the
+authenticated user). These have sensible defaults and only need to be set to
+override them:
+
+```bash
+AGENT_MAX_CONCURRENT_RUNS=2     # max simultaneous runs per user
+AGENT_RATE_LIMIT_BURST=10       # token-bucket capacity (immediate burst)
+AGENT_RATE_LIMIT_PER_MINUTE=20  # sustained runs per user per minute
+```
+
+The limiter is process-local. It fully protects a single-instance deployment; if
+you scale to multiple replicas, move this state to a shared store (e.g. Redis)
+so the limits are enforced globally.
+
 Create the database table:
 
 ```bash
@@ -52,6 +66,18 @@ Run locally:
 ```bash
 npm install
 npm run dev
+```
+
+## Tests
+
+Pure, security-sensitive helpers (MIME formatting, token encryption, the SSRF
+URL guard, Drive query escaping, and agent output parsing) are covered by a
+small [Vitest](https://vitest.dev) suite under `test/`. These tests touch no
+network, database, or browser:
+
+```bash
+npm test          # run once
+npm run test:watch
 ```
 
 ## Deployment
@@ -72,9 +98,12 @@ npm run start:standalone
 ```
 
 Railway also needs a PostgreSQL service connected through `DATABASE_URL`, plus
-the environment variables listed above. After generating the Railway public
-domain, set `NEXTAUTH_URL` to that origin and add these Google OAuth redirect
-paths on the production hostname:
+the environment variables listed above. Railway's managed Postgres is reached
+over the private network without TLS, so leave `DATABASE_SSL` unset there. On
+other hosts that require TLS, set `DATABASE_SSL=require` (or `verify` to validate
+the server certificate). After generating the Railway public domain, set
+`NEXTAUTH_URL` to that origin and add these Google OAuth redirect paths on the
+production hostname:
 
 - `/api/auth/callback/google`
 - `/api/drive/oauth/callback`
@@ -92,6 +121,6 @@ The login flow requests `openid email profile`. The Drive connection flow reques
 
 ## Local debug logs
 
-Set `DEBUG_LOGS=1` during local debugging to write structured JSONL agent traces to `.codex-debug/logs/agent-YYYY-MM-DD.jsonl`. These logs are ignored by git and are readable directly from the workspace.
+Set `DEBUG_LOGS=1` during local debugging to write structured JSONL agent traces to `.debug/logs/agent-YYYY-MM-DD.jsonl`. These logs are ignored by git and are readable directly from the workspace.
 
-By default, logs store metadata only: request IDs, event names, durations, counts, statuses, hashed identifiers, and content lengths. Set `DEBUG_LOG_CONTENT=1` only for local emergency debugging when short query, file-name, or error-response previews are needed. Do not enable either flag for production release builds.
+By default, logs store metadata only: request IDs, event names, durations, counts, statuses, hashed identifiers, and content lengths. Set `DEBUG_LOG_CONTENT=1` only for local emergency debugging when short query, file-name, or error-response previews are needed. Do not enable either flag for production release builds. As a safeguard, content previews are forced off whenever `NODE_ENV=production`, so `DEBUG_LOG_CONTENT=1` has no effect in production builds even if it is set.

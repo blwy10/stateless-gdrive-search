@@ -8,7 +8,8 @@ node_modules
 dist
 coverage
 *.log
-.codex-debug/
+.debug/
 .DS_Store
 tsconfig.tsbuildinfo
+next-env.d.ts
 client_secret_*.json

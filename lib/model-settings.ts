@@ -1,12 +1,11 @@
 // Copyright (c) 2026 Benjamin Lau
 // SPDX-License-Identifier: MIT
 
-import dns from "node:dns/promises";
-import net from "node:net";
 import { z } from "zod";
 import { decryptSecret, encryptSecret } from "@/lib/crypto";
 import { getPool } from "@/lib/db";
 import { env } from "@/lib/env";
+import { validatePublicHttpsBaseUrl } from "@/lib/ssrf";
 
 export type ModelSettingsSummary = {
   hasCustomModel: boolean;
@@ -120,86 +119,4 @@ async function getModelSettingsRow(ownerSub: string): Promise<ModelSettingsRow |
     [ownerSub]
   );
   return result.rows[0] ?? null;
-}
-
-async function validatePublicHttpsBaseUrl(value: string) {
-  let parsed: URL;
-  try {
-    parsed = new URL(value);
-  } catch {
-    throw new Error("Endpoint must be a valid URL");
-  }
-
-  if (parsed.protocol !== "https:") {
-    throw new Error("Endpoint must use https");
-  }
-  if (parsed.username || parsed.password) {
-    throw new Error("Endpoint must not include credentials");
-  }
-  if (parsed.hash || parsed.search) {
-    throw new Error("Endpoint must not include query parameters or fragments");
-  }
-  if (isBlockedHostname(parsed.hostname)) {
-    throw new Error("Endpoint host is not allowed");
-  }
-
-  const addresses = await dns.lookup(parsed.hostname, { all: true, verbatim: true });
-  if (addresses.length === 0 || addresses.some((address) => isPrivateAddress(address.address))) {
-    throw new Error("Endpoint host must resolve to public IP addresses");
-  }
-
-  return parsed.toString().replace(/\/$/, "");
-}
-
-function isBlockedHostname(hostname: string) {
-  const normalized = hostname.toLowerCase().replace(/\.$/, "");
-  return (
-    normalized === "localhost" ||
-    normalized.endsWith(".localhost") ||
-    normalized === "metadata.google.internal"
-  );
-}
-
-function isPrivateAddress(address: string) {
-  const mappedIpv4 = address.toLowerCase().startsWith("::ffff:")
-    ? address.slice("::ffff:".length)
-    : null;
-  const ipVersion = net.isIP(mappedIpv4 ?? address);
-  if (ipVersion === 4) return isPrivateIpv4(mappedIpv4 ?? address);
-  if (ipVersion === 6) return isPrivateIpv6(address);
-  return true;
-}
-
-function isPrivateIpv4(address: string) {
-  const parts = address.split(".").map((part) => Number(part));
-  if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) {
-    return true;
-  }
-
-  const [a, b] = parts;
-  return (
-    a === 0 ||
-    a === 10 ||
-    a === 127 ||
-    (a === 100 && b >= 64 && b <= 127) ||
-    (a === 169 && b === 254) ||
-    (a === 172 && b >= 16 && b <= 31) ||
-    (a === 192 && b === 168) ||
-    (a === 198 && (b === 18 || b === 19)) ||
-    a >= 224
-  );
-}
-
-function isPrivateIpv6(address: string) {
-  const normalized = address.toLowerCase();
-  return (
-    normalized === "::1" ||
-    normalized === "::" ||
-    normalized.startsWith("fc") ||
-    normalized.startsWith("fd") ||
-    normalized.startsWith("fe8") ||
-    normalized.startsWith("fe9") ||
-    normalized.startsWith("fea") ||
-    normalized.startsWith("feb")
-  );
 }

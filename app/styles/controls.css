@@ -1,0 +1,174 @@
+/*
+ * Copyright (c) 2026 Benjamin Lau
+ * SPDX-License-Identifier: MIT
+ */
+
+/*
+ * Shared UI primitives reused across features: buttons, icon buttons, panels
+ * (header/body), and form controls (fields, inputs, radio/checkbox cards).
+ */
+
+.button-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.button {
+  min-height: 40px;
+  border-radius: 7px;
+  padding: 0 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  background: var(--accent);
+  color: #ffffff;
+  font-weight: 650;
+  text-decoration: none;
+}
+
+.button.secondary {
+  background: var(--panel-strong);
+  color: var(--text);
+  border: 1px solid var(--line);
+}
+
+.button.danger {
+  background: #fff2f2;
+  color: var(--danger);
+  border: 1px solid #efcaca;
+}
+
+.icon-button {
+  width: 34px;
+  height: 34px;
+  border-radius: 6px;
+  display: grid;
+  place-items: center;
+  background: var(--panel-strong);
+  color: var(--text);
+  border: 1px solid var(--line);
+  font-weight: 800;
+}
+
+.icon-button svg {
+  width: 18px;
+  height: 18px;
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+}
+
+.panel-header {
+  padding: 16px 18px;
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.panel-header h2 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.panel-body {
+  padding: 18px;
+}
+
+.form-grid {
+  display: grid;
+  gap: 14px;
+}
+
+.field {
+  display: grid;
+  gap: 7px;
+}
+
+.field label {
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.field textarea,
+.field input,
+.field select {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #ffffff;
+  color: var(--text);
+  padding: 10px 11px;
+  outline: none;
+}
+
+.field textarea:focus,
+.field input:focus,
+.field select:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(23, 107, 91, 0.12);
+}
+
+.field input::placeholder,
+.field textarea::placeholder {
+  color: #a1aaa2;
+  opacity: 1;
+}
+
+.field textarea {
+  min-height: 132px;
+  resize: vertical;
+  line-height: 1.45;
+}
+
+.radio-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.radio-card {
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 10px 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: #ffffff;
+}
+
+.checkbox-card {
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 11px 12px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+  background: #ffffff;
+}
+
+.checkbox-card > span {
+  display: grid;
+  gap: 3px;
+}
+
+.checkbox-card strong {
+  color: var(--text);
+  font-size: 14px;
+}
+
+.checkbox-card span span {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.35;
+}

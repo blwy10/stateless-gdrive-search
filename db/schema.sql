@@ -2,7 +2,7 @@
 -- SPDX-License-Identifier: MIT
 
 create table if not exists drive_connections (
-  id text primary key,
+  id text primary key default gen_random_uuid()::text,
   owner_sub text not null,
   drive_email text not null,
   drive_name text,
@@ -13,6 +13,10 @@ create table if not exists drive_connections (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+
+-- Ensure existing deployments pick up the id default so upserts can omit the id.
+alter table drive_connections
+  alter column id set default gen_random_uuid()::text;
 
 create index if not exists drive_connections_owner_sub_idx
   on drive_connections(owner_sub);

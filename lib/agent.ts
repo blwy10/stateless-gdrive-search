@@ -1,11 +1,13 @@
 // Copyright (c) 2026 Benjamin Lau
 // SPDX-License-Identifier: MIT
 
+import { fetch as undiciFetch } from "undici";
 import { z } from "zod";
 import { listDriveConnections } from "@/lib/drive-connections";
 import { openDriveFile, searchDriveFiles, type DriveFile } from "@/lib/drive";
 import { formatMimeType } from "@/lib/file-types";
 import { getEffectiveModelSettings, type EffectiveModelSettings } from "@/lib/model-settings";
+import { ssrfSafeDispatcher } from "@/lib/ssrf";
 import {
   createDebugRequestId,
   debugError,
@@ -13,6 +15,14 @@ import {
   hashForDebug,
   writeDebugLog
 } from "@/lib/debug-log";
+
+/**
+ * Per-request timeout for the outbound model call. Without it, a hung upstream
+ * endpoint would stall the request indefinitely and hold the agent's SSE stream
+ * and server resources open. Applied via {@link AbortSignal.timeout}, so it
+ * bounds connect + response-body read for each individual attempt.
+ */
+const MODEL_REQUEST_TIMEOUT_MS = 60_000;
 
 const AgentRequest = z.object({
   query: z.string().trim().min(1).max(2000),
@@ -264,12 +274,20 @@ async function callModel(
   });
 
   try {
-    const response = await fetch(`${settings.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+    const response = await undiciFetch(`${settings.baseUrl.replace(/\/$/, "")}/chat/completions`, {
       method: "POST",
       headers: {
         authorization: `Bearer ${settings.apiKey}`,
         "content-type": "application/json"
       },
+      // The base URL is validated as a public HTTPS host (see
+      // validatePublicHttpsBaseUrl), but a validated host can still answer with a
+      // redirect to an internal/metadata address (e.g. 169.254.169.254). Refuse to
+      // follow redirects, and for user-supplied endpoints validate the resolved IP
+      // at connect time (ssrfSafeDispatcher) to also close the DNS-rebinding window.
+      redirect: "error",
+      signal: AbortSignal.timeout(MODEL_REQUEST_TIMEOUT_MS),
+      ...(settings.source === "custom" ? { dispatcher: ssrfSafeDispatcher } : {}),
       body: JSON.stringify({
         model: settings.model,
         messages,
@@ -354,7 +372,7 @@ function partialAnswer(reason: string, mode: AgentRequest["mode"]) {
   };
 }
 
-function parseFinalAnswer(content: string | null, mode: AgentRequest["mode"]) {
+export function parseFinalAnswer(content: string | null, mode: AgentRequest["mode"]) {
   if (mode === "list") {
     return { answer: "", answerFormat: "plain" as const };
   }
@@ -375,7 +393,7 @@ function parseFinalAnswer(content: string | null, mode: AgentRequest["mode"]) {
   };
 }
 
-function curatedListFiles(content: string | null, openedFiles: DriveFile[]) {
+export function curatedListFiles(content: string | null, openedFiles: DriveFile[]) {
   const raw = content?.trim() ?? "";
   const match = raw.match(/CURATED_FILE_LIST:\s*(\[[\s\S]*\])\s*$/);
   if (!match) return uniqueFiles(openedFiles);
@@ -420,6 +438,279 @@ async function withToolRetries<T>(
     }
   }
   throw lastError;
+}
+
+/**
+ * Tool result appended to the chat transcript after a tool call. Each tool
+ * handler returns exactly one of these so the main loop can stay a thin
+ * dispatcher.
+ */
+type ToolResultMessage = Extract<ChatMessage, { role: "tool" }>;
+
+/**
+ * Immutable per-run context shared by the tool handlers: everything that is
+ * fixed for the lifetime of a single {@link runDriveAgent} call.
+ */
+export type AgentRunContext = {
+  ownerSub: string;
+  input: AgentRequest;
+  budget: AgentBudget;
+  selectedDriveIds: string[];
+  requestId: string;
+  emit: (event: AgentProgress) => void | Promise<void>;
+};
+
+/**
+ * Mutable per-run state threaded through the tool handlers. Handlers update
+ * these counters/collections in place; the main loop reads them to make
+ * budget/stop decisions and to assemble the final result.
+ */
+export type AgentRunState = {
+  referencedFiles: DriveFile[];
+  openedFiles: DriveFile[];
+  searchedQueries: Set<string>;
+  knownFileKeys: Set<string>;
+  openedFileKeys: Set<string>;
+  searchCallCount: number;
+  openFileCallCount: number;
+  lowProgressSearchCount: number;
+  stopAfterToolUseReason: string | null;
+};
+
+/**
+ * Handle a single `search_drive` tool call: enforce the search budget, run the
+ * search, update progress/low-progress tracking, and emit any newly seen files.
+ * Mutates {@link state} in place and returns the tool message to append.
+ */
+export async function handleSearchTool(
+  context: AgentRunContext,
+  state: AgentRunState,
+  step: number,
+  toolCall: ToolCall
+): Promise<ToolResultMessage> {
+  const { requestId, budget, selectedDriveIds, ownerSub, input, emit } = context;
+  const args = searchArgs.parse(JSON.parse(toolCall.function.arguments || "{}"));
+  const normalizedQuery = normalizeSearchQuery(args.query);
+  await writeDebugLog({
+    event: "agent.tool.search_drive.requested",
+    requestId,
+    step,
+    toolCallIdHash: hashForDebug(toolCall.id),
+    query: debugText(args.query),
+    limit: args.limit ?? null,
+    searchCallCount: state.searchCallCount
+  });
+  if (state.searchCallCount >= budget.maxSearchCalls) {
+    const reason = `Search budget reached after ${state.searchCallCount} search_drive call(s).`;
+    await emit({ type: "progress", message: reason });
+    await writeDebugLog({
+      event: "agent.tool.search_drive.skipped",
+      level: "warn",
+      requestId,
+      step,
+      reason: "search_budget_reached",
+      searchCallCount: state.searchCallCount
+    });
+    state.stopAfterToolUseReason = reason;
+    return {
+      role: "tool",
+      tool_call_id: toolCall.id,
+      content: safeJson({ skipped: true, reason })
+    };
+  }
+
+  await emit({ type: "progress", message: `Searching Drive for "${args.query}"` });
+  state.searchCallCount += 1;
+  const wasRepeatedQuery = state.searchedQueries.has(normalizedQuery);
+  state.searchedQueries.add(normalizedQuery);
+  const toolStartedAt = Date.now();
+  let files: DriveFile[];
+  try {
+    files = await withToolRetries(
+      () =>
+        searchDriveFiles({
+          ownerSub,
+          connectionIds: selectedDriveIds,
+          query: args.query,
+          limit: args.limit,
+          debugRequestId: requestId
+        }),
+      budget.maxToolRetries
+    );
+  } catch (error) {
+    await writeDebugLog({
+      event: "agent.tool.search_drive.failed",
+      level: "error",
+      requestId,
+      step,
+      durationMs: Date.now() - toolStartedAt,
+      searchCallCount: state.searchCallCount,
+      error: debugError(error)
+    });
+    throw error;
+  }
+  const newFiles = files.filter((file) => !state.knownFileKeys.has(fileKey(file)));
+  await writeDebugLog({
+    event: "agent.tool.search_drive.completed",
+    requestId,
+    step,
+    durationMs: Date.now() - toolStartedAt,
+    repeatedQuery: wasRepeatedQuery,
+    resultCount: files.length,
+    newResultCount: newFiles.length,
+    searchCallCount: state.searchCallCount
+  });
+  for (const file of files) {
+    state.knownFileKeys.add(fileKey(file));
+  }
+  if (wasRepeatedQuery || newFiles.length === 0) {
+    state.lowProgressSearchCount += 1;
+  } else {
+    state.lowProgressSearchCount = 0;
+  }
+  if (state.lowProgressSearchCount >= budget.maxLowProgressSearches) {
+    state.stopAfterToolUseReason = `Searches stopped producing new files after ${state.lowProgressSearchCount} low-progress search(es).`;
+    await writeDebugLog({
+      event: "agent.low_progress_search_limit_reached",
+      level: "warn",
+      requestId,
+      step,
+      lowProgressSearchCount: state.lowProgressSearchCount
+    });
+  }
+  if (!input.curateList) {
+    state.referencedFiles.push(...files);
+    for (const file of files) {
+      await emit({ type: "file", file });
+    }
+  }
+  return {
+    role: "tool",
+    tool_call_id: toolCall.id,
+    content: safeJson({ files })
+  };
+}
+
+/**
+ * Handle a single `open_file` tool call: enforce drive scope, dedupe already
+ * opened files, enforce the open-file budget, read the file, and emit progress.
+ * Mutates {@link state} in place and returns the tool message to append.
+ */
+export async function handleOpenFileTool(
+  context: AgentRunContext,
+  state: AgentRunState,
+  step: number,
+  toolCall: ToolCall
+): Promise<ToolResultMessage> {
+  const { requestId, budget, selectedDriveIds, ownerSub, emit } = context;
+  const args = openArgs.parse(JSON.parse(toolCall.function.arguments || "{}"));
+  await writeDebugLog({
+    event: "agent.tool.open_file.requested",
+    requestId,
+    step,
+    toolCallIdHash: hashForDebug(toolCall.id),
+    connectionIdHash: hashForDebug(args.connectionId),
+    fileIdHash: hashForDebug(args.fileId),
+    openFileCallCount: state.openFileCallCount
+  });
+  if (!selectedDriveIds.includes(args.connectionId)) {
+    await writeDebugLog({
+      event: "agent.tool.open_file.rejected",
+      level: "error",
+      requestId,
+      step,
+      reason: "outside_selected_drive_scope",
+      connectionIdHash: hashForDebug(args.connectionId),
+      fileIdHash: hashForDebug(args.fileId)
+    });
+    throw new Error("AI attempted to open a file outside the selected Drive scope");
+  }
+  const key = `${args.connectionId}:${args.fileId}`;
+  if (state.openedFileKeys.has(key)) {
+    const reason = "File was already opened earlier in this run.";
+    await writeDebugLog({
+      event: "agent.tool.open_file.skipped",
+      requestId,
+      step,
+      reason: "already_opened",
+      fileKeyHash: hashForDebug(key)
+    });
+    return {
+      role: "tool",
+      tool_call_id: toolCall.id,
+      content: safeJson({ skipped: true, reason })
+    };
+  }
+  if (state.openFileCallCount >= budget.maxOpenFileCalls) {
+    const reason = `Open-file budget reached after ${state.openFileCallCount} open_file call(s).`;
+    await emit({ type: "progress", message: reason });
+    await writeDebugLog({
+      event: "agent.tool.open_file.skipped",
+      level: "warn",
+      requestId,
+      step,
+      reason: "open_file_budget_reached",
+      openFileCallCount: state.openFileCallCount
+    });
+    state.stopAfterToolUseReason = reason;
+    return {
+      role: "tool",
+      tool_call_id: toolCall.id,
+      content: safeJson({ skipped: true, reason })
+    };
+  }
+
+  state.openFileCallCount += 1;
+  state.openedFileKeys.add(key);
+  const toolStartedAt = Date.now();
+  let opened: { file: DriveFile; content: string };
+  try {
+    opened = await withToolRetries(
+      () =>
+        openDriveFile({
+          ownerSub,
+          connectionId: args.connectionId,
+          fileId: args.fileId,
+          debugRequestId: requestId
+        }),
+      budget.maxToolRetries
+    );
+  } catch (error) {
+    await writeDebugLog({
+      event: "agent.tool.open_file.failed",
+      level: "error",
+      requestId,
+      step,
+      durationMs: Date.now() - toolStartedAt,
+      fileKeyHash: hashForDebug(key),
+      openFileCallCount: state.openFileCallCount,
+      error: debugError(error)
+    });
+    throw error;
+  }
+  await writeDebugLog({
+    event: "agent.tool.open_file.completed",
+    requestId,
+    step,
+    durationMs: Date.now() - toolStartedAt,
+    fileKeyHash: hashForDebug(fileKey(opened.file)),
+    mimeType: opened.file.mimeType,
+    contentLength: opened.content.length,
+    openFileCallCount: state.openFileCallCount
+  });
+  state.knownFileKeys.add(fileKey(opened.file));
+  state.referencedFiles.push(opened.file);
+  state.openedFiles.push(opened.file);
+  await emit({ type: "progress", message: `Opened ${formatFileProgressLabel(opened.file)}` });
+  await emit({ type: "file", file: opened.file });
+  return {
+    role: "tool",
+    tool_call_id: toolCall.id,
+    content: safeJson({
+      file: opened.file,
+      content: opened.content
+    })
+  };
 }
 
 export function parseAgentRequest(value: unknown) {
@@ -474,8 +765,25 @@ export async function runDriveAgent(
     throw new Error("No connected Drive selected");
   }
 
-  const referencedFiles: DriveFile[] = [];
-  const openedFiles: DriveFile[] = [];
+  const context: AgentRunContext = {
+    ownerSub,
+    input,
+    budget,
+    selectedDriveIds,
+    requestId,
+    emit
+  };
+  const state: AgentRunState = {
+    referencedFiles: [],
+    openedFiles: [],
+    searchedQueries: new Set<string>(),
+    knownFileKeys: new Set<string>(),
+    openedFileKeys: new Set<string>(),
+    searchCallCount: 0,
+    openFileCallCount: 0,
+    lowProgressSearchCount: 0,
+    stopAfterToolUseReason: null
+  };
   const messages: ChatMessage[] = [
     { role: "system", content: systemPrompt(input, selectedDriveIds, budget) },
     {
@@ -483,13 +791,6 @@ export async function runDriveAgent(
       content: `Query: ${input.query}\nMode: ${input.mode}\nCurate list: ${input.curateList}`
     }
   ];
-  const searchedQueries = new Set<string>();
-  const knownFileKeys = new Set<string>();
-  const openedFileKeys = new Set<string>();
-  let searchCallCount = 0;
-  let openFileCallCount = 0;
-  let lowProgressSearchCount = 0;
-  let stopAfterToolUseReason: string | null = null;
   let stopInstructionSent = false;
 
   await emit({
@@ -498,10 +799,10 @@ export async function runDriveAgent(
   });
 
   for (let step = 0; step < budget.maxToolSteps; step += 1) {
-    if (stopAfterToolUseReason && !stopInstructionSent) {
+    if (state.stopAfterToolUseReason && !stopInstructionSent) {
       messages.push({
         role: "user",
-        content: `${stopAfterToolUseReason} Stop using tools and return the final result now.`
+        content: `${state.stopAfterToolUseReason} Stop using tools and return the final result now.`
       });
       stopInstructionSent = true;
     }
@@ -539,17 +840,17 @@ export async function runDriveAgent(
       const { answer, answerFormat } = parseFinalAnswer(message.content, input.mode);
       const files =
         input.mode === "list" && input.curateList
-          ? curatedListFiles(message.content, openedFiles)
-          : uniqueFiles(referencedFiles);
+          ? curatedListFiles(message.content, state.openedFiles)
+          : uniqueFiles(state.referencedFiles);
       await writeDebugLog({
         event: "agent.completed",
         requestId,
         reason: "final_message",
         durationMs: Date.now() - startedAt,
         step,
-        searchCallCount,
-        openFileCallCount,
-        referencedFileCount: referencedFiles.length,
+        searchCallCount: state.searchCallCount,
+        openFileCallCount: state.openFileCallCount,
+        referencedFileCount: state.referencedFiles.length,
         returnedFileCount: files.length,
         answerFormat,
         answerLength: answer.length
@@ -560,218 +861,9 @@ export async function runDriveAgent(
 
     for (const toolCall of message.tool_calls) {
       if (toolCall.function.name === "search_drive") {
-        const args = searchArgs.parse(JSON.parse(toolCall.function.arguments || "{}"));
-        const normalizedQuery = normalizeSearchQuery(args.query);
-        await writeDebugLog({
-          event: "agent.tool.search_drive.requested",
-          requestId,
-          step,
-          toolCallIdHash: hashForDebug(toolCall.id),
-          query: debugText(args.query),
-          limit: args.limit ?? null,
-          searchCallCount
-        });
-        if (searchCallCount >= budget.maxSearchCalls) {
-          const reason = `Search budget reached after ${searchCallCount} search_drive call(s).`;
-          await emit({ type: "progress", message: reason });
-          await writeDebugLog({
-            event: "agent.tool.search_drive.skipped",
-            level: "warn",
-            requestId,
-            step,
-            reason: "search_budget_reached",
-            searchCallCount
-          });
-          stopAfterToolUseReason = reason;
-          messages.push({
-            role: "tool",
-            tool_call_id: toolCall.id,
-            content: safeJson({ skipped: true, reason })
-          });
-          continue;
-        }
-
-        await emit({ type: "progress", message: `Searching Drive for "${args.query}"` });
-        searchCallCount += 1;
-        const wasRepeatedQuery = searchedQueries.has(normalizedQuery);
-        searchedQueries.add(normalizedQuery);
-        const toolStartedAt = Date.now();
-        let files: DriveFile[];
-        try {
-          files = await withToolRetries(
-            () =>
-              searchDriveFiles({
-                ownerSub,
-                connectionIds: selectedDriveIds,
-                query: args.query,
-                limit: args.limit,
-                debugRequestId: requestId
-              }),
-            budget.maxToolRetries
-          );
-        } catch (error) {
-          await writeDebugLog({
-            event: "agent.tool.search_drive.failed",
-            level: "error",
-            requestId,
-            step,
-            durationMs: Date.now() - toolStartedAt,
-            searchCallCount,
-            error: debugError(error)
-          });
-          throw error;
-        }
-        const newFiles = files.filter((file) => !knownFileKeys.has(fileKey(file)));
-        await writeDebugLog({
-          event: "agent.tool.search_drive.completed",
-          requestId,
-          step,
-          durationMs: Date.now() - toolStartedAt,
-          repeatedQuery: wasRepeatedQuery,
-          resultCount: files.length,
-          newResultCount: newFiles.length,
-          searchCallCount
-        });
-        for (const file of files) {
-          knownFileKeys.add(fileKey(file));
-        }
-        if (wasRepeatedQuery || newFiles.length === 0) {
-          lowProgressSearchCount += 1;
-        } else {
-          lowProgressSearchCount = 0;
-        }
-        if (lowProgressSearchCount >= budget.maxLowProgressSearches) {
-          stopAfterToolUseReason = `Searches stopped producing new files after ${lowProgressSearchCount} low-progress search(es).`;
-          await writeDebugLog({
-            event: "agent.low_progress_search_limit_reached",
-            level: "warn",
-            requestId,
-            step,
-            lowProgressSearchCount
-          });
-        }
-        if (!input.curateList) {
-          referencedFiles.push(...files);
-          for (const file of files) {
-            await emit({ type: "file", file });
-          }
-        }
-        messages.push({
-          role: "tool",
-          tool_call_id: toolCall.id,
-          content: safeJson({ files })
-        });
+        messages.push(await handleSearchTool(context, state, step, toolCall));
       } else if (toolCall.function.name === "open_file") {
-        const args = openArgs.parse(JSON.parse(toolCall.function.arguments || "{}"));
-        await writeDebugLog({
-          event: "agent.tool.open_file.requested",
-          requestId,
-          step,
-          toolCallIdHash: hashForDebug(toolCall.id),
-          connectionIdHash: hashForDebug(args.connectionId),
-          fileIdHash: hashForDebug(args.fileId),
-          openFileCallCount
-        });
-        if (!selectedDriveIds.includes(args.connectionId)) {
-          await writeDebugLog({
-            event: "agent.tool.open_file.rejected",
-            level: "error",
-            requestId,
-            step,
-            reason: "outside_selected_drive_scope",
-            connectionIdHash: hashForDebug(args.connectionId),
-            fileIdHash: hashForDebug(args.fileId)
-          });
-          throw new Error("AI attempted to open a file outside the selected Drive scope");
-        }
-        const key = `${args.connectionId}:${args.fileId}`;
-        if (openedFileKeys.has(key)) {
-          const reason = "File was already opened earlier in this run.";
-          await writeDebugLog({
-            event: "agent.tool.open_file.skipped",
-            requestId,
-            step,
-            reason: "already_opened",
-            fileKeyHash: hashForDebug(key)
-          });
-          messages.push({
-            role: "tool",
-            tool_call_id: toolCall.id,
-            content: safeJson({ skipped: true, reason })
-          });
-          continue;
-        }
-        if (openFileCallCount >= budget.maxOpenFileCalls) {
-          const reason = `Open-file budget reached after ${openFileCallCount} open_file call(s).`;
-          await emit({ type: "progress", message: reason });
-          await writeDebugLog({
-            event: "agent.tool.open_file.skipped",
-            level: "warn",
-            requestId,
-            step,
-            reason: "open_file_budget_reached",
-            openFileCallCount
-          });
-          stopAfterToolUseReason = reason;
-          messages.push({
-            role: "tool",
-            tool_call_id: toolCall.id,
-            content: safeJson({ skipped: true, reason })
-          });
-          continue;
-        }
-
-        openFileCallCount += 1;
-        openedFileKeys.add(key);
-        const toolStartedAt = Date.now();
-        let opened: { file: DriveFile; content: string };
-        try {
-          opened = await withToolRetries(
-            () =>
-              openDriveFile({
-                ownerSub,
-                connectionId: args.connectionId,
-                fileId: args.fileId,
-                debugRequestId: requestId
-              }),
-            budget.maxToolRetries
-          );
-        } catch (error) {
-          await writeDebugLog({
-            event: "agent.tool.open_file.failed",
-            level: "error",
-            requestId,
-            step,
-            durationMs: Date.now() - toolStartedAt,
-            fileKeyHash: hashForDebug(key),
-            openFileCallCount,
-            error: debugError(error)
-          });
-          throw error;
-        }
-        await writeDebugLog({
-          event: "agent.tool.open_file.completed",
-          requestId,
-          step,
-          durationMs: Date.now() - toolStartedAt,
-          fileKeyHash: hashForDebug(fileKey(opened.file)),
-          mimeType: opened.file.mimeType,
-          contentLength: opened.content.length,
-          openFileCallCount
-        });
-        knownFileKeys.add(fileKey(opened.file));
-        referencedFiles.push(opened.file);
-        openedFiles.push(opened.file);
-        await emit({ type: "progress", message: `Opened ${formatFileProgressLabel(opened.file)}` });
-        await emit({ type: "file", file: opened.file });
-        messages.push({
-          role: "tool",
-          tool_call_id: toolCall.id,
-          content: safeJson({
-            file: opened.file,
-            content: opened.content
-          })
-        });
+        messages.push(await handleOpenFileTool(context, state, step, toolCall));
       }
     }
   }
@@ -818,9 +910,9 @@ export async function runDriveAgent(
   const files =
     input.mode === "list" && input.curateList
       ? finalContent !== null
-        ? curatedListFiles(finalContent, openedFiles)
-        : uniqueFiles(openedFiles)
-      : uniqueFiles(referencedFiles);
+        ? curatedListFiles(finalContent, state.openedFiles)
+        : uniqueFiles(state.openedFiles)
+      : uniqueFiles(state.referencedFiles);
   await writeDebugLog({
     event: "agent.completed",
     requestId,
@@ -828,9 +920,9 @@ export async function runDriveAgent(
     durationMs: Date.now() - startedAt,
     finalModelTurn: needsFinalModelTurn,
     forcedFinalAnswer: finalContent !== null,
-    searchCallCount,
-    openFileCallCount,
-    referencedFileCount: referencedFiles.length,
+    searchCallCount: state.searchCallCount,
+    openFileCallCount: state.openFileCallCount,
+    referencedFileCount: state.referencedFiles.length,
     returnedFileCount: files.length,
     answerFormat,
     answerLength: answer.length

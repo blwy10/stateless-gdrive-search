@@ -1,0 +1,124 @@
+/*
+ * Copyright (c) 2026 Benjamin Lau
+ * SPDX-License-Identifier: MIT
+ */
+
+/* Saved-queries sidebar: query items, archive affordance, and status dots. */
+
+.query-list {
+  display: grid;
+  gap: 8px;
+}
+
+.query-item {
+  width: 100%;
+  min-height: 68px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  background: #ffffff;
+  color: var(--text);
+  text-align: left;
+}
+
+.query-item:hover,
+.query-item.active {
+  border-color: rgba(23, 107, 91, 0.52);
+  background: #f5faf8;
+}
+
+.query-item:disabled {
+  opacity: 0.72;
+}
+
+.query-item-select {
+  min-height: 66px;
+  min-width: 0;
+  padding: 10px 11px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+}
+
+.query-item-main {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.query-item-main strong {
+  font-size: 14px;
+  line-height: 1.25;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow-wrap: anywhere;
+}
+
+.query-item-main span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.query-archive-button {
+  width: 34px;
+  height: 34px;
+  margin: 8px 8px 0 0;
+  border-radius: 6px;
+  display: grid;
+  place-items: center;
+  background: transparent;
+  color: var(--muted);
+  opacity: 0;
+  pointer-events: none;
+}
+
+.query-item:hover .query-archive-button,
+.query-item:focus-within .query-archive-button {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.query-archive-button:hover,
+.query-archive-button:focus-visible {
+  background: #fff2f2;
+  color: var(--danger);
+  outline: none;
+}
+
+.query-archive-button svg {
+  width: 17px;
+  height: 17px;
+}
+
+.status-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  margin-top: 4px;
+  background: var(--muted);
+}
+
+.status-dot.draft {
+  background: var(--muted);
+}
+
+.status-dot.running {
+  background: var(--warning);
+}
+
+.status-dot.finished {
+  background: var(--success);
+}
+
+.status-dot.error {
+  background: var(--danger);
+}

@@ -1,0 +1,188 @@
+/*
+ * Copyright (c) 2026 Benjamin Lau
+ * SPDX-License-Identifier: MIT
+ */
+
+/*
+ * App shell and chrome: top bar, brand, main container, signed-out login
+ * panel, the two-column layout grid, the connected-drives strip/chips, and the
+ * responsive breakpoint. The media query lives at the end of this sheet so it
+ * follows the rules it overrides.
+ */
+
+.app-shell {
+  min-height: 100vh;
+  display: grid;
+  grid-template-rows: auto 1fr;
+}
+
+.topbar {
+  border-bottom: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.82);
+  backdrop-filter: blur(10px);
+}
+
+.topbar-inner {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 16px 24px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  font-weight: 700;
+}
+
+.brand-mark {
+  width: 32px;
+  height: 32px;
+  border-radius: 7px;
+  display: grid;
+  place-items: center;
+  background: #193c36;
+  color: #ffffff;
+}
+
+.main {
+  max-width: 1180px;
+  width: 100%;
+  margin: 0 auto;
+  padding: 28px 24px 48px;
+}
+
+.login-panel {
+  min-height: calc(100vh - 82px);
+  display: grid;
+  place-items: center;
+}
+
+.login-box {
+  width: min(520px, 100%);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+  padding: 30px;
+}
+
+.login-box h1 {
+  margin: 0 0 10px;
+  font-size: 30px;
+  line-height: 1.1;
+}
+
+.login-box p {
+  margin: 0 0 24px;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.layout {
+  display: grid;
+  grid-template-columns: 320px minmax(0, 1fr);
+  gap: 22px;
+  align-items: start;
+}
+
+.connections-strip {
+  margin-bottom: 18px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  background: rgba(255, 255, 255, 0.7);
+}
+
+.connections-strip-main {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.connections-strip-main strong {
+  font-size: 13px;
+}
+
+.drive-chip-list {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.drive-chip {
+  max-width: 340px;
+  min-height: 30px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 4px 5px 4px 9px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: #ffffff;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.drive-chip span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.drive-chip button {
+  min-height: 22px;
+  border-radius: 5px;
+  padding: 0 7px;
+  background: #fff2f2;
+  color: var(--danger);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.drive-list {
+  display: grid;
+  gap: 10px;
+}
+
+.drive-item {
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 12px;
+  display: grid;
+  gap: 8px;
+}
+
+.drive-item strong {
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 860px) {
+  .layout {
+    grid-template-columns: 1fr;
+  }
+
+  .connections-strip {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .topbar-inner,
+  .main {
+    padding-left: 16px;
+    padding-right: 16px;
+  }
+}

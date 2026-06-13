@@ -5,6 +5,14 @@
 
 - Do not run browser-based tests or browser automation for this project.
 - Prefer non-browser verification such as `npm run typecheck`, `npm run lint`, or targeted unit-level checks when they are relevant.
+- Unit tests live in `test/` and run with Vitest (`npm test`, or `npm run test:watch`).
+  They cover pure helpers only (no network/DB/browser): `formatMimeType`,
+  `encryptSecret`/`decryptSecret`, the SSRF guard
+  (`validatePublicHttpsBaseUrl`/`isPrivateIpv4`/`isPrivateIpv6`/`isPrivateAddress`),
+  `escapeDriveQuery`, `parseFinalAnswer`/`curatedListFiles`, and the debug-log
+  redaction helpers (`debugText`/`isDebugContentLogEnabled`, which force content
+  previews off when `NODE_ENV=production`). Add new tests here when you touch
+  these functions.
 
 ## Railway MCP: pin the project/environment first
 

@@ -1,0 +1,399 @@
+// Copyright (c) 2026 Benjamin Lau
+// SPDX-License-Identifier: MIT
+
+"use client";
+
+import { useCallback, useEffect, useMemo, useState } from "react";
+
+export type DriveFile = {
+  connectionId: string;
+  driveEmail: string;
+  id: string;
+  name: string;
+  mimeType: string;
+  webViewLink?: string;
+  modifiedTime?: string;
+  size?: string;
+};
+
+type StreamEvent =
+  | { type: "progress"; message: string }
+  | { type: "file"; file: DriveFile }
+  | { type: "final"; answer: string; answerFormat: "markdown" | "plain"; files: DriveFile[] }
+  | { type: "error"; message: string };
+
+export type QuerySession = {
+  id: string;
+  query: string;
+  mode: "synthesis" | "list";
+  curateList: boolean;
+  selectedDrive: string;
+  createdAt: string;
+  updatedAt: string;
+  status: "draft" | "running" | "finished" | "error";
+  events: string[];
+  files: DriveFile[];
+  answer: string;
+  answerFormat: "markdown" | "plain";
+  error: string;
+};
+
+const STORAGE_KEY = "stateless-gdrive-search:queries:v1";
+
+// Owns the saved-query sessions: the in-progress form state, localStorage
+// persistence, the SSE streaming loop, and the derived values the UI renders.
+export function useQuerySessions() {
+  const [selectedDrive, setSelectedDrive] = useState("all");
+  const [mode, setMode] = useState<"synthesis" | "list">("synthesis");
+  const [curateList, setCurateList] = useState(false);
+  const [query, setQuery] = useState("");
+  const [sessions, setSessions] = useState<QuerySession[]>([]);
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  const [hasLoadedSessions, setHasLoadedSessions] = useState(false);
+  const [progressOpen, setProgressOpen] = useState(false);
+
+  useEffect(() => {
+    try {
+      const stored = window.localStorage.getItem(STORAGE_KEY);
+      if (stored) {
+        const parsed = JSON.parse(stored) as QuerySession[];
+        if (Array.isArray(parsed)) {
+          const restored = parsed.map((session) => ({
+            ...session,
+            curateList: session.curateList ?? false,
+            answerFormat: session.answerFormat ?? ("plain" as const),
+            ...(session.status === "running"
+              ? {
+                  status: "error" as const,
+                  error: session.error || "This run was interrupted before it finished."
+                }
+              : {})
+          }));
+          setSessions(restored);
+          setActiveSessionId(restored[0]?.id ?? null);
+          if (restored[0]) {
+            setQuery(restored[0].query);
+            setMode(restored[0].mode);
+            setCurateList(restored[0].curateList);
+            setSelectedDrive(restored[0].selectedDrive);
+          }
+        }
+      }
+    } catch {
+      window.localStorage.removeItem(STORAGE_KEY);
+    } finally {
+      setHasLoadedSessions(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!hasLoadedSessions) return;
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(sessions));
+  }, [hasLoadedSessions, sessions]);
+
+  const activeSession = useMemo(
+    () => sessions.find((session) => session.id === activeSessionId) ?? null,
+    [activeSessionId, sessions]
+  );
+
+  const uniqueFiles = useMemo(() => {
+    const seen = new Set<string>();
+    return (activeSession?.files ?? []).filter((file) => {
+      const key = `${file.connectionId}:${file.id}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }, [activeSession]);
+
+  const runningSessionCount = sessions.filter((session) => session.status === "running").length;
+
+  // Drive connections live outside this hook; when the last one is removed the
+  // owner resets the scope here without persisting it onto the active draft.
+  const resetDriveScope = useCallback(() => setSelectedDrive("all"), []);
+
+  function newQuery() {
+    if (activeSession?.status === "draft") {
+      if (query.trim()) {
+        saveDraft(activeSession.id, { query, mode, curateList, selectedDrive });
+      }
+      return;
+    }
+
+    const existingDraft = sessions.find((session) => session.status === "draft");
+    if (existingDraft) {
+      setActiveSessionId(existingDraft.id);
+      setQuery(existingDraft.query);
+      setMode(existingDraft.mode);
+      setCurateList(existingDraft.curateList);
+      setSelectedDrive(existingDraft.selectedDrive);
+      return;
+    }
+
+    const now = new Date().toISOString();
+    const session: QuerySession = {
+      id: crypto.randomUUID(),
+      query: "",
+      mode: "synthesis",
+      curateList: false,
+      selectedDrive: "all",
+      createdAt: now,
+      updatedAt: now,
+      status: "draft",
+      events: [],
+      files: [],
+      answer: "",
+      answerFormat: "plain",
+      error: ""
+    };
+
+    upsertSession(session);
+    setActiveSessionId(session.id);
+    setQuery("");
+    setMode("synthesis");
+    setCurateList(false);
+    setSelectedDrive("all");
+  }
+
+  function selectSession(session: QuerySession) {
+    if (session.id === activeSessionId) return;
+
+    if (activeSession?.status === "draft") {
+      if (query.trim()) {
+        saveDraft(activeSession.id, { query, mode, curateList, selectedDrive });
+      } else {
+        setSessions((current) => current.filter((item) => item.id !== activeSession.id));
+      }
+    }
+
+    setActiveSessionId(session.id);
+    setQuery(session.query);
+    setMode(session.mode);
+    setCurateList(session.curateList);
+    setSelectedDrive(session.selectedDrive);
+    setProgressOpen(session.status === "running");
+  }
+
+  function updateQuery(value: string) {
+    setQuery(value);
+    if (activeSession?.status === "draft") {
+      saveDraft(activeSession.id, { query: value });
+    }
+  }
+
+  function updateMode(value: "synthesis" | "list") {
+    setMode(value);
+    if (activeSession?.status === "draft") {
+      saveDraft(activeSession.id, { mode: value });
+    }
+  }
+
+  function updateCurateList(value: boolean) {
+    setCurateList(value);
+    if (activeSession?.status === "draft") {
+      saveDraft(activeSession.id, { curateList: value });
+    }
+  }
+
+  function updateSelectedDrive(value: string) {
+    setSelectedDrive(value);
+    if (activeSession?.status === "draft") {
+      saveDraft(activeSession.id, { selectedDrive: value });
+    }
+  }
+
+  function saveDraft(
+    sessionId: string,
+    updates:
+      | Pick<QuerySession, "query" | "mode" | "curateList" | "selectedDrive">
+      | Partial<Pick<QuerySession, "query" | "mode" | "curateList" | "selectedDrive">>
+  ) {
+    setSessions((current) =>
+      current.map((item) =>
+        item.id === sessionId && item.status === "draft"
+          ? { ...item, ...updates, updatedAt: new Date().toISOString() }
+          : item
+      )
+    );
+  }
+
+  function upsertSession(session: QuerySession) {
+    setSessions((current) => {
+      const withoutSession = current.filter((item) => item.id !== session.id);
+      return [session, ...withoutSession];
+    });
+  }
+
+  function archiveSession(sessionId: string) {
+    const remainingSessions = sessions.filter((session) => session.id !== sessionId);
+    setSessions(remainingSessions);
+
+    if (sessionId !== activeSessionId) return;
+
+    const nextSession = remainingSessions[0] ?? null;
+    setActiveSessionId(nextSession?.id ?? null);
+    setQuery(nextSession?.query ?? "");
+    setMode(nextSession?.mode ?? "synthesis");
+    setCurateList(nextSession?.curateList ?? false);
+    setSelectedDrive(nextSession?.selectedDrive ?? "all");
+  }
+
+  async function runAgent() {
+    const trimmedQuery = query.trim();
+    if (!trimmedQuery) return;
+
+    const now = new Date().toISOString();
+    const session: QuerySession = {
+      id: activeSession?.status === "draft" ? activeSession.id : crypto.randomUUID(),
+      query: trimmedQuery,
+      mode,
+      curateList,
+      selectedDrive,
+      createdAt: activeSession?.status === "draft" ? activeSession.createdAt : now,
+      updatedAt: now,
+      status: "running",
+      events: [],
+      files: [],
+      answer: "",
+      answerFormat: "plain",
+      error: ""
+    };
+
+    setActiveSessionId(session.id);
+    upsertSession(session);
+    setProgressOpen(true);
+    let receivedTerminalEvent = false;
+
+    try {
+      const response = await fetch("/api/agent", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          query: trimmedQuery,
+          mode,
+          curateList,
+          driveIds: [selectedDrive]
+        })
+      });
+
+      if (!response.ok || !response.body) {
+        throw new Error(await response.text());
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const parts = buffer.split("\n\n");
+        buffer = parts.pop() ?? "";
+        for (const part of parts) {
+          const line = part
+            .split("\n")
+            .find((candidate) => candidate.startsWith("data: "));
+          if (!line) continue;
+          const event = JSON.parse(line.slice(6)) as StreamEvent;
+          if (event.type === "progress") {
+            setSessions((current) =>
+              current.map((item) =>
+                item.id === session.id
+                  ? { ...item, events: [...item.events, event.message], updatedAt: new Date().toISOString() }
+                  : item
+              )
+            );
+          } else if (event.type === "file") {
+            setSessions((current) =>
+              current.map((item) =>
+                item.id === session.id
+                  ? { ...item, files: [...item.files, event.file], updatedAt: new Date().toISOString() }
+                  : item
+              )
+            );
+          } else if (event.type === "final") {
+            receivedTerminalEvent = true;
+            setProgressOpen(false);
+            setSessions((current) =>
+              current.map((item) =>
+                item.id === session.id
+                  ? {
+                      ...item,
+                      status: "finished",
+                      answer: event.answer,
+                      answerFormat: event.answerFormat,
+                      files: event.files,
+                      error: "",
+                      updatedAt: new Date().toISOString()
+                    }
+                  : item
+              )
+            );
+          } else if (event.type === "error") {
+            receivedTerminalEvent = true;
+            setSessions((current) =>
+              current.map((item) =>
+                item.id === session.id
+                  ? {
+                      ...item,
+                      status: "error",
+                      error: event.message,
+                      updatedAt: new Date().toISOString()
+                    }
+                  : item
+              )
+            );
+          }
+        }
+      }
+    } catch (caught) {
+      const message = caught instanceof Error ? caught.message : "Agent request failed";
+      setSessions((current) =>
+        current.map((item) =>
+          item.id === session.id
+            ? { ...item, status: "error", error: message, updatedAt: new Date().toISOString() }
+            : item
+        )
+      );
+    } finally {
+      if (!receivedTerminalEvent) {
+        setSessions((current) =>
+          current.map((item) =>
+            item.id === session.id && item.status === "running"
+              ? {
+                  ...item,
+                  status: "error",
+                  error: "The agent stopped before returning a final result.",
+                  updatedAt: new Date().toISOString()
+                }
+              : item
+          )
+        );
+      }
+    }
+  }
+
+  return {
+    sessions,
+    activeSessionId,
+    activeSession,
+    uniqueFiles,
+    runningSessionCount,
+    query,
+    mode,
+    curateList,
+    selectedDrive,
+    progressOpen,
+    setProgressOpen,
+    resetDriveScope,
+    newQuery,
+    selectSession,
+    archiveSession,
+    runAgent,
+    updateQuery,
+    updateMode,
+    updateCurateList,
+    updateSelectedDrive
+  };
+}

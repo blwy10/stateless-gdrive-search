@@ -1,0 +1,122 @@
+/*
+ * Copyright (c) 2026 Benjamin Lau
+ * SPDX-License-Identifier: MIT
+ */
+
+/*
+ * Rendered answer styling: the plain/markdown answer container plus the typed
+ * markdown elements (headings, lists, code, links, blockquotes, tables).
+ */
+
+.answer {
+  white-space: pre-wrap;
+  line-height: 1.55;
+}
+
+.markdown-answer {
+  white-space: normal;
+  display: grid;
+  gap: 10px;
+}
+
+.markdown-answer h3,
+.markdown-answer h4,
+.markdown-answer h5,
+.markdown-answer p,
+.markdown-answer ul,
+.markdown-answer ol,
+.markdown-answer table,
+.markdown-answer blockquote,
+.markdown-answer pre {
+  margin: 0;
+}
+
+.markdown-answer h3 {
+  font-size: 18px;
+}
+
+.markdown-answer h4,
+.markdown-answer h5 {
+  font-size: 15px;
+}
+
+.markdown-answer ul,
+.markdown-answer ol {
+  padding-left: 22px;
+}
+
+.markdown-answer li + li {
+  margin-top: 5px;
+}
+
+.markdown-answer code {
+  border-radius: 5px;
+  padding: 1px 5px;
+  background: var(--panel-strong);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 0.92em;
+}
+
+.markdown-answer pre {
+  max-width: 100%;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 12px;
+  background: #fbfcfb;
+}
+
+.markdown-answer pre code {
+  padding: 0;
+  background: transparent;
+}
+
+.markdown-answer a {
+  color: var(--accent-strong);
+  font-weight: 650;
+}
+
+.markdown-answer blockquote {
+  padding: 2px 0 2px 12px;
+  border-left: 3px solid var(--line);
+  color: var(--muted);
+}
+
+.markdown-answer hr {
+  border: 0;
+  border-top: 1px solid var(--line);
+}
+
+.markdown-table-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+}
+
+.markdown-answer table {
+  width: 100%;
+  min-width: 520px;
+  border-collapse: collapse;
+  background: #ffffff;
+}
+
+.markdown-answer th,
+.markdown-answer td {
+  border-bottom: 1px solid var(--line);
+  padding: 9px 11px;
+  text-align: left;
+  vertical-align: top;
+  line-height: 1.4;
+}
+
+.markdown-answer th {
+  background: var(--panel-strong);
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 750;
+}
+
+.markdown-answer tr:last-child td {
+  border-bottom: 0;
+}

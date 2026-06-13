@@ -3,16 +3,12 @@
 
 "use client";
 
+import { MarkdownContent } from "@/components/markdown";
+import { SettingsDialog, type ModelSettingsSummary } from "@/components/settings-dialog";
+import { useQuerySessions } from "@/hooks/use-query-sessions";
 import { formatMimeType } from "@/lib/file-types";
 import { signIn, signOut } from "next-auth/react";
-import {
-  useCallback,
-  useEffect,
-  useMemo,
-  useState,
-  type CSSProperties,
-  type ReactNode
-} from "react";
+import { useCallback, useState } from "react";
 
 type User = {
   name: string | null;
@@ -30,49 +26,6 @@ type DriveConnection = {
   updatedAt: string;
 };
 
-type ModelSettingsSummary = {
-  hasCustomModel: boolean;
-  apiKeyConfigured: boolean;
-  baseUrl: string | null;
-  model: string | null;
-  updatedAt: string | null;
-};
-
-type DriveFile = {
-  connectionId: string;
-  driveEmail: string;
-  id: string;
-  name: string;
-  mimeType: string;
-  webViewLink?: string;
-  modifiedTime?: string;
-  size?: string;
-};
-
-type StreamEvent =
-  | { type: "progress"; message: string }
-  | { type: "file"; file: DriveFile }
-  | { type: "final"; answer: string; answerFormat: "markdown" | "plain"; files: DriveFile[] }
-  | { type: "error"; message: string };
-
-type QuerySession = {
-  id: string;
-  query: string;
-  mode: "synthesis" | "list";
-  curateList: boolean;
-  selectedDrive: string;
-  createdAt: string;
-  updatedAt: string;
-  status: "draft" | "running" | "finished" | "error";
-  events: string[];
-  files: DriveFile[];
-  answer: string;
-  answerFormat: "markdown" | "plain";
-  error: string;
-};
-
-const STORAGE_KEY = "stateless-gdrive-search:queries:v1";
-
 export function SearchApp({
   user,
   initialConnections,
@@ -86,79 +39,32 @@ export function SearchApp({
   const [modelSettings, setModelSettings] = useState<ModelSettingsSummary | null>(
     initialModelSettings
   );
-  const [selectedDrive, setSelectedDrive] = useState("all");
-  const [mode, setMode] = useState<"synthesis" | "list">("synthesis");
-  const [curateList, setCurateList] = useState(false);
-  const [query, setQuery] = useState("");
-  const [sessions, setSessions] = useState<QuerySession[]>([]);
-  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
-  const [hasLoadedSessions, setHasLoadedSessions] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [settingsBaseUrl, setSettingsBaseUrl] = useState("");
-  const [settingsModel, setSettingsModel] = useState("");
-  const [settingsApiKey, setSettingsApiKey] = useState("");
-  const [settingsMessage, setSettingsMessage] = useState("");
-  const [settingsError, setSettingsError] = useState("");
-  const [settingsSaving, setSettingsSaving] = useState(false);
-  const [progressOpen, setProgressOpen] = useState(false);
 
-  useEffect(() => {
-    try {
-      const stored = window.localStorage.getItem(STORAGE_KEY);
-      if (stored) {
-        const parsed = JSON.parse(stored) as QuerySession[];
-        if (Array.isArray(parsed)) {
-          const restored = parsed.map((session) => ({
-            ...session,
-            curateList: session.curateList ?? false,
-            answerFormat: session.answerFormat ?? ("plain" as const),
-            ...(session.status === "running"
-              ? {
-                  status: "error" as const,
-                  error: session.error || "This run was interrupted before it finished."
-                }
-              : {})
-          }));
-          setSessions(restored);
-          setActiveSessionId(restored[0]?.id ?? null);
-          if (restored[0]) {
-            setQuery(restored[0].query);
-            setMode(restored[0].mode);
-            setCurateList(restored[0].curateList);
-            setSelectedDrive(restored[0].selectedDrive);
-          }
-        }
-      }
-    } catch {
-      window.localStorage.removeItem(STORAGE_KEY);
-    } finally {
-      setHasLoadedSessions(true);
-    }
-  }, []);
-
-  useEffect(() => {
-    if (!hasLoadedSessions) return;
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(sessions));
-  }, [hasLoadedSessions, sessions]);
-
-  const activeSession = useMemo(
-    () => sessions.find((session) => session.id === activeSessionId) ?? null,
-    [activeSessionId, sessions]
-  );
+  const {
+    sessions,
+    activeSessionId,
+    activeSession,
+    uniqueFiles,
+    runningSessionCount,
+    query,
+    mode,
+    curateList,
+    selectedDrive,
+    progressOpen,
+    setProgressOpen,
+    resetDriveScope,
+    newQuery,
+    selectSession,
+    archiveSession,
+    runAgent,
+    updateQuery,
+    updateMode,
+    updateCurateList,
+    updateSelectedDrive
+  } = useQuerySessions();
 
   const hasConnections = connections.length > 0;
-  const uniqueFiles = useMemo(() => {
-    const seen = new Set<string>();
-    return (activeSession?.files ?? []).filter((file) => {
-      const key = `${file.connectionId}:${file.id}`;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
-  }, [activeSession]);
-
-  const runningSessionCount = sessions.filter((session) => session.status === "running").length;
-  const hasCustomModel = modelSettings?.hasCustomModel ?? false;
 
   const statusState = activeSession?.status === "running"
     ? "running"
@@ -192,376 +98,23 @@ export function SearchApp({
           ? `${runningSessionCount} search${runningSessionCount === 1 ? "" : "es"} running. Choose one from the query list to watch it.`
           : "Choose a saved query or start a new one.";
 
+  const closeSettings = useCallback(() => setSettingsOpen(false), []);
+
+  function openSettings() {
+    setSettingsOpen(true);
+  }
+
   async function refreshConnections() {
     const response = await fetch("/api/drive/connections");
     if (!response.ok) return;
     const data = (await response.json()) as { connections: DriveConnection[] };
     setConnections(data.connections);
-    if (data.connections.length === 0) setSelectedDrive("all");
+    if (data.connections.length === 0) resetDriveScope();
   }
 
   async function disconnectDrive(id: string) {
     await fetch(`/api/drive/connections?id=${encodeURIComponent(id)}`, { method: "DELETE" });
     await refreshConnections();
-  }
-
-  const resetSettingsDraft = useCallback((settings: ModelSettingsSummary | null) => {
-    setSettingsBaseUrl(settings?.hasCustomModel ? (settings.baseUrl ?? "") : "");
-    setSettingsModel(settings?.hasCustomModel ? (settings.model ?? "") : "");
-    setSettingsApiKey("");
-    setSettingsMessage("");
-    setSettingsError("");
-  }, []);
-
-  function openSettings() {
-    resetSettingsDraft(modelSettings);
-    setSettingsOpen(true);
-  }
-
-  const closeSettings = useCallback(() => {
-    resetSettingsDraft(modelSettings);
-    setSettingsOpen(false);
-  }, [modelSettings, resetSettingsDraft]);
-
-  useEffect(() => {
-    if (!settingsOpen) return;
-
-    function onKeyDown(event: KeyboardEvent) {
-      if (event.key === "Escape") {
-        closeSettings();
-      }
-    }
-
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [settingsOpen, closeSettings]);
-
-  async function saveModelSettings() {
-    setSettingsSaving(true);
-    setSettingsMessage("");
-    setSettingsError("");
-
-    try {
-      const body: { baseUrl: string; model: string; apiKey?: string } = {
-        baseUrl: settingsBaseUrl,
-        model: settingsModel
-      };
-      if (settingsApiKey.trim()) {
-        body.apiKey = settingsApiKey;
-      }
-
-      const response = await fetch("/api/settings/model", {
-        method: "PUT",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(body)
-      });
-      const data = (await response.json()) as {
-        settings?: ModelSettingsSummary;
-        error?: string;
-      };
-      if (!response.ok || !data.settings) {
-        throw new Error(data.error || "Unable to save model settings");
-      }
-
-      setModelSettings(data.settings);
-      setSettingsBaseUrl(data.settings.baseUrl ?? "");
-      setSettingsModel(data.settings.model ?? "");
-      setSettingsApiKey("");
-      setSettingsMessage("Custom model settings saved.");
-    } catch (caught) {
-      setSettingsError(caught instanceof Error ? caught.message : "Unable to save model settings");
-    } finally {
-      setSettingsSaving(false);
-    }
-  }
-
-  async function deleteModelSettings() {
-    setSettingsSaving(true);
-    setSettingsMessage("");
-    setSettingsError("");
-
-    try {
-      const response = await fetch("/api/settings/model", { method: "DELETE" });
-      const data = (await response.json()) as {
-        settings?: ModelSettingsSummary;
-        error?: string;
-      };
-      if (!response.ok || !data.settings) {
-        throw new Error(data.error || "Unable to delete model settings");
-      }
-
-      setModelSettings(data.settings);
-      setSettingsBaseUrl("");
-      setSettingsModel("");
-      setSettingsApiKey("");
-      setSettingsMessage("Default provider restored.");
-    } catch (caught) {
-      setSettingsError(caught instanceof Error ? caught.message : "Unable to delete model settings");
-    } finally {
-      setSettingsSaving(false);
-    }
-  }
-
-  function newQuery() {
-    if (activeSession?.status === "draft") {
-      if (query.trim()) {
-        saveDraft(activeSession.id, { query, mode, curateList, selectedDrive });
-      }
-      return;
-    }
-
-    const existingDraft = sessions.find((session) => session.status === "draft");
-    if (existingDraft) {
-      setActiveSessionId(existingDraft.id);
-      setQuery(existingDraft.query);
-      setMode(existingDraft.mode);
-      setCurateList(existingDraft.curateList);
-      setSelectedDrive(existingDraft.selectedDrive);
-      return;
-    }
-
-    const now = new Date().toISOString();
-    const session: QuerySession = {
-      id: crypto.randomUUID(),
-      query: "",
-      mode: "synthesis",
-      curateList: false,
-      selectedDrive: "all",
-      createdAt: now,
-      updatedAt: now,
-      status: "draft",
-      events: [],
-      files: [],
-      answer: "",
-      answerFormat: "plain",
-      error: ""
-    };
-
-    upsertSession(session);
-    setActiveSessionId(session.id);
-    setQuery("");
-    setMode("synthesis");
-    setCurateList(false);
-    setSelectedDrive("all");
-  }
-
-  function selectSession(session: QuerySession) {
-    if (session.id === activeSessionId) return;
-
-    if (activeSession?.status === "draft") {
-      if (query.trim()) {
-        saveDraft(activeSession.id, { query, mode, curateList, selectedDrive });
-      } else {
-        setSessions((current) => current.filter((item) => item.id !== activeSession.id));
-      }
-    }
-
-    setActiveSessionId(session.id);
-    setQuery(session.query);
-    setMode(session.mode);
-    setCurateList(session.curateList);
-    setSelectedDrive(session.selectedDrive);
-    setProgressOpen(session.status === "running");
-  }
-
-  function updateQuery(value: string) {
-    setQuery(value);
-    if (activeSession?.status === "draft") {
-      saveDraft(activeSession.id, { query: value });
-    }
-  }
-
-  function updateMode(value: "synthesis" | "list") {
-    setMode(value);
-    if (activeSession?.status === "draft") {
-      saveDraft(activeSession.id, { mode: value });
-    }
-  }
-
-  function updateCurateList(value: boolean) {
-    setCurateList(value);
-    if (activeSession?.status === "draft") {
-      saveDraft(activeSession.id, { curateList: value });
-    }
-  }
-
-  function updateSelectedDrive(value: string) {
-    setSelectedDrive(value);
-    if (activeSession?.status === "draft") {
-      saveDraft(activeSession.id, { selectedDrive: value });
-    }
-  }
-
-  function saveDraft(
-    sessionId: string,
-    updates:
-      | Pick<QuerySession, "query" | "mode" | "curateList" | "selectedDrive">
-      | Partial<Pick<QuerySession, "query" | "mode" | "curateList" | "selectedDrive">>
-  ) {
-    setSessions((current) =>
-      current.map((item) =>
-        item.id === sessionId && item.status === "draft"
-          ? { ...item, ...updates, updatedAt: new Date().toISOString() }
-          : item
-      )
-    );
-  }
-
-  function upsertSession(session: QuerySession) {
-    setSessions((current) => {
-      const withoutSession = current.filter((item) => item.id !== session.id);
-      return [session, ...withoutSession];
-    });
-  }
-
-  function archiveSession(sessionId: string) {
-    const remainingSessions = sessions.filter((session) => session.id !== sessionId);
-    setSessions(remainingSessions);
-
-    if (sessionId !== activeSessionId) return;
-
-    const nextSession = remainingSessions[0] ?? null;
-    setActiveSessionId(nextSession?.id ?? null);
-    setQuery(nextSession?.query ?? "");
-    setMode(nextSession?.mode ?? "synthesis");
-    setCurateList(nextSession?.curateList ?? false);
-    setSelectedDrive(nextSession?.selectedDrive ?? "all");
-  }
-
-  async function runAgent() {
-    const trimmedQuery = query.trim();
-    if (!trimmedQuery) return;
-
-    const now = new Date().toISOString();
-    const session: QuerySession = {
-      id: activeSession?.status === "draft" ? activeSession.id : crypto.randomUUID(),
-      query: trimmedQuery,
-      mode,
-      curateList,
-      selectedDrive,
-      createdAt: activeSession?.status === "draft" ? activeSession.createdAt : now,
-      updatedAt: now,
-      status: "running",
-      events: [],
-      files: [],
-      answer: "",
-      answerFormat: "plain",
-      error: ""
-    };
-
-    setActiveSessionId(session.id);
-    upsertSession(session);
-    setProgressOpen(true);
-    let receivedTerminalEvent = false;
-
-    try {
-      const response = await fetch("/api/agent", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          query: trimmedQuery,
-          mode,
-          curateList,
-          driveIds: [selectedDrive]
-        })
-      });
-
-      if (!response.ok || !response.body) {
-        throw new Error(await response.text());
-      }
-
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const parts = buffer.split("\n\n");
-        buffer = parts.pop() ?? "";
-        for (const part of parts) {
-          const line = part
-            .split("\n")
-            .find((candidate) => candidate.startsWith("data: "));
-          if (!line) continue;
-          const event = JSON.parse(line.slice(6)) as StreamEvent;
-          if (event.type === "progress") {
-            setSessions((current) =>
-              current.map((item) =>
-                item.id === session.id
-                  ? { ...item, events: [...item.events, event.message], updatedAt: new Date().toISOString() }
-                  : item
-              )
-            );
-          } else if (event.type === "file") {
-            setSessions((current) =>
-              current.map((item) =>
-                item.id === session.id
-                  ? { ...item, files: [...item.files, event.file], updatedAt: new Date().toISOString() }
-                  : item
-              )
-            );
-          } else if (event.type === "final") {
-            receivedTerminalEvent = true;
-            setProgressOpen(false);
-            setSessions((current) =>
-              current.map((item) =>
-                item.id === session.id
-                  ? {
-                      ...item,
-                      status: "finished",
-                      answer: event.answer,
-                      answerFormat: event.answerFormat,
-                      files: event.files,
-                      error: "",
-                      updatedAt: new Date().toISOString()
-                    }
-                  : item
-              )
-            );
-          } else if (event.type === "error") {
-            receivedTerminalEvent = true;
-            setSessions((current) =>
-              current.map((item) =>
-                item.id === session.id
-                  ? {
-                      ...item,
-                      status: "error",
-                      error: event.message,
-                      updatedAt: new Date().toISOString()
-                    }
-                  : item
-              )
-            );
-          }
-        }
-      }
-    } catch (caught) {
-      const message = caught instanceof Error ? caught.message : "Agent request failed";
-      setSessions((current) =>
-        current.map((item) =>
-          item.id === session.id
-            ? { ...item, status: "error", error: message, updatedAt: new Date().toISOString() }
-            : item
-        )
-      );
-    } finally {
-      if (!receivedTerminalEvent) {
-        setSessions((current) =>
-          current.map((item) =>
-            item.id === session.id && item.status === "running"
-              ? {
-                  ...item,
-                  status: "error",
-                  error: "The agent stopped before returning a final result.",
-                  updatedAt: new Date().toISOString()
-                }
-              : item
-          )
-        );
-      }
-    }
   }
 
   return (
@@ -605,148 +158,11 @@ export function SearchApp({
         ) : (
           <>
             {settingsOpen ? (
-              <section className="settings-panel" aria-labelledby="settings-title">
-                <div className="settings-backdrop" onClick={closeSettings} />
-                <div className="settings-dialog">
-                  <div className="panel-header">
-                    <h2 id="settings-title">Settings</h2>
-                    <button
-                      className="icon-button"
-                      type="button"
-                      aria-label="Close settings"
-                      onClick={closeSettings}
-                    >
-                      <svg
-                        aria-hidden="true"
-                        viewBox="0 0 24 24"
-                        fill="none"
-                        stroke="currentColor"
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                        strokeWidth="2.4"
-                      >
-                        <path d="M18 6 6 18" />
-                        <path d="m6 6 12 12" />
-                      </svg>
-                    </button>
-                  </div>
-                  <div className="panel-body form-grid">
-                    <section className="settings-current-provider" aria-labelledby="current-provider-title">
-                      <div className="settings-section-heading">
-                        <h3 id="current-provider-title">Current provider</h3>
-                        <span className={`provider-badge ${hasCustomModel ? "custom" : "default"}`}>
-                          {hasCustomModel ? "Custom" : "Default"}
-                        </span>
-                      </div>
-                      <p>
-                        {hasCustomModel
-                          ? "Searches are using your saved endpoint and model."
-                          : "Searches are using the app-managed model provider."}
-                      </p>
-                      {hasCustomModel ? (
-                        <dl className="provider-details">
-                          <div>
-                            <dt>Endpoint</dt>
-                            <dd>{modelSettings?.baseUrl}</dd>
-                          </div>
-                          <div>
-                            <dt>Model</dt>
-                            <dd>{modelSettings?.model}</dd>
-                          </div>
-                          <div>
-                            <dt>API key</dt>
-                            <dd>Configured</dd>
-                          </div>
-                        </dl>
-                      ) : null}
-                    </section>
-
-                    <div className="settings-note">
-                      API keys are write-only. After saving, the key cannot be viewed here again.
-                    </div>
-
-                    <section className="settings-form-section" aria-labelledby="custom-provider-title">
-                      <div className="settings-section-heading">
-                        <h3 id="custom-provider-title">Custom provider</h3>
-                      </div>
-                      <p className="settings-help">
-                        {hasCustomModel
-                          ? "Update your saved OpenAI-compatible endpoint, model, or API key."
-                          : "Add your own OpenAI-compatible endpoint, model, and API key."}
-                      </p>
-
-                    <div className="field">
-                      <label htmlFor="model-base-url">OpenAI-compatible endpoint</label>
-                      <input
-                        id="model-base-url"
-                        type="url"
-                        value={settingsBaseUrl}
-                        onChange={(event) => setSettingsBaseUrl(event.target.value)}
-                        placeholder="https://api.openai.com/v1"
-                      />
-                    </div>
-
-                    <div className="field">
-                      <label htmlFor="model-name">Model name</label>
-                      <input
-                        id="model-name"
-                        value={settingsModel}
-                        onChange={(event) => setSettingsModel(event.target.value)}
-                        placeholder="gpt-4.1-mini"
-                      />
-                    </div>
-
-                    <div className="field">
-                      <label htmlFor="model-api-key">
-                        API key
-                        {modelSettings?.apiKeyConfigured ? (
-                          <span className="inline-status">configured</span>
-                        ) : null}
-                      </label>
-                      <input
-                        id="model-api-key"
-                        type="password"
-                        value={settingsApiKey}
-                        onChange={(event) => setSettingsApiKey(event.target.value)}
-                        placeholder={
-                          modelSettings?.apiKeyConfigured
-                            ? "Leave blank to keep existing key"
-                            : "Required for custom provider"
-                        }
-                        autoComplete="new-password"
-                        spellCheck={false}
-                      />
-                    </div>
-
-                    {settingsError ? <div className="form-message error">{settingsError}</div> : null}
-                    {settingsMessage ? (
-                      <div className="form-message success">{settingsMessage}</div>
-                    ) : null}
-
-                    <div className="settings-actions">
-                      <button
-                        className="button"
-                        type="button"
-                        onClick={saveModelSettings}
-                        disabled={settingsSaving}
-                      >
-                        {hasCustomModel ? "Update custom provider" : "Save custom provider"}
-                      </button>
-                      {hasCustomModel ? (
-                        <button
-                          className="button secondary"
-                          type="button"
-                          onClick={deleteModelSettings}
-                          disabled={settingsSaving}
-                        >
-                          Use default provider
-                        </button>
-                      ) : null}
-                    </div>
-                    </section>
-                  </div>
-                </div>
-              </section>
+              <SettingsDialog
+                modelSettings={modelSettings}
+                onSettingsChange={setModelSettings}
+                onClose={closeSettings}
+              />
             ) : null}
 
             <section className="connections-strip">
@@ -1045,246 +461,11 @@ function downloadAnswer(answer: string, format: "markdown" | "plain", query: str
 
 function AnswerView({ answer, format }: { answer: string; format: "markdown" | "plain" }) {
   if (format === "markdown") {
-    return <div className="answer markdown-answer">{renderMarkdown(answer)}</div>;
-  }
-  return <div className="answer">{answer}</div>;
-}
-
-function renderMarkdown(markdown: string) {
-  const blocks: ReactNode[] = [];
-  const lines = markdown.split(/\r?\n/);
-  let index = 0;
-
-  while (index < lines.length) {
-    const line = lines[index];
-    if (!line.trim()) {
-      index += 1;
-      continue;
-    }
-
-    if (line.startsWith("```")) {
-      const code: string[] = [];
-      index += 1;
-      while (index < lines.length && !lines[index].startsWith("```")) {
-        code.push(lines[index]);
-        index += 1;
-      }
-      if (index < lines.length) index += 1;
-      blocks.push(
-        <pre key={`code-${index}`}>
-          <code>{code.join("\n")}</code>
-        </pre>
-      );
-      continue;
-    }
-
-    if (isMarkdownTableStart(lines, index)) {
-      const tableStart = index;
-      const headers = splitMarkdownTableRow(lines[index]);
-      const alignments = splitMarkdownTableRow(lines[index + 1]).map(parseMarkdownTableAlignment);
-      const rows: string[][] = [];
-      index += 2;
-
-      while (index < lines.length && isMarkdownTableRow(lines[index])) {
-        rows.push(splitMarkdownTableRow(lines[index]));
-        index += 1;
-      }
-
-      blocks.push(
-        <div className="markdown-table-wrap" key={`table-${tableStart}`}>
-          <table>
-            <thead>
-              <tr>
-                {headers.map((header, cellIndex) => (
-                  <th
-                    key={`table-${tableStart}-head-${cellIndex}`}
-                    style={tableCellStyle(alignments[cellIndex])}
-                  >
-                    {renderInlineMarkdown(header, `table-${tableStart}-head-${cellIndex}`)}
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((row, rowIndex) => (
-                <tr key={`table-${tableStart}-row-${rowIndex}`}>
-                  {headers.map((_, cellIndex) => (
-                    <td
-                      key={`table-${tableStart}-row-${rowIndex}-${cellIndex}`}
-                      style={tableCellStyle(alignments[cellIndex])}
-                    >
-                      {renderInlineMarkdown(
-                        row[cellIndex] ?? "",
-                        `table-${tableStart}-row-${rowIndex}-${cellIndex}`
-                      )}
-                    </td>
-                  ))}
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      );
-      continue;
-    }
-
-    const heading = line.match(/^(#{1,3})\s+(.+)$/);
-    if (heading) {
-      const level = heading[1].length;
-      const content = renderInlineMarkdown(heading[2], `heading-${index}`);
-      blocks.push(
-        level === 1 ? (
-          <h3 key={`heading-${index}`}>{content}</h3>
-        ) : level === 2 ? (
-          <h4 key={`heading-${index}`}>{content}</h4>
-        ) : (
-          <h5 key={`heading-${index}`}>{content}</h5>
-        )
-      );
-      index += 1;
-      continue;
-    }
-
-    if (/^\s*[-*]\s+/.test(line)) {
-      const items: ReactNode[] = [];
-      while (index < lines.length && /^\s*[-*]\s+/.test(lines[index])) {
-        const item = lines[index].replace(/^\s*[-*]\s+/, "");
-        items.push(<li key={`li-${index}`}>{renderInlineMarkdown(item, `li-${index}`)}</li>);
-        index += 1;
-      }
-      blocks.push(<ul key={`ul-${index}`}>{items}</ul>);
-      continue;
-    }
-
-    if (/^\s*\d+\.\s+/.test(line)) {
-      const items: ReactNode[] = [];
-      while (index < lines.length && /^\s*\d+\.\s+/.test(lines[index])) {
-        const item = lines[index].replace(/^\s*\d+\.\s+/, "");
-        items.push(<li key={`oli-${index}`}>{renderInlineMarkdown(item, `oli-${index}`)}</li>);
-        index += 1;
-      }
-      blocks.push(<ol key={`ol-${index}`}>{items}</ol>);
-      continue;
-    }
-
-    const paragraph: string[] = [];
-    while (
-      index < lines.length &&
-      lines[index].trim() &&
-      !lines[index].startsWith("```") &&
-      !isMarkdownTableStart(lines, index) &&
-      !/^(#{1,3})\s+/.test(lines[index]) &&
-      !/^\s*[-*]\s+/.test(lines[index]) &&
-      !/^\s*\d+\.\s+/.test(lines[index])
-    ) {
-      paragraph.push(lines[index]);
-      index += 1;
-    }
-    blocks.push(
-      <p key={`p-${index}`}>{renderInlineMarkdown(paragraph.join(" "), `p-${index}`)}</p>
+    return (
+      <div className="answer markdown-answer">
+        <MarkdownContent>{answer}</MarkdownContent>
+      </div>
     );
   }
-
-  return blocks;
-}
-
-function isMarkdownTableStart(lines: string[], index: number) {
-  return Boolean(
-    lines[index] &&
-      lines[index + 1] &&
-      isMarkdownTableRow(lines[index]) &&
-      isMarkdownTableSeparator(lines[index + 1]) &&
-      splitMarkdownTableRow(lines[index]).length === splitMarkdownTableRow(lines[index + 1]).length
-  );
-}
-
-function isMarkdownTableRow(line: string) {
-  return line.includes("|") && splitMarkdownTableRow(line).length > 1;
-}
-
-function isMarkdownTableSeparator(line: string) {
-  const cells = splitMarkdownTableRow(line);
-  return cells.length > 1 && cells.every((cell) => /^:?-{3,}:?$/.test(cell.trim()));
-}
-
-function splitMarkdownTableRow(line: string) {
-  const trimmed = line.trim().replace(/^\|/, "").replace(/\|$/, "");
-  const cells: string[] = [];
-  let current = "";
-  let escaped = false;
-
-  for (const character of trimmed) {
-    if (escaped) {
-      current += character;
-      escaped = false;
-    } else if (character === "\\") {
-      escaped = true;
-    } else if (character === "|") {
-      cells.push(current.trim());
-      current = "";
-    } else {
-      current += character;
-    }
-  }
-
-  if (escaped) current += "\\";
-  cells.push(current.trim());
-  return cells;
-}
-
-function parseMarkdownTableAlignment(cell: string) {
-  const trimmed = cell.trim();
-  if (trimmed.startsWith(":") && trimmed.endsWith(":")) return "center";
-  if (trimmed.endsWith(":")) return "right";
-  return "left";
-}
-
-function tableCellStyle(alignment?: string): CSSProperties | undefined {
-  if (alignment === "center" || alignment === "right") {
-    return { textAlign: alignment };
-  }
-  return undefined;
-}
-
-function renderInlineMarkdown(value: string, keyPrefix: string) {
-  const nodes: ReactNode[] = [];
-  const pattern = /(`[^`]+`|\*\*[^*]+\*\*|\[[^\]]+\]\([^)]+\))/g;
-  let lastIndex = 0;
-  let match: RegExpExecArray | null;
-
-  while ((match = pattern.exec(value))) {
-    if (match.index > lastIndex) {
-      nodes.push(value.slice(lastIndex, match.index));
-    }
-    const token = match[0];
-    const key = `${keyPrefix}-${match.index}`;
-    if (token.startsWith("`")) {
-      nodes.push(<code key={key}>{token.slice(1, -1)}</code>);
-    } else if (token.startsWith("**")) {
-      nodes.push(<strong key={key}>{token.slice(2, -2)}</strong>);
-    } else {
-      const link = token.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
-      const href = safeMarkdownHref(link?.[2] ?? "");
-      nodes.push(
-        href ? (
-          <a key={key} href={href} target="_blank" rel="noreferrer">
-            {link?.[1]}
-          </a>
-        ) : (
-          link?.[1]
-        )
-      );
-    }
-    lastIndex = match.index + token.length;
-  }
-
-  if (lastIndex < value.length) {
-    nodes.push(value.slice(lastIndex));
-  }
-
-  return nodes;
-}
-
-function safeMarkdownHref(href: string) {
-  return /^(https?:|mailto:)/i.test(href) ? href : "";
+  return <div className="answer">{answer}</div>;
 }

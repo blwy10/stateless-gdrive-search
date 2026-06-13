@@ -21,6 +21,12 @@ export function isDebugLogEnabled() {
 }
 
 export function isDebugContentLogEnabled() {
+  // Content previews can include short query / file-name / error snippets, so
+  // they are strictly for local emergency debugging (see README). Enforce the
+  // documented "do not enable in production" guidance in code: never emit
+  // previews when NODE_ENV is "production", regardless of the flag. Metadata
+  // logging (DEBUG_LOGS) is unaffected and still works in any environment.
+  if (process.env.NODE_ENV === "production") return false;
   return enabled(process.env.DEBUG_LOG_CONTENT);
 }
 
@@ -63,7 +69,7 @@ export function debugError(error: unknown) {
 
 function logPath() {
   const date = new Date().toISOString().slice(0, 10);
-  return path.join(process.cwd(), ".codex-debug", "logs", `agent-${date}.jsonl`);
+  return path.join(process.cwd(), ".debug", "logs", `agent-${date}.jsonl`);
 }
 
 export async function writeDebugLog(event: DebugLogEvent) {

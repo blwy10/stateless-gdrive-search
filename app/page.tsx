@@ -2,13 +2,13 @@
 // SPDX-License-Identifier: MIT
 
 import { getServerSession } from "next-auth";
-import { authOptions } from "@/lib/auth";
+import { getAuthOptions } from "@/lib/auth";
 import { listDriveConnections } from "@/lib/drive-connections";
 import { getModelSettingsSummary } from "@/lib/model-settings";
 import { SearchApp } from "@/components/search-app";
 
 export default async function Home() {
-  const session = await getServerSession(authOptions);
+  const session = await getServerSession(getAuthOptions());
   const connections = session?.user?.id ? await listDriveConnections(session.user.id) : [];
   const modelSettings = session?.user?.id ? await getModelSettingsSummary(session.user.id) : null;
 

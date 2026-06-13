@@ -15,6 +15,15 @@ const DRIVE_SCOPES = [
 
 export const driveScopes = DRIVE_SCOPES.join(" ");
 
+/**
+ * Per-request timeout for outbound Google OAuth/userinfo calls. Without it, a
+ * hung connection would stall the caller indefinitely; notably,
+ * {@link refreshDriveToken} runs inside the Drive request path, so an unbounded
+ * refresh would hold the agent's SSE stream and server resources open. Applied
+ * via {@link AbortSignal.timeout}.
+ */
+const OAUTH_REQUEST_TIMEOUT_MS = 15_000;
+
 export async function createDriveOAuthUrl(ownerSub: string) {
   const state = crypto.randomBytes(32).toString("base64url");
   const cookieStore = await cookies();
@@ -51,6 +60,7 @@ export async function exchangeDriveCode(code: string) {
   const response = await fetch("https://oauth2.googleapis.com/token", {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
+    signal: AbortSignal.timeout(OAUTH_REQUEST_TIMEOUT_MS),
     body: new URLSearchParams({
       code,
       client_id: env.googleClientId(),
@@ -75,6 +85,7 @@ export async function refreshDriveToken(refreshToken: string) {
   const response = await fetch("https://oauth2.googleapis.com/token", {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
+    signal: AbortSignal.timeout(OAUTH_REQUEST_TIMEOUT_MS),
     body: new URLSearchParams({
       client_id: env.googleClientId(),
       client_secret: env.googleClientSecret(),
@@ -95,7 +106,8 @@ export async function refreshDriveToken(refreshToken: string) {
 
 export async function getGoogleUserInfo(accessToken: string) {
   const response = await fetch("https://www.googleapis.com/oauth2/v2/userinfo", {
-    headers: { authorization: `Bearer ${accessToken}` }
+    headers: { authorization: `Bearer ${accessToken}` },
+    signal: AbortSignal.timeout(OAUTH_REQUEST_TIMEOUT_MS)
   });
   if (!response.ok) {
     throw new Error(`Google userinfo failed: ${response.status} ${await response.text()}`);

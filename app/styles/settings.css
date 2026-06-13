@@ -1,0 +1,160 @@
+/*
+ * Copyright (c) 2026 Benjamin Lau
+ * SPDX-License-Identifier: MIT
+ */
+
+/*
+ * Settings modal: overlay/dialog, current-provider summary, provider badge and
+ * details, the custom-provider form helpers, and inline/save form messages.
+ */
+
+.settings-panel {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: start center;
+  padding: 72px 18px 24px;
+}
+
+.settings-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(20, 28, 24, 0.35);
+}
+
+.settings-dialog {
+  position: relative;
+  width: min(560px, 100%);
+  max-height: calc(100vh - 96px);
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  box-shadow: 0 24px 60px rgba(31, 43, 36, 0.2);
+}
+
+.settings-note {
+  border: 1px solid #d7e7df;
+  border-radius: 7px;
+  padding: 10px 11px;
+  background: #f2faf6;
+  color: var(--accent-strong);
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.settings-current-provider {
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 13px;
+  background: #fbfcfb;
+}
+
+.settings-section-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.settings-section-heading h3 {
+  margin: 0;
+  font-size: 14px;
+}
+
+.settings-current-provider p,
+.settings-help {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.settings-form-section {
+  display: grid;
+  gap: 14px;
+}
+
+.provider-badge {
+  min-height: 26px;
+  border-radius: 999px;
+  padding: 4px 10px;
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--line);
+  background: var(--panel-strong);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.provider-badge.custom {
+  border-color: #c9e5d2;
+  background: #f1faf4;
+  color: var(--success);
+}
+
+.provider-details {
+  margin: 12px 0 0;
+  display: grid;
+  gap: 8px;
+}
+
+.provider-details div {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 82px minmax(0, 1fr);
+  gap: 10px;
+}
+
+.provider-details dt,
+.provider-details dd {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.provider-details dt {
+  color: var(--muted);
+  font-weight: 700;
+}
+
+.provider-details dd {
+  min-width: 0;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.inline-status {
+  margin-left: 8px;
+  color: var(--success);
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.form-message {
+  border-radius: 7px;
+  padding: 10px 11px;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.form-message.error {
+  border: 1px solid #efcaca;
+  background: #fff6f6;
+  color: var(--danger);
+}
+
+.form-message.success {
+  border: 1px solid #c9e5d2;
+  background: #f1faf4;
+  color: var(--success);
+}
+
+.settings-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}

@@ -3,7 +3,7 @@
 
 import { NextRequest, NextResponse } from "next/server";
 import { ZodError } from "zod";
-import { requireSession } from "@/lib/auth";
+import { requireSession, withAuth } from "@/lib/auth";
 import {
   deleteModelSettings,
   getModelSettingsSummary,
@@ -11,12 +11,12 @@ import {
   upsertModelSettings
 } from "@/lib/model-settings";
 
-export async function GET() {
+export const GET = withAuth(async () => {
   const session = await requireSession();
   return NextResponse.json({ settings: await getModelSettingsSummary(session.user.id) });
-}
+});
 
-export async function PUT(request: NextRequest) {
+export const PUT = withAuth(async (request: NextRequest) => {
   const session = await requireSession();
 
   try {
@@ -26,13 +26,13 @@ export async function PUT(request: NextRequest) {
   } catch (error) {
     return NextResponse.json({ error: errorMessage(error) }, { status: 400 });
   }
-}
+});
 
-export async function DELETE() {
+export const DELETE = withAuth(async () => {
   const session = await requireSession();
   await deleteModelSettings(session.user.id);
   return NextResponse.json({ settings: await getModelSettingsSummary(session.user.id) });
-}
+});
 
 function errorMessage(error: unknown) {
   if (error instanceof ZodError) {
