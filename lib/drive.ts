@@ -207,6 +207,18 @@ function trimContent(content: string) {
   return `${normalized.slice(0, MAX_FILE_CHARS)}\n\n[Truncated at ${MAX_FILE_CHARS} characters]`;
 }
 
+function googleAppsTypeName(mimeType: string) {
+  return mimeType.replace("application/vnd.google-apps.", "Google ");
+}
+
+function unsupportedGoogleAppsContent(file: Omit<DriveFile, "connectionId" | "driveEmail">) {
+  const linkText = file.webViewLink ? ` Open it in Drive: ${file.webViewLink}` : "";
+  return [
+    `${file.name} is a ${googleAppsTypeName(file.mimeType)} file.`,
+    `This app can extract text from Google Docs, Sheets, and Slides, but it cannot extract text from this Google Drive file type yet.${linkText}`
+  ].join("\n");
+}
+
 export async function openDriveFile(input: {
   ownerSub: string;
   connectionId: string;
@@ -256,6 +268,10 @@ export async function openDriveFile(input: {
       content = (await downloadBuffer(connection, input.fileId)).toString("utf8");
       break;
     default:
+      if (metadata.mimeType.startsWith("application/vnd.google-apps.")) {
+        content = unsupportedGoogleAppsContent(metadata);
+        break;
+      }
       content = (await downloadBuffer(connection, input.fileId)).toString("utf8");
   }
 

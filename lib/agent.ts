@@ -36,10 +36,22 @@ type ChatCompletion = {
   }>;
 };
 
+export type AgentBudget = {
+  maxToolSteps: number;
+  maxSearchCalls: number;
+  maxOpenFileCalls: number;
+  maxLowProgressSearches: number;
+  maxToolRetries: number;
+};
+
+export type AgentOptions = {
+  budget?: Partial<AgentBudget>;
+};
+
 export type AgentProgress =
   | { type: "progress"; message: string }
   | { type: "file"; file: DriveFile }
-  | { type: "final"; answer: string; files: DriveFile[] }
+  | { type: "final"; answer: string; answerFormat: "markdown" | "plain"; files: DriveFile[] }
   | { type: "error"; message: string };
 
 const searchArgs = z.object({
@@ -95,18 +107,59 @@ const tools = [
   }
 ];
 
-function systemPrompt(mode: AgentRequest["mode"], allowedDriveIds: string[]) {
+export const defaultAgentBudgets: Record<AgentRequest["mode"], AgentBudget> = {
+  list: {
+    maxToolSteps: 8,
+    maxSearchCalls: 4,
+    maxOpenFileCalls: 6,
+    maxLowProgressSearches: 2,
+    maxToolRetries: 1
+  },
+  synthesis: {
+    maxToolSteps: 8,
+    maxSearchCalls: 5,
+    maxOpenFileCalls: 8,
+    maxLowProgressSearches: 2,
+    maxToolRetries: 1
+  }
+};
+
+export function resolveAgentBudget(
+  mode: AgentRequest["mode"],
+  override?: Partial<AgentBudget>
+): AgentBudget {
+  return {
+    ...defaultAgentBudgets[mode],
+    ...override
+  };
+}
+
+function systemPrompt(mode: AgentRequest["mode"], allowedDriveIds: string[], budget: AgentBudget) {
   const answerInstruction =
     mode === "synthesis"
-      ? "Return a concise synthesis answering the user's query, followed by the source files you relied on."
-      : "Return only a relevant file list. Do not synthesize an answer.";
+      ? `Return a concise synthesis answering the user's query, followed by the source files you relied on.
+Your final response must start with exactly one format line:
+FORMAT: markdown
+or
+FORMAT: plain
+Then put the answer body after that line.
+Use markdown only when headings, lists, links, or other markdown structure materially improve readability.
+Never return HTML or any format other than markdown or plain.`
+      : `Find relevant files only. Do not synthesize an answer.
+When you are done, return exactly:
+FORMAT: plain
+FILE_LIST_COMPLETE`;
 
   return `You are a Google Drive research agent.
 
 You have exactly two tools: search_drive and open_file.
 You may only work with these selected Drive connection IDs: ${allowedDriveIds.join(", ")}.
-Search using several targeted query variants before deciding there is not enough evidence.
-Open files when their titles or snippets appear relevant, especially when synthesis mode is requested.
+Use at most ${budget.maxSearchCalls} search_drive calls.
+Use at most ${budget.maxOpenFileCalls} open_file calls.
+Search using targeted query variants before deciding there is not enough evidence.
+Do not repeat equivalent searches.
+Open files when their titles or snippets appear relevant. In list mode, opening files is allowed when needed to judge relevance.
+If searches stop producing new relevant files, answer with the evidence found.
 Never claim you searched outside Google Drive.
 Never ask for permissions or tokens.
 If evidence is weak, say that directly.
@@ -141,11 +194,72 @@ async function callModel(messages: ChatMessage[]) {
 function uniqueFiles(files: DriveFile[]) {
   const seen = new Set<string>();
   return files.filter((file) => {
-    const key = `${file.connectionId}:${file.id}`;
+    const key = fileKey(file);
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
   });
+}
+
+function fileKey(file: Pick<DriveFile, "connectionId" | "id">) {
+  return `${file.connectionId}:${file.id}`;
+}
+
+function normalizeSearchQuery(query: string) {
+  return query.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+function partialAnswer(reason: string, mode: AgentRequest["mode"]) {
+  if (mode === "list") {
+    return { answer: "", answerFormat: "plain" as const };
+  }
+
+  return {
+    answerFormat: "plain" as const,
+    answer: `${reason} Returning the files found so far.`
+  };
+}
+
+function parseFinalAnswer(content: string | null, mode: AgentRequest["mode"]) {
+  if (mode === "list") {
+    return { answer: "", answerFormat: "plain" as const };
+  }
+
+  const raw = content?.trim() || "No answer returned.";
+  const match = raw.match(/^FORMAT:\s*(markdown|plain)\s*\n([\s\S]*)$/i);
+  if (match) {
+    return {
+      answerFormat: match[1].toLowerCase() === "markdown" ? ("markdown" as const) : ("plain" as const),
+      answer: match[2].trim()
+    };
+  }
+
+  const likelyMarkdown = /(^|\n)\s*(#{1,6}\s+|[-*]\s+|\d+\.\s+|```|\[[^\]]+\]\([^)]+\))/.test(raw);
+  return {
+    answerFormat: likelyMarkdown ? ("markdown" as const) : ("plain" as const),
+    answer: raw
+  };
+}
+
+function isRetryableToolError(error: unknown) {
+  if (!(error instanceof Error)) return false;
+  return /\b(408|409|429|500|502|503|504)\b/.test(error.message);
+}
+
+async function withToolRetries<T>(
+  operation: () => Promise<T>,
+  retryCount: number
+): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= retryCount; attempt += 1) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error;
+      if (attempt >= retryCount || !isRetryableToolError(error)) break;
+    }
+  }
+  throw lastError;
 }
 
 export function parseAgentRequest(value: unknown) {
@@ -155,8 +269,10 @@ export function parseAgentRequest(value: unknown) {
 export async function runDriveAgent(
   ownerSub: string,
   input: AgentRequest,
-  emit: (event: AgentProgress) => void | Promise<void>
+  emit: (event: AgentProgress) => void | Promise<void>,
+  options: AgentOptions = {}
 ) {
+  const budget = resolveAgentBudget(input.mode, options.budget);
   const connections = await listDriveConnections(ownerSub);
   const allowed = new Set(connections.map((connection) => connection.id));
   const selectedDriveIds = input.driveIds.includes("all")
@@ -169,19 +285,35 @@ export async function runDriveAgent(
 
   const referencedFiles: DriveFile[] = [];
   const messages: ChatMessage[] = [
-    { role: "system", content: systemPrompt(input.mode, selectedDriveIds) },
+    { role: "system", content: systemPrompt(input.mode, selectedDriveIds, budget) },
     {
       role: "user",
       content: `Query: ${input.query}\nMode: ${input.mode}`
     }
   ];
+  const searchedQueries = new Set<string>();
+  const knownFileKeys = new Set<string>();
+  const openedFileKeys = new Set<string>();
+  let searchCallCount = 0;
+  let openFileCallCount = 0;
+  let lowProgressSearchCount = 0;
+  let stopAfterToolUseReason: string | null = null;
+  let stopInstructionSent = false;
 
   await emit({
     type: "progress",
     message: `Agent started with ${selectedDriveIds.length} Drive connection(s).`
   });
 
-  for (let step = 0; step < 8; step += 1) {
+  for (let step = 0; step < budget.maxToolSteps; step += 1) {
+    if (stopAfterToolUseReason && !stopInstructionSent) {
+      messages.push({
+        role: "user",
+        content: `${stopAfterToolUseReason} Stop using tools and return the final result now.`
+      });
+      stopInstructionSent = true;
+    }
+
     const completion = await callModel(messages);
     const message = completion.choices[0]?.message;
     if (!message) {
@@ -195,21 +327,53 @@ export async function runDriveAgent(
     });
 
     if (!message.tool_calls?.length) {
-      const answer = message.content?.trim() || "No answer returned.";
-      await emit({ type: "final", answer, files: uniqueFiles(referencedFiles) });
+      const { answer, answerFormat } = parseFinalAnswer(message.content, input.mode);
+      await emit({ type: "final", answer, answerFormat, files: uniqueFiles(referencedFiles) });
       return;
     }
 
     for (const toolCall of message.tool_calls) {
       if (toolCall.function.name === "search_drive") {
         const args = searchArgs.parse(JSON.parse(toolCall.function.arguments || "{}"));
+        const normalizedQuery = normalizeSearchQuery(args.query);
+        if (searchCallCount >= budget.maxSearchCalls) {
+          const reason = `Search budget reached after ${searchCallCount} search_drive call(s).`;
+          await emit({ type: "progress", message: reason });
+          stopAfterToolUseReason = reason;
+          messages.push({
+            role: "tool",
+            tool_call_id: toolCall.id,
+            content: safeJson({ skipped: true, reason })
+          });
+          continue;
+        }
+
         await emit({ type: "progress", message: `Searching Drive for "${args.query}"` });
-        const files = await searchDriveFiles({
-          ownerSub,
-          connectionIds: selectedDriveIds,
-          query: args.query,
-          limit: args.limit
-        });
+        searchCallCount += 1;
+        const wasRepeatedQuery = searchedQueries.has(normalizedQuery);
+        searchedQueries.add(normalizedQuery);
+        const files = await withToolRetries(
+          () =>
+            searchDriveFiles({
+              ownerSub,
+              connectionIds: selectedDriveIds,
+              query: args.query,
+              limit: args.limit
+            }),
+          budget.maxToolRetries
+        );
+        const newFiles = files.filter((file) => !knownFileKeys.has(fileKey(file)));
+        for (const file of files) {
+          knownFileKeys.add(fileKey(file));
+        }
+        if (wasRepeatedQuery || newFiles.length === 0) {
+          lowProgressSearchCount += 1;
+        } else {
+          lowProgressSearchCount = 0;
+        }
+        if (lowProgressSearchCount >= budget.maxLowProgressSearches) {
+          stopAfterToolUseReason = `Searches stopped producing new files after ${lowProgressSearchCount} low-progress search(es).`;
+        }
         referencedFiles.push(...files);
         for (const file of files) {
           await emit({ type: "file", file });
@@ -224,12 +388,41 @@ export async function runDriveAgent(
         if (!selectedDriveIds.includes(args.connectionId)) {
           throw new Error("AI attempted to open a file outside the selected Drive scope");
         }
+        const key = `${args.connectionId}:${args.fileId}`;
+        if (openedFileKeys.has(key)) {
+          const reason = "File was already opened earlier in this run.";
+          messages.push({
+            role: "tool",
+            tool_call_id: toolCall.id,
+            content: safeJson({ skipped: true, reason })
+          });
+          continue;
+        }
+        if (openFileCallCount >= budget.maxOpenFileCalls) {
+          const reason = `Open-file budget reached after ${openFileCallCount} open_file call(s).`;
+          await emit({ type: "progress", message: reason });
+          stopAfterToolUseReason = reason;
+          messages.push({
+            role: "tool",
+            tool_call_id: toolCall.id,
+            content: safeJson({ skipped: true, reason })
+          });
+          continue;
+        }
+
         await emit({ type: "progress", message: `Opening file ${args.fileId}` });
-        const opened = await openDriveFile({
-          ownerSub,
-          connectionId: args.connectionId,
-          fileId: args.fileId
-        });
+        openFileCallCount += 1;
+        openedFileKeys.add(key);
+        const opened = await withToolRetries(
+          () =>
+            openDriveFile({
+              ownerSub,
+              connectionId: args.connectionId,
+              fileId: args.fileId
+            }),
+          budget.maxToolRetries
+        );
+        knownFileKeys.add(fileKey(opened.file));
         referencedFiles.push(opened.file);
         await emit({ type: "file", file: opened.file });
         messages.push({
@@ -244,5 +437,7 @@ export async function runDriveAgent(
     }
   }
 
-  throw new Error("Agent reached the maximum tool-use steps before completing");
+  const reason = `Agent stopped after reaching the ${budget.maxToolSteps}-step tool-use budget.`;
+  const { answer, answerFormat } = partialAnswer(reason, input.mode);
+  await emit({ type: "final", answer, answerFormat, files: uniqueFiles(referencedFiles) });
 }
