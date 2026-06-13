@@ -7,10 +7,14 @@ A production-oriented Next.js app for Google-login users to connect one or more 
 
 > Created with Codex. The repository, application structure, and implementation were generated and edited through Codex-assisted development.
 
-The agent has exactly two app tools:
+The agent has a small, fixed set of app tools:
 
 - `search_drive`: search connected Google Drives with read-only Drive scopes.
-- `open_file`: read a selected file's contents.
+- `open_file`: read a selected file's contents (synthesis and uncurated list mode).
+- `review_file`: curated file-list mode only — read a candidate file and judge its
+  relevance in an isolated grader call, keeping it only if relevant. Offered
+  instead of `open_file` when curating, so file contents never accumulate in the
+  agent's context.
 
 Durable application data is limited to encrypted Google Drive OAuth token material,
 optional encrypted per-user model API keys, and their metadata.
@@ -125,4 +129,4 @@ Set `DEBUG_LOGS=1` during local debugging to write structured JSONL agent traces
 
 By default, logs store metadata only: request IDs, event names, durations, counts, statuses, hashed identifiers, and content lengths. Set `DEBUG_LOG_CONTENT=1` only for local emergency debugging when short query, file-name, or error-response previews are needed. It is a modifier on top of `DEBUG_LOGS`, not a standalone switch: with `DEBUG_LOGS=0` nothing is written at all, so content previews require `DEBUG_LOGS=1` as well (and, like all debug logging, are inert in production per the safeguard above).
 
-To trace *why* the agent curates files the way it does (e.g. in file-list curation mode), set `DEBUG_LOG_TRANSCRIPT=1`. This emits an `agent.model.transcript` event for every model call containing the assistant's full, untruncated reasoning text and the tool calls it issued that step (names and arguments), so you can see the rationale behind each `open_file` / `keep_file` decision. It is the most verbose and sensitive log we emit, so it is independent of `DEBUG_LOG_CONTENT`, still requires the `DEBUG_LOGS=1` master switch, and is likewise force-disabled whenever `NODE_ENV=production`.
+To trace *why* the agent curates files the way it does (e.g. in file-list curation mode), set `DEBUG_LOG_TRANSCRIPT=1`. This emits an `agent.model.transcript` event for every model call containing the assistant's full, untruncated reasoning text and the tool calls it issued that step (names and arguments), so you can see the rationale behind each `open_file` / `review_file` decision (in curated file-list mode, `review_file` grades each file's relevance in a separate isolated model call, logged as its own `agent.model.*` events plus an `agent.tool.review_file.completed` entry recording the keep/discard verdict). It is the most verbose and sensitive log we emit, so it is independent of `DEBUG_LOG_CONTENT`, still requires the `DEBUG_LOGS=1` master switch, and is likewise force-disabled whenever `NODE_ENV=production`.

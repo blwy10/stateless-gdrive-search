@@ -54,7 +54,7 @@ type ToolCall = {
   id: string;
   type: "function";
   function: {
-    name: "search_drive" | "open_file" | "keep_file";
+    name: "search_drive" | "open_file" | "review_file";
     arguments: string;
   };
 };
@@ -126,12 +126,15 @@ export type AgentOptions = {
 export type AgentProgress =
   | { type: "progress"; message: string }
   | { type: "file"; file: DriveFile }
-  // Curated list mode only: a file the agent opened and is evaluating for
-  // relevance. It is provisional and may never be kept.
+  // Curated list mode only: a file the agent is reading and grading right now.
+  // Provisional — it resolves to exactly one of `kept` or `discarded`.
   | { type: "reviewing"; file: DriveFile }
-  // Curated list mode only: a file the agent explicitly kept as relevant via
-  // keep_file. The set of kept files is the authoritative curated result.
+  // Curated list mode only: a reviewed file the grader judged relevant. The set
+  // of kept files is the authoritative curated result.
   | { type: "kept"; file: DriveFile }
+  // Curated list mode only: a reviewed file the grader judged not relevant, so
+  // the UI can drop it from the provisional "reviewing" state.
+  | { type: "discarded"; file: DriveFile }
   | { type: "final"; answer: string; answerFormat: "markdown" | "plain"; files: DriveFile[] }
   | { type: "error"; message: string };
 
@@ -145,7 +148,7 @@ const openArgs = z.object({
   fileId: z.string().min(1)
 });
 
-const keepArgs = z.object({
+const reviewArgs = z.object({
   connectionId: z.string().min(1),
   fileId: z.string().min(1)
 });
@@ -192,16 +195,19 @@ const openFileTool: ToolDefinition = {
   }
 };
 
-// Curated list mode only. Lets the model commit a relevance decision per file
-// the moment it has read it, instead of emitting one list at the very end. The
-// set of kept files is the authoritative curated result, so the UI can promote
-// files from "reviewing" to "kept" live as the agent works.
-const keepFileTool: ToolDefinition = {
+// Curated list mode only. Reads a candidate file and judges its relevance in a
+// single step. Crucially, the file's content is NOT loaded into the main agent's
+// context: review_file opens the file and grades it in an isolated, single-shot
+// model call (see gradeFileRelevance), returning only a compact verdict. This
+// keeps the curating loop's context tiny no matter how many files it reviews,
+// and makes each relevance judgement an independent decision with the model's
+// full attention rather than one made while 14 other files crowd the window.
+const reviewFileTool: ToolDefinition = {
   type: "function",
   function: {
-    name: "keep_file",
+    name: "review_file",
     description:
-      "Mark an already-opened file as relevant so it is included in the curated results. Call this immediately after reading a file whose content is relevant to the query. Only files you have opened can be kept. Pass the same connectionId and fileId you opened it with, copied verbatim from the search_drive result.",
+      "Open a file returned by search_drive, read it, and judge whether it is relevant to the query. Relevant files are kept in the curated results automatically; irrelevant ones are discarded. Copy connectionId and fileId verbatim from a single search_drive result — never invent, guess, or modify an id, and never pair the connectionId of one file with the fileId of another. connectionId must be one of the selected Drive connection IDs.",
     parameters: {
       type: "object",
       properties: {
@@ -221,12 +227,13 @@ function isCuratingRequest(input: AgentRequest) {
 }
 
 /**
- * Tools offered to the model for a given request. `keep_file` is only useful
- * (and only enabled) when curating a file list; offering it elsewhere would
- * just tempt the model into calls that have no effect.
+ * Tools offered to the model for a given request. Curated list mode swaps
+ * `open_file` for `review_file`: instead of pulling file contents into the
+ * agent's context and judging them inline, the model reviews candidates and an
+ * isolated grader decides relevance, so curated runs never offer `open_file`.
  */
 function toolsForRequest(input: AgentRequest): ToolDefinition[] {
-  return isCuratingRequest(input) ? [...baseTools, keepFileTool] : baseTools;
+  return isCuratingRequest(input) ? [searchTool, reviewFileTool] : baseTools;
 }
 
 export const defaultAgentBudgets: Record<AgentRequest["mode"], AgentBudget> = {
@@ -258,8 +265,11 @@ export function resolveAgentBudget(
 
 function basePrompt(allowedDriveIds: string[], budget: AgentBudget, curating = false) {
   const toolList = curating
-    ? "You have exactly three tools: search_drive, open_file, and keep_file."
+    ? "You have exactly two tools: search_drive and review_file."
     : "You have exactly two tools: search_drive and open_file.";
+  const readBudgetLine = curating
+    ? `Use at most ${budget.maxOpenFileCalls} review_file calls.`
+    : `Use at most ${budget.maxOpenFileCalls} open_file calls.`;
   // Smaller models occasionally fabricate a connectionId — e.g. inventing a
   // second connection even when only one exists. Spell out that ids are opaque
   // values to be copied verbatim, and when there is a single connection pin it
@@ -275,7 +285,7 @@ You may only work with these selected Drive connection IDs: ${allowedDriveIds.jo
 Every connectionId and fileId you pass to a tool is an opaque identifier you must copy verbatim from a search_drive result — never invent, guess, modify, or take an id from a different file.
 ${idRule}
 Use at most ${budget.maxSearchCalls} search_drive calls.
-Use at most ${budget.maxOpenFileCalls} open_file calls.
+${readBudgetLine}
 Search using targeted query variants before deciding there is not enough evidence.
 Do not repeat equivalent searches.
 If searches stop producing new relevant files, answer with the evidence found.
@@ -307,10 +317,10 @@ function listSystemPrompt(
     return `${basePrompt(allowedDriveIds, budget, true)}
 
 Find relevant files only. Do not synthesize an answer.
-Open files that may be relevant. The moment you read a file whose content is relevant to the query, call keep_file with its connectionId and fileId.
-Only keep files you have actually opened and judged relevant; never keep a file you have not opened.
-The files you keep are the entire curated result. A file you never keep will not be returned, so be sure to keep every relevant file as you go.
-When you have opened the promising files and kept the relevant ones, stop calling tools and reply with exactly:
+For every file that looks promising from its title or snippet, call review_file with its connectionId and fileId.
+review_file opens the file, reads it, and judges its relevance for you: relevant files are kept in the results automatically and irrelevant ones are discarded. You do not judge relevance yourself, and there is no separate step to open or keep a file.
+Only files you review can be returned, and only the relevant ones are kept, so review every promising file.
+When you have reviewed the promising files, stop calling tools and reply with exactly:
 FORMAT: plain
 DONE`;
   }
@@ -473,6 +483,112 @@ async function callModel(
   throw lastError ?? new Error("AI request failed");
 }
 
+/**
+ * Verdict from grading one file against the query in curated list mode. The
+ * `reason` is a short, auditable justification (surfaced in debug logs and the
+ * review_file tool result), not shown to the end user.
+ */
+export type GradeVerdict = { relevant: boolean; reason: string };
+
+const MAX_GRADE_REASON_CHARS = 300;
+
+/**
+ * Build the isolated conversation used to grade a single file. This is a fresh,
+ * minimal context — system instruction plus one user message holding only the
+ * query and this one file — so the judgement never sees (or is polluted by) the
+ * other files the agent is reviewing. The content is already capped upstream by
+ * the Drive reader (MAX_FILE_CHARS), so this stays a small, bounded prompt.
+ */
+function buildGradeMessages(query: string, file: DriveFile, content: string): ChatMessage[] {
+  return [
+    {
+      role: "system",
+      content: `You decide whether a single document is relevant to a user's search query.
+Relevant means the document's content would help answer or directly concerns the query — sharing a keyword alone is not enough.
+Respond with ONLY a JSON object and nothing else (no prose, no code fences):
+{"relevant": true or false, "reason": "<one short sentence>"}`
+    },
+    {
+      role: "user",
+      content: `Query: ${query}
+
+File name: ${file.name}
+File type: ${formatMimeType(file.mimeType)}
+
+Content:
+${content}`
+    }
+  ];
+}
+
+/**
+ * Parse the grader's reply into a verdict. The grader is instructed to return a
+ * bare JSON object, but models sometimes wrap it in prose or code fences, so we
+ * extract the first JSON object and read `relevant`/`reason` leniently. If the
+ * reply cannot be parsed at all, we default to KEEPING the file: a malformed
+ * grade should not silently drop a file that might be relevant (favouring recall
+ * mirrors the rest of the agent's "return something useful" behaviour), and the
+ * reason records that it was a default so the decision stays auditable.
+ */
+export function parseGradeResponse(content: string | null): GradeVerdict {
+  const raw = (content ?? "").trim();
+  const match = raw.match(/\{[\s\S]*\}/);
+  if (match) {
+    try {
+      const parsed = JSON.parse(match[0]) as { relevant?: unknown; reason?: unknown };
+      const relevant =
+        parsed.relevant === true || /^(true|yes|relevant)$/i.test(String(parsed.relevant).trim());
+      const reason =
+        typeof parsed.reason === "string" && parsed.reason.trim()
+          ? parsed.reason.trim().slice(0, MAX_GRADE_REASON_CHARS)
+          : relevant
+            ? "Judged relevant."
+            : "Judged not relevant.";
+      return { relevant, reason };
+    } catch {
+      // Fall through to the default-keep behaviour below.
+    }
+  }
+  return { relevant: true, reason: "Relevance grade could not be parsed; kept by default." };
+}
+
+/**
+ * Grade one already-read file against the query using an isolated, single-shot
+ * model call (no tools, its own minimal conversation). On any failure — the
+ * grader request erroring out after retries, or an unparseable reply — we keep
+ * the file rather than abort or drop it, so a transient grader problem degrades
+ * to extra recall instead of a missing result.
+ */
+export async function gradeFileRelevance(
+  modelSettings: EffectiveModelSettings,
+  query: string,
+  file: DriveFile,
+  content: string,
+  requestId: string,
+  step: number
+): Promise<GradeVerdict> {
+  try {
+    const completion = await callModel(
+      modelSettings,
+      buildGradeMessages(query, file, content),
+      requestId,
+      step,
+      null
+    );
+    return parseGradeResponse(completion.choices[0]?.message?.content ?? null);
+  } catch (error) {
+    await writeDebugLog({
+      event: "agent.grade.failed",
+      level: "warn",
+      requestId,
+      step,
+      fileKeyHash: hashForDebug(fileKey(file)),
+      error: debugError(error)
+    });
+    return { relevant: true, reason: "Relevance check unavailable; kept by default." };
+  }
+}
+
 function uniqueFiles(files: DriveFile[]) {
   const seen = new Set<string>();
   return files.filter((file) => {
@@ -525,22 +641,6 @@ export function parseFinalAnswer(content: string | null, mode: AgentRequest["mod
     answerFormat: likelyMarkdown ? ("markdown" as const) : ("plain" as const),
     answer: raw
   };
-}
-
-/**
- * Resolve the curated file list for list mode. Normally this is the set of files
- * the model explicitly kept via keep_file. As a safety net, if the model opened
- * files but kept none — usually because it ignored keep_file rather than judging
- * everything irrelevant — fall back to the reviewed (opened) files so the run
- * still returns something useful instead of an empty list. The `fallback` flag
- * reports whether that substitution happened (for logging / progress).
- */
-export function curatedResultFiles(keptFiles: DriveFile[], openedFiles: DriveFile[]) {
-  if (keptFiles.length > 0) {
-    return { files: uniqueFiles(keptFiles), fallback: false };
-  }
-  const reviewed = uniqueFiles(openedFiles);
-  return { files: reviewed, fallback: reviewed.length > 0 };
 }
 
 function isRetryableToolError(error: unknown) {
@@ -647,6 +747,13 @@ export type AgentRunContext = {
   selectedDriveIds: string[];
   requestId: string;
   emit: (event: AgentProgress) => void | Promise<void>;
+  /**
+   * Curated list mode only: grade one already-read file for relevance. Injected
+   * (rather than called directly) so it runs as an isolated model call in
+   * production but can be stubbed in tests without mocking the network. `step` is
+   * forwarded for debug-log correlation.
+   */
+  gradeFile: (file: DriveFile, content: string, step: number) => Promise<GradeVerdict>;
 };
 
 /**
@@ -658,16 +765,23 @@ export type AgentRunState = {
   referencedFiles: DriveFile[];
   openedFiles: DriveFile[];
   /**
-   * Curated list mode only: files the model kept via `keep_file`. This is the
+   * Curated list mode only: every file run through the relevance grader (kept or
+   * discarded). Tracked for visibility/logging; the result is `keptFiles`.
+   */
+  reviewedFiles: DriveFile[];
+  /**
+   * Curated list mode only: files the grader judged relevant. This is the
    * authoritative curated result, populated live as the run progresses.
    */
   keptFiles: DriveFile[];
   searchedQueries: Set<string>;
   knownFileKeys: Set<string>;
   openedFileKeys: Set<string>;
+  reviewedFileKeys: Set<string>;
   keptFileKeys: Set<string>;
   searchCallCount: number;
   openFileCallCount: number;
+  reviewFileCallCount: number;
   lowProgressSearchCount: number;
   stopAfterToolUseReason: string | null;
 };
@@ -807,8 +921,7 @@ export async function handleOpenFileTool(
   step: number,
   toolCall: ToolCall
 ): Promise<ToolResultMessage> {
-  const { requestId, budget, selectedDriveIds, ownerSub, input, emit } = context;
-  const curating = isCuratingRequest(input);
+  const { requestId, budget, selectedDriveIds, ownerSub, emit } = context;
   const parsed = await parseToolArgs(context, step, toolCall, openArgs);
   if (!parsed.ok) return parsed.observation;
   const args = parsed.args;
@@ -921,18 +1034,11 @@ export async function handleOpenFileTool(
   });
   state.knownFileKeys.add(fileKey(opened.file));
   state.openedFiles.push(opened.file);
-  // When curating, an opened file is only a candidate: it becomes a result only
-  // if the model later keeps it. The authoritative list is state.keptFiles, so
-  // we surface the open as a provisional "reviewing" event and leave it out of
-  // referencedFiles. Otherwise an open is itself a result the UI should show.
-  if (curating) {
-    await emit({ type: "progress", message: `Reviewing ${formatFileProgressLabel(opened.file)}` });
-    await emit({ type: "reviewing", file: opened.file });
-  } else {
-    state.referencedFiles.push(opened.file);
-    await emit({ type: "progress", message: `Opened ${formatFileProgressLabel(opened.file)}` });
-    await emit({ type: "file", file: opened.file });
-  }
+  // open_file is offered only outside curated mode (curated runs review files
+  // via review_file instead), so an opened file is always a result to surface.
+  state.referencedFiles.push(opened.file);
+  await emit({ type: "progress", message: `Opened ${formatFileProgressLabel(opened.file)}` });
+  await emit({ type: "file", file: opened.file });
   return {
     role: "tool",
     tool_call_id: toolCall.id,
@@ -944,79 +1050,158 @@ export async function handleOpenFileTool(
 }
 
 /**
- * Handle a single `keep_file` tool call (curated list mode only): record the
- * model's decision to keep an already-opened file as relevant. This is the
- * authoritative curation signal — the kept set becomes the final result — so it
- * runs live, emitting a `kept` event the UI uses to promote the file out of the
- * provisional "reviewing" state. Keeping a file that was never opened is
- * rejected as a tool-result observation (not thrown) so the model can recover.
+ * Handle a single `review_file` tool call (curated list mode only): open a
+ * candidate file, grade its relevance in an isolated model call, and keep it iff
+ * the grader says it is relevant. Unlike open_file, the file's content is never
+ * returned into the main loop's context — only a compact verdict — so the
+ * curating conversation stays small however many files are reviewed.
+ *
+ * Mirrors open_file's guards (out-of-scope connectionId, dedupe, budget, open
+ * failure) which are all surfaced as recoverable observations rather than thrown,
+ * so a single bad file never aborts the run. Emits a provisional `reviewing`
+ * event before grading, then `kept` or `discarded` once the verdict is in, so
+ * the UI shows each review as it happens instead of a lingering queue.
  */
-export async function handleKeepFileTool(
+export async function handleReviewFileTool(
   context: AgentRunContext,
   state: AgentRunState,
   step: number,
   toolCall: ToolCall
 ): Promise<ToolResultMessage> {
-  const { requestId, emit } = context;
-  const parsed = await parseToolArgs(context, step, toolCall, keepArgs);
+  const { requestId, budget, selectedDriveIds, ownerSub, emit, gradeFile } = context;
+  const parsed = await parseToolArgs(context, step, toolCall, reviewArgs);
   if (!parsed.ok) return parsed.observation;
   const args = parsed.args;
   const key = `${args.connectionId}:${args.fileId}`;
   await writeDebugLog({
-    event: "agent.tool.keep_file.requested",
+    event: "agent.tool.review_file.requested",
     requestId,
     step,
     toolCallIdHash: hashForDebug(toolCall.id),
-    fileKeyHash: hashForDebug(key),
-    keptFileCount: state.keptFiles.length
+    connectionIdHash: hashForDebug(args.connectionId),
+    fileIdHash: hashForDebug(args.fileId),
+    reviewFileCallCount: state.reviewFileCallCount
   });
-
-  const opened = state.openedFiles.find((candidate) => fileKey(candidate) === key);
-  if (!opened) {
+  if (!selectedDriveIds.includes(args.connectionId)) {
     await writeDebugLog({
-      event: "agent.tool.keep_file.rejected",
-      level: "warn",
+      event: "agent.tool.review_file.rejected",
+      level: "error",
       requestId,
       step,
-      reason: "not_opened",
-      fileKeyHash: hashForDebug(key)
+      reason: "outside_selected_drive_scope",
+      connectionIdHash: hashForDebug(args.connectionId),
+      fileIdHash: hashForDebug(args.fileId)
     });
+    // Same security boundary and recovery posture as open_file: an out-of-scope
+    // connectionId is almost always a hallucinated id, so reject it as an
+    // observation (never opening the file) instead of throwing and aborting.
     return toolErrorObservation(
       toolCall.id,
-      "Open this file with open_file before keeping it. Only files you have opened can be kept."
+      `connectionId "${args.connectionId}" is not one of the selected Drive connections, so this file cannot be reviewed. Use the exact connectionId from a search_drive result. Selected connectionIds: ${selectedDriveIds.join(", ")}.`
     );
   }
-
-  if (state.keptFileKeys.has(key)) {
+  if (state.reviewedFileKeys.has(key)) {
     await writeDebugLog({
-      event: "agent.tool.keep_file.skipped",
+      event: "agent.tool.review_file.skipped",
       requestId,
       step,
-      reason: "already_kept",
+      reason: "already_reviewed",
       fileKeyHash: hashForDebug(key)
     });
     return {
       role: "tool",
       tool_call_id: toolCall.id,
-      content: safeJson({ kept: true, alreadyKept: true })
+      content: safeJson({ reviewed: true, alreadyReviewed: true, kept: state.keptFileKeys.has(key) })
+    };
+  }
+  if (state.reviewFileCallCount >= budget.maxOpenFileCalls) {
+    const reason = `Review budget reached after ${state.reviewFileCallCount} review_file call(s).`;
+    await emit({ type: "progress", message: reason });
+    await writeDebugLog({
+      event: "agent.tool.review_file.skipped",
+      level: "warn",
+      requestId,
+      step,
+      reason: "review_budget_reached",
+      reviewFileCallCount: state.reviewFileCallCount
+    });
+    state.stopAfterToolUseReason = reason;
+    return {
+      role: "tool",
+      tool_call_id: toolCall.id,
+      content: safeJson({ skipped: true, reason })
     };
   }
 
-  state.keptFileKeys.add(key);
-  state.keptFiles.push(opened);
+  state.reviewFileCallCount += 1;
+  state.reviewedFileKeys.add(key);
+  const toolStartedAt = Date.now();
+  let opened: { file: DriveFile; content: string };
+  try {
+    opened = await withToolRetries(
+      () =>
+        openDriveFile({
+          ownerSub,
+          connectionId: args.connectionId,
+          fileId: args.fileId,
+          debugRequestId: requestId
+        }),
+      budget.maxToolRetries
+    );
+  } catch (error) {
+    await writeDebugLog({
+      event: "agent.tool.review_file.failed",
+      level: "error",
+      requestId,
+      step,
+      durationMs: Date.now() - toolStartedAt,
+      fileKeyHash: hashForDebug(key),
+      reviewFileCallCount: state.reviewFileCallCount,
+      error: debugError(error)
+    });
+    return toolErrorObservation(
+      toolCall.id,
+      `Could not open this file to review it: ${errorText(error)}. It may be inaccessible; continue with the other files.`
+    );
+  }
+
+  const openedKey = fileKey(opened.file);
+  state.knownFileKeys.add(openedKey);
+  state.reviewedFileKeys.add(openedKey);
+  state.reviewedFiles.push(opened.file);
+  await emit({ type: "progress", message: `Reviewing ${formatFileProgressLabel(opened.file)}` });
+  await emit({ type: "reviewing", file: opened.file });
+
+  const verdict = await gradeFile(opened.file, opened.content, step);
   await writeDebugLog({
-    event: "agent.tool.keep_file.completed",
+    event: "agent.tool.review_file.completed",
     requestId,
     step,
-    fileKeyHash: hashForDebug(key),
+    durationMs: Date.now() - toolStartedAt,
+    fileKeyHash: hashForDebug(openedKey),
+    mimeType: opened.file.mimeType,
+    contentLength: opened.content.length,
+    relevant: verdict.relevant,
+    reviewFileCallCount: state.reviewFileCallCount,
     keptFileCount: state.keptFiles.length
   });
-  await emit({ type: "progress", message: `Kept ${formatFileProgressLabel(opened)}` });
-  await emit({ type: "kept", file: opened });
+
+  if (verdict.relevant) {
+    if (!state.keptFileKeys.has(openedKey)) {
+      state.keptFileKeys.add(openedKey);
+      state.keptFiles.push(opened.file);
+    }
+    await emit({ type: "progress", message: `Kept ${formatFileProgressLabel(opened.file)}` });
+    await emit({ type: "kept", file: opened.file });
+  } else {
+    await emit({ type: "progress", message: `Discarded ${formatFileProgressLabel(opened.file)}` });
+    await emit({ type: "discarded", file: opened.file });
+  }
+
   return {
     role: "tool",
     tool_call_id: toolCall.id,
-    content: safeJson({ kept: true })
+    content: safeJson({ reviewed: true, kept: verdict.relevant, reason: verdict.reason })
   };
 }
 
@@ -1039,7 +1224,7 @@ export async function dispatchToolCall(
   const name: string = toolCall.function.name;
   if (name === "search_drive") return handleSearchTool(context, state, step, toolCall);
   if (name === "open_file") return handleOpenFileTool(context, state, step, toolCall);
-  if (name === "keep_file") return handleKeepFileTool(context, state, step, toolCall);
+  if (name === "review_file") return handleReviewFileTool(context, state, step, toolCall);
 
   await writeDebugLog({
     event: "agent.tool.unknown",
@@ -1116,26 +1301,32 @@ export async function runDriveAgent(
     budget,
     selectedDriveIds,
     requestId,
-    emit
+    emit,
+    gradeFile: (file, content, step) =>
+      gradeFileRelevance(modelSettings, input.query, file, content, requestId, step)
   };
   const state: AgentRunState = {
     referencedFiles: [],
     openedFiles: [],
+    reviewedFiles: [],
     keptFiles: [],
     searchedQueries: new Set<string>(),
     knownFileKeys: new Set<string>(),
     openedFileKeys: new Set<string>(),
+    reviewedFileKeys: new Set<string>(),
     keptFileKeys: new Set<string>(),
     searchCallCount: 0,
     openFileCallCount: 0,
+    reviewFileCallCount: 0,
     lowProgressSearchCount: 0,
     stopAfterToolUseReason: null
   };
   const curating = isCuratingRequest(input);
-  // In curated mode the curated result is the set of kept files, built up live
-  // via keep_file rather than parsed from a final message. See curatedResultFiles
-  // for the empty-keep fallback.
-  const curatedResult = () => curatedResultFiles(state.keptFiles, state.openedFiles);
+  // In curated mode the curated result is exactly the set of files the grader
+  // kept, built up live as review_file runs rather than parsed from a final
+  // message. An empty kept set is a valid "nothing relevant" result, so there is
+  // no opened-files fallback.
+  const curatedResult = () => uniqueFiles(state.keptFiles);
   const activeTools = toolsForRequest(input);
   const messages: ChatMessage[] = [
     { role: "system", content: systemPrompt(input, selectedDriveIds, budget) },
@@ -1156,20 +1347,20 @@ export async function runDriveAgent(
       messages.push({
         role: "user",
         content: curating
-          ? `${state.stopAfterToolUseReason} Stop searching and opening files. Keep any remaining relevant opened files with keep_file, then reply to finish.`
+          ? `${state.stopAfterToolUseReason} Stop searching. Review any remaining promising files with review_file, then reply to finish.`
           : `${state.stopAfterToolUseReason} Stop using tools and return the final result now.`
       });
       stopInstructionSent = true;
     }
 
-    // Once a budget has forced a stop, drop the search/open tools so the model
-    // must wind down instead of issuing calls that would only be skipped. In
-    // curated mode keep_file is free and is the curation signal itself, so we
-    // keep offering it until the model finishes — otherwise a file opened right
-    // before the stop could never be kept.
+    // Once a budget has forced a stop, drop search so the model winds down
+    // instead of issuing calls that would only be skipped. In curated mode keep
+    // offering review_file so a promising file found right before the stop can
+    // still be reviewed; a review past the review budget just returns a skipped
+    // observation, so this can't run away.
     const offeredTools = stopInstructionSent
       ? curating
-        ? [keepFileTool]
+        ? [reviewFileTool]
         : null
       : activeTools;
     const completion = await callModel(modelSettings, messages, requestId, step, offeredTools);
@@ -1181,14 +1372,7 @@ export async function runDriveAgent(
       // the budget-exhausted path does.
       const reason = "The AI returned an empty response.";
       const { answer, answerFormat } = partialAnswer(reason, input.mode);
-      const curated = curating ? curatedResult() : null;
-      const files = curated ? curated.files : uniqueFiles(state.referencedFiles);
-      if (curated?.fallback) {
-        await emit({
-          type: "progress",
-          message: "No files were explicitly kept; returning all reviewed files."
-        });
-      }
+      const files = curating ? curatedResult() : uniqueFiles(state.referencedFiles);
       await writeDebugLog({
         event: "agent.completed",
         requestId,
@@ -1199,7 +1383,7 @@ export async function runDriveAgent(
         openFileCallCount: state.openFileCallCount,
         referencedFileCount: state.referencedFiles.length,
         keptFileCount: state.keptFiles.length,
-        curatedFallback: curated?.fallback ?? false,
+        reviewedFileCount: state.reviewedFiles.length,
         returnedFileCount: files.length,
         answerFormat,
         answerLength: answer.length
@@ -1216,14 +1400,7 @@ export async function runDriveAgent(
 
     if (!message.tool_calls?.length) {
       const { answer, answerFormat } = parseFinalAnswer(message.content, input.mode);
-      const curated = curating ? curatedResult() : null;
-      const files = curated ? curated.files : uniqueFiles(state.referencedFiles);
-      if (curated?.fallback) {
-        await emit({
-          type: "progress",
-          message: "No files were explicitly kept; returning all reviewed files."
-        });
-      }
+      const files = curating ? curatedResult() : uniqueFiles(state.referencedFiles);
       await writeDebugLog({
         event: "agent.completed",
         requestId,
@@ -1234,7 +1411,7 @@ export async function runDriveAgent(
         openFileCallCount: state.openFileCallCount,
         referencedFileCount: state.referencedFiles.length,
         keptFileCount: state.keptFiles.length,
-        curatedFallback: curated?.fallback ?? false,
+        reviewedFileCount: state.reviewedFiles.length,
         returnedFileCount: files.length,
         answerFormat,
         answerLength: answer.length
@@ -1254,8 +1431,8 @@ export async function runDriveAgent(
   // respects the requested mode. Without this, synthesis runs that ran out of
   // steps would skip synthesis and return only the raw list of files read.
   // List mode needs no model turn: un-curated returns the files found, and
-  // curated returns the files already kept live via keep_file. So only
-  // synthesis needs the extra call.
+  // curated returns the files the grader already kept live via review_file. So
+  // only synthesis needs the extra call.
   const needsFinalModelTurn = input.mode === "synthesis";
   let finalContent: string | null = null;
   if (needsFinalModelTurn) {
@@ -1287,14 +1464,7 @@ export async function runDriveAgent(
     finalContent !== null
       ? parseFinalAnswer(finalContent, input.mode)
       : partialAnswer(reason, input.mode);
-  const curated = curating ? curatedResult() : null;
-  const files = curated ? curated.files : uniqueFiles(state.referencedFiles);
-  if (curated?.fallback) {
-    await emit({
-      type: "progress",
-      message: "No files were explicitly kept; returning all reviewed files."
-    });
-  }
+  const files = curating ? curatedResult() : uniqueFiles(state.referencedFiles);
   await writeDebugLog({
     event: "agent.completed",
     requestId,
@@ -1306,7 +1476,7 @@ export async function runDriveAgent(
     openFileCallCount: state.openFileCallCount,
     referencedFileCount: state.referencedFiles.length,
     keptFileCount: state.keptFiles.length,
-    curatedFallback: curated?.fallback ?? false,
+    reviewedFileCount: state.reviewedFiles.length,
     returnedFileCount: files.length,
     answerFormat,
     answerLength: answer.length

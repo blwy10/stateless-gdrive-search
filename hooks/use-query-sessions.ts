@@ -21,6 +21,7 @@ type StreamEvent =
   | { type: "file"; file: DriveFile }
   | { type: "reviewing"; file: DriveFile }
   | { type: "kept"; file: DriveFile }
+  | { type: "discarded"; file: DriveFile }
   | { type: "final"; answer: string; answerFormat: "markdown" | "plain"; files: DriveFile[] }
   | { type: "error"; message: string };
 
@@ -35,10 +36,10 @@ export type QuerySession = {
   status: "draft" | "running" | "finished" | "error";
   events: string[];
   files: DriveFile[];
-  // Curated list mode only: files the agent has opened and is still evaluating
-  // for relevance. They move into `files` once kept and are cleared when the run
-  // settles. Transient/UI-only, but kept on the session so the UI renders from a
-  // single source of truth.
+  // Curated list mode only: files the agent is reading and grading right now.
+  // Each one resolves to either `files` (kept) or removal (discarded), and the
+  // list is cleared when the run settles. Transient/UI-only, but kept on the
+  // session so the UI renders from a single source of truth.
   reviewingFiles: DriveFile[];
   answer: string;
   answerFormat: "markdown" | "plain";
@@ -359,6 +360,23 @@ export function useQuerySessions() {
                       files: [...item.files, event.file],
                       reviewingFiles: item.reviewingFiles.filter(
                         (file) => `${file.connectionId}:${file.id}` !== keptKey
+                      ),
+                      updatedAt: new Date().toISOString()
+                    }
+                  : item
+              )
+            );
+          } else if (event.type === "discarded") {
+            // Curated mode: the grader judged this file irrelevant, so drop it
+            // from "reviewing" without adding it to the results.
+            const discardedKey = `${event.file.connectionId}:${event.file.id}`;
+            setSessions((current) =>
+              current.map((item) =>
+                item.id === session.id
+                  ? {
+                      ...item,
+                      reviewingFiles: item.reviewingFiles.filter(
+                        (file) => `${file.connectionId}:${file.id}` !== discardedKey
                       ),
                       updatedAt: new Date().toISOString()
                     }

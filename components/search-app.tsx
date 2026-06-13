@@ -303,8 +303,8 @@ export function SearchApp({
                         onChange={(event) => updateCurateList(event.target.checked)}
                       />
                       <span>
-                        <strong>Curate opened files</strong>
-                        <span>Return only files the model opens and keeps as relevant.</span>
+                        <strong>Curate reviewed files</strong>
+                        <span>Return only files the model reviews and judges relevant.</span>
                       </span>
                     </label>
                   ) : null}
@@ -426,7 +426,8 @@ export function SearchApp({
                   <div className="panel-header">
                     <h2>Reviewing</h2>
                     <p className="panel-subtitle">
-                      Opened files the agent is still judging. Only the ones it keeps appear above.
+                      Files the agent is reading and grading right now. Only the ones judged
+                      relevant are kept above.
                     </p>
                   </div>
                   <div className="panel-body">

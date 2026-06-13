@@ -10,6 +10,8 @@
   `encryptSecret`/`decryptSecret`, the SSRF guard
   (`validatePublicHttpsBaseUrl`/`isPrivateIpv4`/`isPrivateIpv6`/`isPrivateAddress`),
   `escapeDriveQuery`, `emptyExtractionNote`, `parseFinalAnswer`,
+  `parseGradeResponse` (the curated-mode relevance-grader reply parser, which
+  defaults to keeping a file when the grader's reply can't be parsed),
   and the debug-log gating helpers (`debugText`/`isDebugLogEnabled`/
   `isDebugContentLogEnabled`/`isDebugTranscriptLogEnabled`, which force all debug
   logging — metadata, content previews, and the full transcript dump — off when
@@ -19,11 +21,15 @@
   out-of-scope-connectionId path (a connectionId not in `selectedDriveIds` — usually
   the model hallucinating an id — is likewise rejected as an observation without
   opening the file, never thrown), invalid tool arguments (malformed JSON or a
-  schema violation, via `parseToolArgs`, in all three handlers), `dispatchToolCall`
+  schema violation, via `parseToolArgs`, in the `open_file` and `search_drive`
+  handlers), `dispatchToolCall`
   (unknown/hallucinated tool names are answered with an observation so every
-  `tool_call` gets a reply), `isRetryableModelStatus` (the model-retry policy), and
-  the curated `keep_file` flow via `handleKeepFileTool`. Add new tests here when you
-  touch these functions.
+  `tool_call` gets a reply; it also routes `review_file`), `isRetryableModelStatus`
+  (the model-retry policy), and the curated `review_file` flow via
+  `handleReviewFileTool` (keep on a relevant grade, discard on an irrelevant one,
+  dedupe of already-reviewed files, the review budget, the out-of-scope guard, and
+  the open-failure path — and that the file's content is never returned into the
+  main loop's context). Add new tests here when you touch these functions.
 
   Run-resilience invariant: anything that processes a model tool call must return a
   tool-result observation, never throw — a throw bubbles out of `runDriveAgent` and
@@ -36,15 +42,26 @@
   retried; see `isRetryableModelStatus`), and an empty model response finalizes
   gracefully with partial results instead of throwing.
 
-  Curated file-list mode does live curation: opening a file emits a provisional
-  `reviewing` event, and the model promotes relevant files with the `keep_file`
-  tool (`handleKeepFileTool`), which emits a `kept` event. The set of kept files
-  (`AgentRunState.keptFiles`) is the authoritative curated result — there is no
-  end-of-run `CURATED_FILE_LIST` marker anymore. `keep_file` is only offered to the
-  model when curating, and a file must be opened before it can be kept.
-  `curatedResultFiles(keptFiles, openedFiles)` resolves the final list and applies
-  a safety net: if the model opened files but kept none, it falls back to the
-  reviewed (opened) files rather than returning nothing (and reports `fallback`).
+  Curated file-list mode uses per-file relevance grading instead of loading file
+  contents into the agent's context. When curating, the model is offered
+  `search_drive` and `review_file` (not `open_file`). `review_file`
+  (`handleReviewFileTool`) opens a candidate, emits a provisional `reviewing`
+  event, then grades it in an isolated, single-shot model call
+  (`gradeFileRelevance` → `parseGradeResponse`) whose own minimal conversation
+  holds only the query and that one file. Crucially, the file's content is NOT
+  returned into the main loop — only a compact verdict (`{reviewed, kept, reason}`)
+  — so the curating conversation stays small no matter how many files it reviews.
+  A relevant grade keeps the file (emits `kept`); an irrelevant one discards it
+  (emits `discarded`, which the UI uses to drop it from "reviewing"). The grader
+  is injected as `AgentRunContext.gradeFile` so tests can stub it without mocking
+  the network; on any grader failure (request error or unparseable reply) it
+  defaults to keeping the file, favouring recall.
+
+  The set of kept files (`AgentRunState.keptFiles`) is the authoritative curated
+  result — there is no end-of-run marker, and no opened-files fallback: with the
+  grader judging every file explicitly, an empty kept set is a valid "nothing
+  relevant" result. Curated runs reuse `budget.maxOpenFileCalls` as the cap on
+  `review_file` calls (tracked via `state.reviewFileCallCount`).
 
 ## Railway MCP: pin the project/environment first
 

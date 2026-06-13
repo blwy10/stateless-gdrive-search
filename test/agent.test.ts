@@ -3,16 +3,17 @@
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  curatedResultFiles,
   dispatchToolCall,
-  handleKeepFileTool,
   handleOpenFileTool,
+  handleReviewFileTool,
   handleSearchTool,
   isRetryableModelStatus,
   parseFinalAnswer,
+  parseGradeResponse,
   type AgentProgress,
   type AgentRunContext,
-  type AgentRunState
+  type AgentRunState,
+  type GradeVerdict
 } from "@/lib/agent";
 import { openDriveFile, searchDriveFiles } from "@/lib/drive";
 import type { DriveFile } from "@/lib/drive";
@@ -46,6 +47,7 @@ function makeContext(overrides: Partial<AgentRunContext> = {}): AgentRunContext 
     selectedDriveIds: ["c1"],
     requestId: "req-test",
     emit: () => {},
+    gradeFile: async () => ({ relevant: true, reason: "stub" }),
     ...overrides
   };
 }
@@ -54,28 +56,38 @@ function makeState(overrides: Partial<AgentRunState> = {}): AgentRunState {
   return {
     referencedFiles: [],
     openedFiles: [],
+    reviewedFiles: [],
     keptFiles: [],
     searchedQueries: new Set<string>(),
     knownFileKeys: new Set<string>(),
     openedFileKeys: new Set<string>(),
+    reviewedFileKeys: new Set<string>(),
     keptFileKeys: new Set<string>(),
     searchCallCount: 0,
     openFileCallCount: 0,
+    reviewFileCallCount: 0,
     lowProgressSearchCount: 0,
     stopAfterToolUseReason: null,
     ...overrides
   };
 }
 
-function keepCall(id: string, connectionId: string, fileId: string) {
+function reviewCall(id: string, connectionId = "c1", fileId = "f1") {
   return {
     id,
     type: "function" as const,
     function: {
-      name: "keep_file" as const,
+      name: "review_file" as const,
       arguments: JSON.stringify({ connectionId, fileId })
     }
   };
+}
+
+function curatedContext(overrides: Partial<AgentRunContext> = {}): AgentRunContext {
+  return makeContext({
+    input: { query: "q", mode: "list", driveIds: ["c1"], curateList: true },
+    ...overrides
+  });
 }
 
 describe("parseFinalAnswer", () => {
@@ -141,26 +153,44 @@ describe("parseFinalAnswer", () => {
   });
 });
 
-describe("curatedResultFiles", () => {
-  it("returns the kept files (de-duplicated) when any were kept", () => {
-    const kept = [file("c1", "a"), file("c1", "a"), file("c2", "b")];
-    const opened = [file("c1", "a"), file("c2", "b"), file("c3", "c")];
-    expect(curatedResultFiles(kept, opened)).toEqual({
-      files: [file("c1", "a"), file("c2", "b")],
-      fallback: false
+describe("parseGradeResponse", () => {
+  it("parses a clean JSON verdict", () => {
+    expect(parseGradeResponse('{"relevant": true, "reason": "matches the query"}')).toEqual({
+      relevant: true,
+      reason: "matches the query"
+    });
+    expect(parseGradeResponse('{"relevant": false, "reason": "off topic"}')).toEqual({
+      relevant: false,
+      reason: "off topic"
     });
   });
 
-  it("falls back to the reviewed files when nothing was kept", () => {
-    const opened = [file("c1", "a"), file("c1", "a"), file("c2", "b")];
-    expect(curatedResultFiles([], opened)).toEqual({
-      files: [file("c1", "a"), file("c2", "b")],
-      fallback: true
+  it("extracts the JSON object when wrapped in code fences or prose", () => {
+    expect(
+      parseGradeResponse('```json\n{"relevant": true, "reason": "ok"}\n```')
+    ).toEqual({ relevant: true, reason: "ok" });
+    expect(
+      parseGradeResponse('Sure! Here is my verdict: {"relevant": false, "reason": "no"} done.')
+    ).toEqual({ relevant: false, reason: "no" });
+  });
+
+  it("reads relevance leniently (string yes/true)", () => {
+    expect(parseGradeResponse('{"relevant": "yes", "reason": "r"}').relevant).toBe(true);
+    expect(parseGradeResponse('{"relevant": "false", "reason": "r"}').relevant).toBe(false);
+  });
+
+  it("supplies a default reason when the model omits one", () => {
+    expect(parseGradeResponse('{"relevant": true}')).toEqual({
+      relevant: true,
+      reason: "Judged relevant."
     });
   });
 
-  it("returns an empty list (no fallback) when nothing was kept or opened", () => {
-    expect(curatedResultFiles([], [])).toEqual({ files: [], fallback: false });
+  it("defaults to keeping the file when the reply cannot be parsed", () => {
+    const verdict = parseGradeResponse("not json at all");
+    expect(verdict.relevant).toBe(true);
+    expect(verdict.reason).toContain("could not be parsed");
+    expect(parseGradeResponse(null).relevant).toBe(true);
   });
 });
 
@@ -283,7 +313,7 @@ describe("handleOpenFileTool", () => {
     expect(runState.referencedFiles).toHaveLength(1);
   });
 
-  it("emits a provisional 'reviewing' event and skips referencedFiles when curating", async () => {
+  it("always records an opened file as a result (open_file is non-curated only)", async () => {
     vi.mocked(openDriveFile).mockResolvedValue({
       file: file("c1", "f1", "Doc"),
       content: "hello world"
@@ -291,7 +321,6 @@ describe("handleOpenFileTool", () => {
     const runState = makeState();
     const events: AgentProgress[] = [];
     const context = makeContext({
-      input: { query: "q", mode: "list", driveIds: ["c1"], curateList: true },
       emit: (event) => {
         events.push(event);
       }
@@ -299,62 +328,133 @@ describe("handleOpenFileTool", () => {
 
     await handleOpenFileTool(context, runState, 0, openCall("call-3"));
 
-    // Opening only stages a candidate when curating: it must NOT become a result
-    // (that happens via keep_file), so no "file" event and nothing referenced.
     expect(runState.openedFiles).toHaveLength(1);
-    expect(runState.referencedFiles).toHaveLength(0);
-    expect(events.some((event) => event.type === "reviewing")).toBe(true);
-    expect(events.some((event) => event.type === "file")).toBe(false);
+    expect(runState.referencedFiles).toHaveLength(1);
+    expect(events.some((event) => event.type === "file")).toBe(true);
+    expect(events.some((event) => event.type === "reviewing")).toBe(false);
   });
 });
 
-describe("handleKeepFileTool", () => {
-  it("keeps an opened file and emits a 'kept' event", async () => {
-    const opened = file("c1", "f1", "Doc");
-    const runState = makeState({ openedFiles: [opened] });
-    const events: AgentProgress[] = [];
-    const context = makeContext({
-      input: { query: "q", mode: "list", driveIds: ["c1"], curateList: true },
-      emit: (event) => {
-        events.push(event);
-      }
-    });
-
-    const result = await handleKeepFileTool(context, runState, 0, keepCall("k1", "c1", "f1"));
-
-    const payload = JSON.parse(result.content) as { kept?: boolean };
-    expect(payload.kept).toBe(true);
-    expect(runState.keptFiles).toEqual([opened]);
-    expect(events).toContainEqual({ type: "kept", file: opened });
+describe("handleReviewFileTool", () => {
+  beforeEach(() => {
+    vi.mocked(openDriveFile).mockReset();
   });
 
-  it("rejects keeping a file that was never opened, without throwing", async () => {
+  function setup(verdict: GradeVerdict) {
+    vi.mocked(openDriveFile).mockResolvedValue({
+      file: file("c1", "f1", "Doc"),
+      content: "hello world"
+    });
     const runState = makeState();
+    const events: AgentProgress[] = [];
+    const gradeFile = vi.fn(async () => verdict);
+    const context = curatedContext({
+      emit: (event) => {
+        events.push(event);
+      },
+      gradeFile
+    });
+    return { runState, events, gradeFile, context };
+  }
 
-    const result = await handleKeepFileTool(
-      makeContext(),
-      runState,
-      0,
-      keepCall("k2", "c1", "ghost")
-    );
+  it("keeps a file the grader judges relevant and never returns its content", async () => {
+    const { runState, events, gradeFile, context } = setup({ relevant: true, reason: "on topic" });
+
+    const result = await handleReviewFileTool(context, runState, 0, reviewCall("r1"));
+
+    const payload = JSON.parse(result.content) as { reviewed?: boolean; kept?: boolean; content?: string };
+    expect(payload.reviewed).toBe(true);
+    expect(payload.kept).toBe(true);
+    // The file's content must NOT leak back into the main loop's context.
+    expect(payload.content).toBeUndefined();
+    expect(gradeFile).toHaveBeenCalledTimes(1);
+    expect(runState.keptFiles).toEqual([file("c1", "f1", "Doc")]);
+    expect(runState.reviewedFiles).toHaveLength(1);
+    expect(events.some((event) => event.type === "reviewing")).toBe(true);
+    expect(events.some((event) => event.type === "kept")).toBe(true);
+    expect(events.some((event) => event.type === "discarded")).toBe(false);
+  });
+
+  it("discards a file the grader judges irrelevant", async () => {
+    const { runState, events, context } = setup({ relevant: false, reason: "off topic" });
+
+    const result = await handleReviewFileTool(context, runState, 0, reviewCall("r2"));
+
+    const payload = JSON.parse(result.content) as { reviewed?: boolean; kept?: boolean };
+    expect(payload.reviewed).toBe(true);
+    expect(payload.kept).toBe(false);
+    expect(runState.keptFiles).toHaveLength(0);
+    expect(runState.reviewedFiles).toHaveLength(1);
+    expect(events.some((event) => event.type === "reviewing")).toBe(true);
+    expect(events.some((event) => event.type === "discarded")).toBe(true);
+    expect(events.some((event) => event.type === "kept")).toBe(false);
+  });
+
+  it("rejects an out-of-scope connectionId as an observation without opening or grading", async () => {
+    const runState = makeState();
+    const gradeFile = vi.fn(async () => ({ relevant: true, reason: "x" }));
+    const context = curatedContext({ gradeFile });
+
+    // selectedDriveIds is ["c1"], so "c2" is outside scope (a hallucinated id).
+    const result = await handleReviewFileTool(context, runState, 0, reviewCall("r3", "c2", "f1"));
 
     const payload = JSON.parse(result.content) as { error?: boolean; message?: string };
     expect(payload.error).toBe(true);
-    expect(payload.message).toContain("open_file");
+    expect(payload.message).toContain("not one of the selected");
+    expect(openDriveFile).not.toHaveBeenCalled();
+    expect(gradeFile).not.toHaveBeenCalled();
+    expect(runState.reviewFileCallCount).toBe(0);
     expect(runState.keptFiles).toHaveLength(0);
   });
 
-  it("is idempotent: keeping the same file twice records it once", async () => {
-    const opened = file("c1", "f1", "Doc");
-    const runState = makeState({ openedFiles: [opened] });
+  it("returns an error observation (not a throw) when the file fails to open", async () => {
+    vi.mocked(openDriveFile).mockRejectedValue(
+      new Error("Google Drive request failed with status 403")
+    );
+    const runState = makeState();
+    const gradeFile = vi.fn(async () => ({ relevant: true, reason: "x" }));
+    const context = curatedContext({ gradeFile });
 
-    await handleKeepFileTool(makeContext(), runState, 0, keepCall("k3", "c1", "f1"));
-    const second = await handleKeepFileTool(makeContext(), runState, 0, keepCall("k4", "c1", "f1"));
+    const result = await handleReviewFileTool(context, runState, 0, reviewCall("r4"));
 
-    const payload = JSON.parse(second.content) as { kept?: boolean; alreadyKept?: boolean };
+    const payload = JSON.parse(result.content) as { error?: boolean; message?: string };
+    expect(payload.error).toBe(true);
+    expect(payload.message).toContain("403");
+    // The file is counted (so it won't be retried) but never graded or kept.
+    expect(runState.reviewFileCallCount).toBe(1);
+    expect(gradeFile).not.toHaveBeenCalled();
+    expect(runState.keptFiles).toHaveLength(0);
+  });
+
+  it("skips a file already reviewed earlier in the run", async () => {
+    const { runState, gradeFile, context } = setup({ relevant: true, reason: "on topic" });
+
+    await handleReviewFileTool(context, runState, 0, reviewCall("r5"));
+    const second = await handleReviewFileTool(context, runState, 0, reviewCall("r6"));
+
+    const payload = JSON.parse(second.content) as { reviewed?: boolean; alreadyReviewed?: boolean; kept?: boolean };
+    expect(payload.alreadyReviewed).toBe(true);
     expect(payload.kept).toBe(true);
-    expect(payload.alreadyKept).toBe(true);
+    expect(openDriveFile).toHaveBeenCalledTimes(1);
+    expect(gradeFile).toHaveBeenCalledTimes(1);
     expect(runState.keptFiles).toHaveLength(1);
+  });
+
+  it("skips reviewing once the review budget is reached", async () => {
+    const runState = makeState();
+    const gradeFile = vi.fn(async () => ({ relevant: true, reason: "x" }));
+    const context = curatedContext({
+      budget: { ...makeContext().budget, maxOpenFileCalls: 0 },
+      gradeFile
+    });
+
+    const result = await handleReviewFileTool(context, runState, 0, reviewCall("r7"));
+
+    const payload = JSON.parse(result.content) as { skipped?: boolean; reason?: string };
+    expect(payload.skipped).toBe(true);
+    expect(payload.reason).toContain("Review budget reached");
+    expect(openDriveFile).not.toHaveBeenCalled();
+    expect(gradeFile).not.toHaveBeenCalled();
   });
 });
 
@@ -429,6 +529,23 @@ describe("dispatchToolCall", () => {
     const payload = JSON.parse(result.content) as { content?: string };
     expect(payload.content).toBe("hi");
     expect(openDriveFile).toHaveBeenCalledTimes(1);
+  });
+
+  it("routes review_file to its handler in curated mode", async () => {
+    vi.mocked(openDriveFile).mockResolvedValue({
+      file: file("c1", "f1", "Doc"),
+      content: "hi"
+    });
+    const runState = makeState();
+    const gradeFile = vi.fn(async () => ({ relevant: true, reason: "ok" }));
+    const context = curatedContext({ gradeFile });
+
+    const result = await dispatchToolCall(context, runState, 0, reviewCall("route-review"));
+
+    const payload = JSON.parse(result.content) as { reviewed?: boolean; kept?: boolean };
+    expect(payload.reviewed).toBe(true);
+    expect(payload.kept).toBe(true);
+    expect(gradeFile).toHaveBeenCalledTimes(1);
   });
 });
 
