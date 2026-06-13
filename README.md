@@ -31,6 +31,8 @@ TOKEN_ENCRYPTION_KEY=base64-encoded-32-byte-key
 AI_API_KEY=...
 AI_BASE_URL=https://api.openai.com/v1
 AI_MODEL=gpt-4.1-mini
+DEBUG_LOGS=0
+DEBUG_LOG_CONTENT=0
 ```
 
 Create the database table:
@@ -56,3 +58,9 @@ Create one Google OAuth client. Add these redirect URIs:
 For production, add the same paths on your deployed hostname.
 
 The login flow requests `openid email profile`. The Drive connection flow requests `openid email profile https://www.googleapis.com/auth/drive.metadata.readonly https://www.googleapis.com/auth/drive.readonly`.
+
+## Local debug logs
+
+Set `DEBUG_LOGS=1` during local debugging to write structured JSONL agent traces to `.codex-debug/logs/agent-YYYY-MM-DD.jsonl`. These logs are ignored by git and are readable directly from the workspace.
+
+By default, logs store metadata only: request IDs, event names, durations, counts, statuses, hashed identifiers, and content lengths. Set `DEBUG_LOG_CONTENT=1` only for local emergency debugging when short query, file-name, or error-response previews are needed. Do not enable either flag for production release builds.

@@ -2,6 +2,13 @@ import { z } from "zod";
 import { listDriveConnections } from "@/lib/drive-connections";
 import { openDriveFile, searchDriveFiles, type DriveFile } from "@/lib/drive";
 import { env } from "@/lib/env";
+import {
+  createDebugRequestId,
+  debugError,
+  debugText,
+  hashForDebug,
+  writeDebugLog
+} from "@/lib/debug-log";
 
 const AgentRequest = z.object({
   query: z.string().trim().min(1).max(2000),
@@ -200,25 +207,72 @@ function safeJson(value: unknown) {
   return JSON.stringify(value, null, 2);
 }
 
-async function callModel(messages: ChatMessage[]) {
-  const response = await fetch(`${env.aiBaseUrl().replace(/\/$/, "")}/chat/completions`, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${env.aiApiKey()}`,
-      "content-type": "application/json"
-    },
-    body: JSON.stringify({
-      model: env.aiModel(),
-      messages,
-      tools,
-      tool_choice: "auto",
-      temperature: 0.2
-    })
+async function callModel(messages: ChatMessage[], requestId: string, step: number) {
+  const startedAt = Date.now();
+  const model = env.aiModel();
+
+  await writeDebugLog({
+    event: "agent.model.request",
+    requestId,
+    step,
+    model,
+    messageCount: messages.length
   });
-  if (!response.ok) {
-    throw new Error(`AI request failed: ${response.status} ${await response.text()}`);
+
+  try {
+    const response = await fetch(`${env.aiBaseUrl().replace(/\/$/, "")}/chat/completions`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${env.aiApiKey()}`,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        model,
+        messages,
+        tools,
+        tool_choice: "auto",
+        temperature: 0.2
+      })
+    });
+    if (!response.ok) {
+      const responseBody = await response.text();
+      await writeDebugLog({
+        event: "agent.model.failed",
+        level: "error",
+        requestId,
+        step,
+        model,
+        status: response.status,
+        durationMs: Date.now() - startedAt,
+        response: debugText(responseBody)
+      });
+      throw new Error(`AI request failed: ${response.status} ${responseBody}`);
+    }
+
+    const completion = (await response.json()) as ChatCompletion;
+    const message = completion.choices[0]?.message;
+    await writeDebugLog({
+      event: "agent.model.completed",
+      requestId,
+      step,
+      model,
+      durationMs: Date.now() - startedAt,
+      toolCallCount: message?.tool_calls?.length ?? 0,
+      responseContentLength: message?.content?.length ?? 0
+    });
+    return completion;
+  } catch (error) {
+    await writeDebugLog({
+      event: "agent.model.error",
+      level: "error",
+      requestId,
+      step,
+      model,
+      durationMs: Date.now() - startedAt,
+      error: debugError(error)
+    });
+    throw error;
   }
-  return (await response.json()) as ChatCompletion;
 }
 
 function uniqueFiles(files: DriveFile[]) {
@@ -328,14 +382,42 @@ export async function runDriveAgent(
   emit: (event: AgentProgress) => void | Promise<void>,
   options: AgentOptions = {}
 ) {
+  const requestId = createDebugRequestId("agent");
+  const startedAt = Date.now();
   const budget = resolveAgentBudget(input.mode, options.budget);
+  await writeDebugLog({
+    event: "agent.started",
+    requestId,
+    mode: input.mode,
+    curateList: input.curateList,
+    query: debugText(input.query),
+    requestedDriveCount: input.driveIds.length,
+    ownerSubHash: hashForDebug(ownerSub),
+    budget
+  });
+
   const connections = await listDriveConnections(ownerSub);
   const allowed = new Set(connections.map((connection) => connection.id));
   const selectedDriveIds = input.driveIds.includes("all")
     ? connections.map((connection) => connection.id)
     : input.driveIds.filter((id) => allowed.has(id));
 
+  await writeDebugLog({
+    event: "agent.connections.selected",
+    requestId,
+    availableConnectionCount: connections.length,
+    selectedConnectionCount: selectedDriveIds.length,
+    selectedConnectionIdHashes: selectedDriveIds.map(hashForDebug)
+  });
+
   if (selectedDriveIds.length === 0) {
+    await writeDebugLog({
+      event: "agent.failed",
+      level: "warn",
+      requestId,
+      reason: "no_connected_drive_selected",
+      durationMs: Date.now() - startedAt
+    });
     throw new Error("No connected Drive selected");
   }
 
@@ -371,9 +453,17 @@ export async function runDriveAgent(
       stopInstructionSent = true;
     }
 
-    const completion = await callModel(messages);
+    const completion = await callModel(messages, requestId, step);
     const message = completion.choices[0]?.message;
     if (!message) {
+      await writeDebugLog({
+        event: "agent.failed",
+        level: "error",
+        requestId,
+        reason: "model_returned_no_message",
+        step,
+        durationMs: Date.now() - startedAt
+      });
       throw new Error("AI returned no message");
     }
 
@@ -389,6 +479,19 @@ export async function runDriveAgent(
         input.mode === "list" && input.curateList
           ? curatedListFiles(message.content, openedFiles)
           : uniqueFiles(referencedFiles);
+      await writeDebugLog({
+        event: "agent.completed",
+        requestId,
+        reason: "final_message",
+        durationMs: Date.now() - startedAt,
+        step,
+        searchCallCount,
+        openFileCallCount,
+        referencedFileCount: referencedFiles.length,
+        returnedFileCount: files.length,
+        answerFormat,
+        answerLength: answer.length
+      });
       await emit({ type: "final", answer, answerFormat, files });
       return;
     }
@@ -397,9 +500,26 @@ export async function runDriveAgent(
       if (toolCall.function.name === "search_drive") {
         const args = searchArgs.parse(JSON.parse(toolCall.function.arguments || "{}"));
         const normalizedQuery = normalizeSearchQuery(args.query);
+        await writeDebugLog({
+          event: "agent.tool.search_drive.requested",
+          requestId,
+          step,
+          toolCallIdHash: hashForDebug(toolCall.id),
+          query: debugText(args.query),
+          limit: args.limit ?? null,
+          searchCallCount
+        });
         if (searchCallCount >= budget.maxSearchCalls) {
           const reason = `Search budget reached after ${searchCallCount} search_drive call(s).`;
           await emit({ type: "progress", message: reason });
+          await writeDebugLog({
+            event: "agent.tool.search_drive.skipped",
+            level: "warn",
+            requestId,
+            step,
+            reason: "search_budget_reached",
+            searchCallCount
+          });
           stopAfterToolUseReason = reason;
           messages.push({
             role: "tool",
@@ -413,17 +533,43 @@ export async function runDriveAgent(
         searchCallCount += 1;
         const wasRepeatedQuery = searchedQueries.has(normalizedQuery);
         searchedQueries.add(normalizedQuery);
-        const files = await withToolRetries(
-          () =>
-            searchDriveFiles({
-              ownerSub,
-              connectionIds: selectedDriveIds,
-              query: args.query,
-              limit: args.limit
-            }),
-          budget.maxToolRetries
-        );
+        const toolStartedAt = Date.now();
+        let files: DriveFile[];
+        try {
+          files = await withToolRetries(
+            () =>
+              searchDriveFiles({
+                ownerSub,
+                connectionIds: selectedDriveIds,
+                query: args.query,
+                limit: args.limit,
+                debugRequestId: requestId
+              }),
+            budget.maxToolRetries
+          );
+        } catch (error) {
+          await writeDebugLog({
+            event: "agent.tool.search_drive.failed",
+            level: "error",
+            requestId,
+            step,
+            durationMs: Date.now() - toolStartedAt,
+            searchCallCount,
+            error: debugError(error)
+          });
+          throw error;
+        }
         const newFiles = files.filter((file) => !knownFileKeys.has(fileKey(file)));
+        await writeDebugLog({
+          event: "agent.tool.search_drive.completed",
+          requestId,
+          step,
+          durationMs: Date.now() - toolStartedAt,
+          repeatedQuery: wasRepeatedQuery,
+          resultCount: files.length,
+          newResultCount: newFiles.length,
+          searchCallCount
+        });
         for (const file of files) {
           knownFileKeys.add(fileKey(file));
         }
@@ -434,6 +580,13 @@ export async function runDriveAgent(
         }
         if (lowProgressSearchCount >= budget.maxLowProgressSearches) {
           stopAfterToolUseReason = `Searches stopped producing new files after ${lowProgressSearchCount} low-progress search(es).`;
+          await writeDebugLog({
+            event: "agent.low_progress_search_limit_reached",
+            level: "warn",
+            requestId,
+            step,
+            lowProgressSearchCount
+          });
         }
         if (!input.curateList) {
           referencedFiles.push(...files);
@@ -448,12 +601,37 @@ export async function runDriveAgent(
         });
       } else if (toolCall.function.name === "open_file") {
         const args = openArgs.parse(JSON.parse(toolCall.function.arguments || "{}"));
+        await writeDebugLog({
+          event: "agent.tool.open_file.requested",
+          requestId,
+          step,
+          toolCallIdHash: hashForDebug(toolCall.id),
+          connectionIdHash: hashForDebug(args.connectionId),
+          fileIdHash: hashForDebug(args.fileId),
+          openFileCallCount
+        });
         if (!selectedDriveIds.includes(args.connectionId)) {
+          await writeDebugLog({
+            event: "agent.tool.open_file.rejected",
+            level: "error",
+            requestId,
+            step,
+            reason: "outside_selected_drive_scope",
+            connectionIdHash: hashForDebug(args.connectionId),
+            fileIdHash: hashForDebug(args.fileId)
+          });
           throw new Error("AI attempted to open a file outside the selected Drive scope");
         }
         const key = `${args.connectionId}:${args.fileId}`;
         if (openedFileKeys.has(key)) {
           const reason = "File was already opened earlier in this run.";
+          await writeDebugLog({
+            event: "agent.tool.open_file.skipped",
+            requestId,
+            step,
+            reason: "already_opened",
+            fileKeyHash: hashForDebug(key)
+          });
           messages.push({
             role: "tool",
             tool_call_id: toolCall.id,
@@ -464,6 +642,14 @@ export async function runDriveAgent(
         if (openFileCallCount >= budget.maxOpenFileCalls) {
           const reason = `Open-file budget reached after ${openFileCallCount} open_file call(s).`;
           await emit({ type: "progress", message: reason });
+          await writeDebugLog({
+            event: "agent.tool.open_file.skipped",
+            level: "warn",
+            requestId,
+            step,
+            reason: "open_file_budget_reached",
+            openFileCallCount
+          });
           stopAfterToolUseReason = reason;
           messages.push({
             role: "tool",
@@ -476,15 +662,42 @@ export async function runDriveAgent(
         await emit({ type: "progress", message: `Opening file ${args.fileId}` });
         openFileCallCount += 1;
         openedFileKeys.add(key);
-        const opened = await withToolRetries(
-          () =>
-            openDriveFile({
-              ownerSub,
-              connectionId: args.connectionId,
-              fileId: args.fileId
-            }),
-          budget.maxToolRetries
-        );
+        const toolStartedAt = Date.now();
+        let opened: { file: DriveFile; content: string };
+        try {
+          opened = await withToolRetries(
+            () =>
+              openDriveFile({
+                ownerSub,
+                connectionId: args.connectionId,
+                fileId: args.fileId,
+                debugRequestId: requestId
+              }),
+            budget.maxToolRetries
+          );
+        } catch (error) {
+          await writeDebugLog({
+            event: "agent.tool.open_file.failed",
+            level: "error",
+            requestId,
+            step,
+            durationMs: Date.now() - toolStartedAt,
+            fileKeyHash: hashForDebug(key),
+            openFileCallCount,
+            error: debugError(error)
+          });
+          throw error;
+        }
+        await writeDebugLog({
+          event: "agent.tool.open_file.completed",
+          requestId,
+          step,
+          durationMs: Date.now() - toolStartedAt,
+          fileKeyHash: hashForDebug(fileKey(opened.file)),
+          mimeType: opened.file.mimeType,
+          contentLength: opened.content.length,
+          openFileCallCount
+        });
         knownFileKeys.add(fileKey(opened.file));
         referencedFiles.push(opened.file);
         openedFiles.push(opened.file);
@@ -507,5 +720,17 @@ export async function runDriveAgent(
     input.mode === "list" && input.curateList
       ? uniqueFiles(openedFiles)
       : uniqueFiles(referencedFiles);
+  await writeDebugLog({
+    event: "agent.completed",
+    requestId,
+    reason: "max_tool_steps_reached",
+    durationMs: Date.now() - startedAt,
+    searchCallCount,
+    openFileCallCount,
+    referencedFileCount: referencedFiles.length,
+    returnedFileCount: files.length,
+    answerFormat,
+    answerLength: answer.length
+  });
   await emit({ type: "final", answer, answerFormat, files });
 }

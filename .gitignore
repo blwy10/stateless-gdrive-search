@@ -5,6 +5,7 @@ node_modules
 dist
 coverage
 *.log
+.codex-debug/
 .DS_Store
 tsconfig.tsbuildinfo
 client_secret_*.json

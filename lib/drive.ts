@@ -7,6 +7,7 @@ import {
   type DriveConnection
 } from "@/lib/drive-connections";
 import { expiresAtFromNow, refreshDriveToken } from "@/lib/google-oauth";
+import { debugError, debugText, hashForDebug, writeDebugLog } from "@/lib/debug-log";
 
 export type DriveFile = {
   connectionId: string;
@@ -21,11 +22,21 @@ export type DriveFile = {
 
 const MAX_FILE_CHARS = 32_000;
 
+type DriveDebugContext = {
+  requestId?: string;
+  operation: string;
+  connectionId?: string;
+  fileId?: string;
+};
+
 function escapeDriveQuery(value: string) {
   return value.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
 }
 
-async function ensureAccessToken(connection: DriveConnection): Promise<DriveConnection> {
+async function ensureAccessToken(
+  connection: DriveConnection,
+  requestId?: string
+): Promise<DriveConnection> {
   if (!connection.expiresAt || connection.expiresAt.getTime() > Date.now() + 30_000) {
     return connection;
   }
@@ -41,6 +52,14 @@ async function ensureAccessToken(connection: DriveConnection): Promise<DriveConn
     expiresAt,
     scope: refreshed.scope
   });
+  await writeDebugLog({
+    event: "drive.token.refreshed",
+    requestId,
+    connectionIdHash: hashForDebug(connection.id),
+    ownerSubHash: hashForDebug(connection.ownerSub),
+    expiresAt: expiresAt?.toISOString() ?? null,
+    scopeHash: refreshed.scope ? hashForDebug(refreshed.scope) : null
+  });
   return {
     ...connection,
     accessToken: refreshed.access_token,
@@ -49,15 +68,66 @@ async function ensureAccessToken(connection: DriveConnection): Promise<DriveConn
   };
 }
 
-async function googleFetch(connection: DriveConnection, url: URL) {
-  const active = await ensureAccessToken(connection);
-  const response = await fetch(url, {
-    headers: { authorization: `Bearer ${active.accessToken}` }
+async function googleFetch(connection: DriveConnection, url: URL, context: DriveDebugContext) {
+  const startedAt = Date.now();
+  const connectionId = context.connectionId ?? connection.id;
+  await writeDebugLog({
+    event: "drive.google.request",
+    requestId: context.requestId,
+    operation: context.operation,
+    method: "GET",
+    path: url.pathname,
+    queryParamNames: [...url.searchParams.keys()],
+    connectionIdHash: hashForDebug(connectionId),
+    fileIdHash: context.fileId ? hashForDebug(context.fileId) : null
   });
-  if (!response.ok) {
-    throw new Error(`Google Drive request failed: ${response.status} ${await response.text()}`);
+
+  try {
+    const active = await ensureAccessToken(connection, context.requestId);
+    const response = await fetch(url, {
+      headers: { authorization: `Bearer ${active.accessToken}` }
+    });
+    if (!response.ok) {
+      const responseBody = await response.text();
+      await writeDebugLog({
+        event: "drive.google.failed",
+        level: "error",
+        requestId: context.requestId,
+        operation: context.operation,
+        status: response.status,
+        durationMs: Date.now() - startedAt,
+        path: url.pathname,
+        connectionIdHash: hashForDebug(connectionId),
+        fileIdHash: context.fileId ? hashForDebug(context.fileId) : null,
+        response: debugText(responseBody)
+      });
+      throw new Error(`Google Drive request failed: ${response.status} ${responseBody}`);
+    }
+    await writeDebugLog({
+      event: "drive.google.completed",
+      requestId: context.requestId,
+      operation: context.operation,
+      status: response.status,
+      durationMs: Date.now() - startedAt,
+      path: url.pathname,
+      connectionIdHash: hashForDebug(connectionId),
+      fileIdHash: context.fileId ? hashForDebug(context.fileId) : null
+    });
+    return response;
+  } catch (error) {
+    await writeDebugLog({
+      event: "drive.google.error",
+      level: "error",
+      requestId: context.requestId,
+      operation: context.operation,
+      durationMs: Date.now() - startedAt,
+      path: url.pathname,
+      connectionIdHash: hashForDebug(connectionId),
+      fileIdHash: context.fileId ? hashForDebug(context.fileId) : null,
+      error: debugError(error)
+    });
+    throw error;
   }
-  return response;
 }
 
 export async function searchDriveFiles(input: {
@@ -65,14 +135,32 @@ export async function searchDriveFiles(input: {
   connectionIds: string[];
   query: string;
   limit?: number;
+  debugRequestId?: string;
 }): Promise<DriveFile[]> {
+  const startedAt = Date.now();
   const query = escapeDriveQuery(input.query.trim());
   const limit = Math.min(input.limit ?? 10, 20);
   const files: DriveFile[] = [];
 
+  await writeDebugLog({
+    event: "drive.search.started",
+    requestId: input.debugRequestId,
+    connectionCount: input.connectionIds.length,
+    query: debugText(input.query),
+    limit
+  });
+
   for (const connectionId of input.connectionIds) {
     const connection = await getDriveConnection(input.ownerSub, connectionId);
-    if (!connection) continue;
+    if (!connection) {
+      await writeDebugLog({
+        event: "drive.search.connection_missing",
+        level: "warn",
+        requestId: input.debugRequestId,
+        connectionIdHash: hashForDebug(connectionId)
+      });
+      continue;
+    }
     const url = new URL("https://www.googleapis.com/drive/v3/files");
     url.searchParams.set(
       "q",
@@ -85,8 +173,18 @@ export async function searchDriveFiles(input: {
     );
     url.searchParams.set("supportsAllDrives", "true");
     url.searchParams.set("includeItemsFromAllDrives", "true");
-    const response = await googleFetch(connection, url);
+    const response = await googleFetch(connection, url, {
+      requestId: input.debugRequestId,
+      operation: "search_files",
+      connectionId
+    });
     const data = (await response.json()) as { files?: Omit<DriveFile, "connectionId" | "driveEmail">[] };
+    await writeDebugLog({
+      event: "drive.search.connection_completed",
+      requestId: input.debugRequestId,
+      connectionIdHash: hashForDebug(connectionId),
+      resultCount: data.files?.length ?? 0
+    });
     for (const file of data.files ?? []) {
       files.push({
         ...file,
@@ -96,31 +194,62 @@ export async function searchDriveFiles(input: {
     }
   }
 
+  await writeDebugLog({
+    event: "drive.search.completed",
+    requestId: input.debugRequestId,
+    durationMs: Date.now() - startedAt,
+    resultCount: files.length
+  });
+
   return files;
 }
 
-async function getDriveFileMetadata(connection: DriveConnection, fileId: string) {
+async function getDriveFileMetadata(
+  connection: DriveConnection,
+  fileId: string,
+  requestId?: string
+) {
   const url = new URL(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}`);
   url.searchParams.set("fields", "id,name,mimeType,webViewLink,modifiedTime,size");
   url.searchParams.set("supportsAllDrives", "true");
-  const response = await googleFetch(connection, url);
+  const response = await googleFetch(connection, url, {
+    requestId,
+    operation: "get_metadata",
+    connectionId: connection.id,
+    fileId
+  });
   return (await response.json()) as Omit<DriveFile, "connectionId" | "driveEmail">;
 }
 
-async function downloadBuffer(connection: DriveConnection, fileId: string) {
+async function downloadBuffer(connection: DriveConnection, fileId: string, requestId?: string) {
   const url = new URL(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}`);
   url.searchParams.set("alt", "media");
   url.searchParams.set("supportsAllDrives", "true");
-  const response = await googleFetch(connection, url);
+  const response = await googleFetch(connection, url, {
+    requestId,
+    operation: "download_file",
+    connectionId: connection.id,
+    fileId
+  });
   return Buffer.from(await response.arrayBuffer());
 }
 
-async function exportBuffer(connection: DriveConnection, fileId: string, mimeType: string) {
+async function exportBuffer(
+  connection: DriveConnection,
+  fileId: string,
+  mimeType: string,
+  requestId?: string
+) {
   const url = new URL(
     `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}/export`
   );
   url.searchParams.set("mimeType", mimeType);
-  const response = await googleFetch(connection, url);
+  const response = await googleFetch(connection, url, {
+    requestId,
+    operation: "export_file",
+    connectionId: connection.id,
+    fileId
+  });
   return Buffer.from(await response.arrayBuffer());
 }
 
@@ -223,35 +352,61 @@ export async function openDriveFile(input: {
   ownerSub: string;
   connectionId: string;
   fileId: string;
+  debugRequestId?: string;
 }): Promise<{ file: DriveFile; content: string }> {
+  const startedAt = Date.now();
+  await writeDebugLog({
+    event: "drive.open.started",
+    requestId: input.debugRequestId,
+    connectionIdHash: hashForDebug(input.connectionId),
+    fileIdHash: hashForDebug(input.fileId)
+  });
+
   const connection = await getDriveConnection(input.ownerSub, input.connectionId);
   if (!connection) {
+    await writeDebugLog({
+      event: "drive.open.connection_missing",
+      level: "warn",
+      requestId: input.debugRequestId,
+      connectionIdHash: hashForDebug(input.connectionId),
+      fileIdHash: hashForDebug(input.fileId)
+    });
     throw new Error("Drive connection not found");
   }
 
-  const metadata = await getDriveFileMetadata(connection, input.fileId);
+  const metadata = await getDriveFileMetadata(connection, input.fileId, input.debugRequestId);
+  await writeDebugLog({
+    event: "drive.open.metadata_loaded",
+    requestId: input.debugRequestId,
+    connectionIdHash: hashForDebug(input.connectionId),
+    fileIdHash: hashForDebug(input.fileId),
+    name: debugText(metadata.name),
+    mimeType: metadata.mimeType,
+    size: metadata.size ?? null,
+    modifiedTime: metadata.modifiedTime ?? null
+  });
   let content: string;
 
   switch (metadata.mimeType) {
     case "application/vnd.google-apps.document":
-      content = (await exportBuffer(connection, input.fileId, "text/plain")).toString("utf8");
+      content = (await exportBuffer(connection, input.fileId, "text/plain", input.debugRequestId)).toString("utf8");
       break;
     case "application/vnd.google-apps.spreadsheet":
-      content = (await exportBuffer(connection, input.fileId, "text/csv")).toString("utf8");
+      content = (await exportBuffer(connection, input.fileId, "text/csv", input.debugRequestId)).toString("utf8");
       break;
     case "application/vnd.google-apps.presentation":
-      content = (await exportBuffer(connection, input.fileId, "text/plain")).toString("utf8");
+      content = (await exportBuffer(connection, input.fileId, "text/plain", input.debugRequestId)).toString("utf8");
       break;
     case "application/pdf":
-      content = (await pdfParse(await downloadBuffer(connection, input.fileId))).text;
+      content = (await pdfParse(await downloadBuffer(connection, input.fileId, input.debugRequestId))).text;
       break;
     case "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
     case "application/msword":
-      content = (await mammoth.extractRawText({ buffer: await downloadBuffer(connection, input.fileId) }))
+      content = (await mammoth.extractRawText({ buffer: await downloadBuffer(connection, input.fileId, input.debugRequestId) }))
         .value;
       break;
     case "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":
-      content = await extractXlsxText(await downloadBuffer(connection, input.fileId));
+      content = await extractXlsxText(await downloadBuffer(connection, input.fileId, input.debugRequestId));
       break;
     case "application/vnd.ms-excel":
       content =
@@ -259,21 +414,33 @@ export async function openDriveFile(input: {
       break;
     case "application/vnd.openxmlformats-officedocument.presentationml.presentation":
     case "application/vnd.ms-powerpoint":
-      content = await extractPptxText(await downloadBuffer(connection, input.fileId));
+      content = await extractPptxText(await downloadBuffer(connection, input.fileId, input.debugRequestId));
       break;
     case "text/plain":
     case "text/markdown":
     case "text/csv":
     case "application/json":
-      content = (await downloadBuffer(connection, input.fileId)).toString("utf8");
+      content = (await downloadBuffer(connection, input.fileId, input.debugRequestId)).toString("utf8");
       break;
     default:
       if (metadata.mimeType.startsWith("application/vnd.google-apps.")) {
         content = unsupportedGoogleAppsContent(metadata);
         break;
       }
-      content = (await downloadBuffer(connection, input.fileId)).toString("utf8");
+      content = (await downloadBuffer(connection, input.fileId, input.debugRequestId)).toString("utf8");
   }
+
+  const trimmedContent = trimContent(content);
+  await writeDebugLog({
+    event: "drive.open.completed",
+    requestId: input.debugRequestId,
+    durationMs: Date.now() - startedAt,
+    connectionIdHash: hashForDebug(input.connectionId),
+    fileIdHash: hashForDebug(input.fileId),
+    mimeType: metadata.mimeType,
+    rawContentLength: content.length,
+    returnedContentLength: trimmedContent.length
+  });
 
   return {
     file: {
@@ -281,6 +448,6 @@ export async function openDriveFile(input: {
       connectionId: connection.id,
       driveEmail: connection.driveEmail
     },
-    content: trimContent(content)
+    content: trimmedContent
   };
 }
