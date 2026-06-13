@@ -1,3 +1,6 @@
+-- Copyright (c) 2026 Benjamin Lau
+-- SPDX-License-Identifier: MIT
+
 create table if not exists drive_connections (
   id text primary key,
   owner_sub text not null,

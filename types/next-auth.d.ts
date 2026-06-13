@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Benjamin Lau
+// SPDX-License-Identifier: MIT
+
 import type { DefaultSession } from "next-auth";
 
 declare module "next-auth" {

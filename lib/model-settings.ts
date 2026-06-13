@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Benjamin Lau
+// SPDX-License-Identifier: MIT
+
 import dns from "node:dns/promises";
 import net from "node:net";
 import { z } from "zod";

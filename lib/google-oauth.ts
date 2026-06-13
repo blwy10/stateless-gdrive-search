@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Benjamin Lau
+// SPDX-License-Identifier: MIT
+
 import { cookies } from "next/headers";
 import crypto from "node:crypto";
 import { env } from "@/lib/env";

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Benjamin Lau
+// SPDX-License-Identifier: MIT
+
 import { NextRequest, NextResponse } from "next/server";
 import { ZodError } from "zod";
 import { requireSession } from "@/lib/auth";

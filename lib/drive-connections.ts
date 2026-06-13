@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Benjamin Lau
+// SPDX-License-Identifier: MIT
+
 import crypto from "node:crypto";
 import { getPool } from "@/lib/db";
 import { decryptSecret, encryptSecret } from "@/lib/crypto";

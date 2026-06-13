@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Benjamin Lau
+// SPDX-License-Identifier: MIT
+
 "use client";
 
 import { formatMimeType } from "@/lib/file-types";

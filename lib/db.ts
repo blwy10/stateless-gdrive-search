@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Benjamin Lau
+// SPDX-License-Identifier: MIT
+
 import { Pool } from "pg";
 import { env } from "@/lib/env";
 

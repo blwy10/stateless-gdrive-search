@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Benjamin Lau
+// SPDX-License-Identifier: MIT
+
 import JSZip from "jszip";
 import mammoth from "mammoth";
 import pdfParse from "pdf-parse";

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Benjamin Lau
+// SPDX-License-Identifier: MIT
+
 import { appendFile, mkdir } from "fs/promises";
 import path from "path";
 import { createHash, randomUUID } from "crypto";

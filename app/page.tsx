@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Benjamin Lau
+// SPDX-License-Identifier: MIT
+
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
 import { listDriveConnections } from "@/lib/drive-connections";

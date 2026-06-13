@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Benjamin Lau
+// SPDX-License-Identifier: MIT
+
 function required(name: string): string {
   const value = process.env[name];
   if (!value) {

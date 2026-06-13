@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Benjamin Lau
+// SPDX-License-Identifier: MIT
+
 const MIME_TYPE_LABELS: Record<string, string> = {
   "application/pdf": "PDF",
   "application/msword": "Word document",

@@ -1,3 +1,6 @@
+<!-- Copyright (c) 2026 Benjamin Lau -->
+<!-- SPDX-License-Identifier: MIT -->
+
 # Agent Instructions
 
 - Do not run browser-based tests or browser automation for this project.

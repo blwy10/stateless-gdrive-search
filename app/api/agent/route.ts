@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Benjamin Lau
+// SPDX-License-Identifier: MIT
+
 import { NextRequest } from "next/server";
 import { requireSession } from "@/lib/auth";
 import { parseAgentRequest, runDriveAgent, type AgentProgress } from "@/lib/agent";

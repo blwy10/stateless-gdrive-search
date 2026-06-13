@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Benjamin Lau
+// SPDX-License-Identifier: MIT
+
 import { z } from "zod";
 import { listDriveConnections } from "@/lib/drive-connections";
 import { openDriveFile, searchDriveFiles, type DriveFile } from "@/lib/drive";

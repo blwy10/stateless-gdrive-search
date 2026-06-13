@@ -1,3 +1,6 @@
+<!-- Copyright (c) 2026 Benjamin Lau -->
+<!-- SPDX-License-Identifier: MIT -->
+
 # Stateless GDrive Search
 
 A production-oriented Next.js app for Google-login users to connect one or more Google Drive accounts and query them with a constrained AI agent.
