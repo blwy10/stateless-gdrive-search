@@ -1,0 +1,93 @@
+# Copyright (c) 2026 Benjamin Lau
+# SPDX-License-Identifier: MIT
+
+name: CI
+
+on:
+  pull_request:
+    branches: [main, release]
+  push:
+    branches: [main, release]
+
+# Cancel superseded runs on the same ref to save runner time.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege: CI only needs to read the repo.
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+
+  typecheck:
+    name: Typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - run: npm test
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    # `next build` prerenders `/`, which constructs the NextAuth Google provider
+    # and reads required env (GOOGLE_CLIENT_ID, etc.) at build time. None of these
+    # are real secrets or used to reach any service during the build — they are
+    # throwaway PLACEHOLDERS that only satisfy the required(...) checks so the
+    # build can compile. Real values live in Railway / .env.local, never here.
+    env:
+      NEXT_TELEMETRY_DISABLED: "1"
+      GOOGLE_CLIENT_ID: ci-placeholder
+      GOOGLE_CLIENT_SECRET: ci-placeholder
+      DATABASE_URL: postgres://ci:ci@localhost:5432/ci
+      # base64-encoded 32-byte key (throwaway, generated for CI only)
+      TOKEN_ENCRYPTION_KEY: EQgJ6+ynWKakJ3J3670i1bPJBhdJ3j97qhq6Lu6JmSw=
+      AI_API_KEY: ci-placeholder
+      AI_PROVIDER: openai
+      AI_MODEL: gpt-4o-mini
+      AI_REASONING_EFFORT: none
+      GRADER_AI_API_KEY: ci-placeholder
+      GRADER_AI_PROVIDER: openai
+      GRADER_AI_MODEL: gpt-4o-mini
+      GRADER_AI_REASONING_EFFORT: none
+      SUMMARIZER_AI_API_KEY: ci-placeholder
+      SUMMARIZER_AI_PROVIDER: openai
+      SUMMARIZER_AI_MODEL: gpt-4o-mini
+      SUMMARIZER_AI_REASONING_EFFORT: none
+      NEXTAUTH_URL: http://localhost:3000
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - run: npm run build
