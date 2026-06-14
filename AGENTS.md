@@ -77,6 +77,48 @@
   adapters over them, so testing the handlers directly still exercises the real
   run-resilience behaviour. Add new tests here when you touch these functions.
 
+## Module layout
+
+  Several formerly-monolithic files were split into focused modules behind a
+  barrel; the public import paths are unchanged, so `@/lib/agent`, `@/lib/drive`,
+  and `@/lib/model-settings` resolve to each directory's `index.ts`. Symbol names
+  referenced elsewhere in this doc are unchanged — only their files moved.
+
+  - `lib/agent/` (was `lib/agent.ts`): `types` (request/budget/progress/tool
+    schemas), `prompts`, `tokens`, `logging`, `examiner` (grading), `summarizer`,
+    `answer` (final-answer + SOURCES parsing + `buildAgentResult`), `budget`
+    (limits + diminishing-returns notes), `state` (`FileSet`, `AgentRunContext`,
+    `AgentRunState`, `createRunState`, `recordTouched`), `tool-runtime`
+    (safeJson/retries/`parseToolArgs`), `tools` (`buildAgentTools`),
+    `handlers/{search,open,review}` (the tested tool handlers), and `run`
+    (`runDriveAgent`, decomposed into `resolveRunModels`/`selectDriveIds`/
+    `buildRunContext`/`runMainModelLoop`/`forceSynthesis`/`finalizeRun`).
+  - `lib/drive/` (was `lib/drive.ts`): `types`, `query`
+    (`buildDriveSearchQuery`/`escapeDriveQuery`), `client` (token refresh +
+    `googleFetch` + metadata/download/export), `extract` (pdf/pptx/xlsx/docx text),
+    `content` (`resolveFileContent`/`emptyExtractionNote` + the `MAX_FILE_CHARS`
+    cap), `search` (`searchDriveFiles`), `open` (`openDriveFile`).
+  - `lib/model-settings/` (was `lib/model-settings.ts`): `constants`
+    (enums + coercion), `types` (summaries/effective/inputs + parsers), `env`
+    (`envSettings`), `resolve` (`resolveRoleSettings` + summary/SSRF helpers),
+    `repository` (all DB reads/writes).
+  - `hooks/use-query-sessions.ts` keeps the hook; persistence and the SSE stream
+    moved to `hooks/query-sessions/{types,storage,stream}` (the per-event session
+    update is now the pure `applyStreamEvent` reducer in `stream`).
+  - `components/search-app.tsx` is now a thin orchestrator over
+    `components/search/*` (top-bar, login-panel, connections-strip, query-list,
+    query-form, run-status, results-view, result-views).
+  - `components/settings-dialog.tsx` is the modal shell; the per-role form moved to
+    `components/settings/{constants,use-role-settings,role-settings-form}`.
+
+  `AgentRunState` (god-object cleanup): the four parallel `(array, Set)` pairs that
+  tracked touched/opened/reviewed/kept files are now four `FileSet` instances
+  (`state.touched`/`opened`/`reviewed`/`kept`). `FileSet` encapsulates the dedupe:
+  `claim(idLike)` reserves a key synchronously before an async fetch (the
+  race-safe open/review path), `collect(file)` stores the fetched object, `add(file)`
+  does both when the object is already in hand (touched/kept), and `has`/`list()`/
+  `size` read it. `knownFileKeys`/`searchedQueries` stay plain `Set`s.
+
 ## Drive search recall, berry-picking & diminishing returns
 
   Recall (`buildDriveSearchQuery` in `lib/drive.ts`): Drive's `contains` operator
@@ -265,7 +307,7 @@
   unified `reasoningText`. The verdict, `reason`, and `entityCount` are also
   recorded on `agent.tool.review_file.completed`.
 
-  The set of kept files (`AgentRunState.keptFiles`) is the authoritative curated
+  The set of kept files (`AgentRunState.kept`, a `FileSet`) is the authoritative curated
   *primary* result — there is no end-of-run marker, and no opened-files fallback:
   with the examiner judging every file explicitly, an empty kept set is a valid
   "nothing relevant" result. (Curated runs still accumulate a *touched* set for the
@@ -279,9 +321,9 @@
 
   - `touchedFiles` is every file the agent *encountered* this run — search
     candidates plus anything it opened/reviewed — tracked uniformly across all
-    modes by `recordTouched` (which dedupes via `state.touchedFileKeys` and emits
+    modes by `recordTouched` (which dedupes via the touched `FileSet` and emits
     one `file` event per file). It is the disclosure ("Files touched") the UI
-    hides behind a toggle. `state.touchedFiles` replaced the old, misnamed
+    hides behind a toggle. `state.touched` (a `FileSet`) replaced the old, misnamed
     `referencedFiles` and is now populated in curated mode too.
   - `files` is the per-mode **result** — the thing the user actually wants:
     - **synthesis** → the files the answer *cites*. The model ends its answer with

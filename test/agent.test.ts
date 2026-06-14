@@ -3,6 +3,7 @@
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  createRunState,
   describeSubjectIdentity,
   handleOpenFileTool,
   handleReviewFileTool,
@@ -77,28 +78,7 @@ function makeContext(overrides: Partial<AgentRunContext> = {}): AgentRunContext 
 }
 
 function makeState(overrides: Partial<AgentRunState> = {}): AgentRunState {
-  return {
-    touchedFiles: [],
-    openedFiles: [],
-    reviewedFiles: [],
-    keptFiles: [],
-    searchedQueries: new Set<string>(),
-    knownFileKeys: new Set<string>(),
-    touchedFileKeys: new Set<string>(),
-    openedFileKeys: new Set<string>(),
-    reviewedFileKeys: new Set<string>(),
-    keptFileKeys: new Set<string>(),
-    searchCallCount: 0,
-    openFileCallCount: 0,
-    reviewFileCallCount: 0,
-    tokensSpent: 0,
-    tokensAtLastProgress: 0,
-    lastInputTokens: 0,
-    stopSearchingReason: null,
-    windDownReason: null,
-    currentStep: 0,
-    ...overrides
-  };
+  return { ...createRunState(), ...overrides };
 }
 
 function reviewCall(id: string, connectionId = "c1", fileId = "f1") {
@@ -399,8 +379,8 @@ describe("handleOpenFileTool", () => {
     // The failed file is still counted and marked opened so the run won't retry
     // it, but it must not be recorded as opened or touched.
     expect(runState.openFileCallCount).toBe(1);
-    expect(runState.openedFiles).toHaveLength(0);
-    expect(runState.touchedFiles).toHaveLength(0);
+    expect(runState.opened.list()).toHaveLength(0);
+    expect(runState.touched.list()).toHaveLength(0);
   });
 
   it("rejects an out-of-scope connectionId as an observation instead of throwing", async () => {
@@ -429,8 +409,8 @@ describe("handleOpenFileTool", () => {
     expect(openDriveFile).not.toHaveBeenCalled();
     // The out-of-scope call must not consume budget or be recorded as opened.
     expect(runState.openFileCallCount).toBe(0);
-    expect(runState.openedFiles).toHaveLength(0);
-    expect(runState.touchedFiles).toHaveLength(0);
+    expect(runState.opened.list()).toHaveLength(0);
+    expect(runState.touched.list()).toHaveLength(0);
   });
 
   it("returns an error observation for malformed JSON arguments instead of throwing", async () => {
@@ -480,8 +460,8 @@ describe("handleOpenFileTool", () => {
 
     const payload = JSON.parse(result.content) as { content?: string };
     expect(payload.content).toBe("hello world");
-    expect(runState.openedFiles).toHaveLength(1);
-    expect(runState.touchedFiles).toHaveLength(1);
+    expect(runState.opened.list()).toHaveLength(1);
+    expect(runState.touched.list()).toHaveLength(1);
   });
 
   it("records an opened file in the touched set and emits a file event", async () => {
@@ -499,8 +479,8 @@ describe("handleOpenFileTool", () => {
 
     await handleOpenFileTool(context, runState, 0, openCall("call-3"));
 
-    expect(runState.openedFiles).toHaveLength(1);
-    expect(runState.touchedFiles).toHaveLength(1);
+    expect(runState.opened.list()).toHaveLength(1);
+    expect(runState.touched.list()).toHaveLength(1);
     expect(events.some((event) => event.type === "file")).toBe(true);
     expect(events.some((event) => event.type === "reviewing")).toBe(false);
   });
@@ -574,8 +554,8 @@ describe("handleReviewFileTool", () => {
     // The file's content must NOT leak back into the main loop's context.
     expect(payload.content).toBeUndefined();
     expect(gradeFile).toHaveBeenCalledTimes(1);
-    expect(runState.keptFiles).toEqual([file("c1", "f1", "Doc")]);
-    expect(runState.reviewedFiles).toHaveLength(1);
+    expect(runState.kept.list()).toEqual([file("c1", "f1", "Doc")]);
+    expect(runState.reviewed.list()).toHaveLength(1);
     expect(events.some((event) => event.type === "reviewing")).toBe(true);
     expect(events.some((event) => event.type === "kept")).toBe(true);
     expect(events.some((event) => event.type === "discarded")).toBe(false);
@@ -599,8 +579,8 @@ describe("handleReviewFileTool", () => {
     const payload = JSON.parse(result.content) as { examined?: boolean; relevant?: boolean };
     expect(payload.examined).toBe(true);
     expect(payload.relevant).toBe(false);
-    expect(runState.keptFiles).toHaveLength(0);
-    expect(runState.reviewedFiles).toHaveLength(1);
+    expect(runState.kept.list()).toHaveLength(0);
+    expect(runState.reviewed.list()).toHaveLength(1);
     expect(events.some((event) => event.type === "reviewing")).toBe(true);
     expect(events.some((event) => event.type === "discarded")).toBe(true);
     expect(events.some((event) => event.type === "kept")).toBe(false);
@@ -628,8 +608,8 @@ describe("handleReviewFileTool", () => {
     expect(payload.entities).toEqual(["Airwallex"]);
     // Uncurated returns every match at search time, so review never keeps/discards
     // and emits none of the curated lifecycle events.
-    expect(runState.keptFiles).toHaveLength(0);
-    expect(runState.reviewedFiles).toHaveLength(1);
+    expect(runState.kept.list()).toHaveLength(0);
+    expect(runState.reviewed.list()).toHaveLength(1);
     expect(events.some((event) => event.type === "reviewing")).toBe(false);
     expect(events.some((event) => event.type === "kept")).toBe(false);
     expect(events.some((event) => event.type === "discarded")).toBe(false);
@@ -649,7 +629,7 @@ describe("handleReviewFileTool", () => {
     expect(openDriveFile).not.toHaveBeenCalled();
     expect(gradeFile).not.toHaveBeenCalled();
     expect(runState.reviewFileCallCount).toBe(0);
-    expect(runState.keptFiles).toHaveLength(0);
+    expect(runState.kept.list()).toHaveLength(0);
   });
 
   it("returns an error observation (not a throw) when the file fails to open", async () => {
@@ -668,7 +648,7 @@ describe("handleReviewFileTool", () => {
     // The file is counted (so it won't be retried) but never graded or kept.
     expect(runState.reviewFileCallCount).toBe(1);
     expect(gradeFile).not.toHaveBeenCalled();
-    expect(runState.keptFiles).toHaveLength(0);
+    expect(runState.kept.list()).toHaveLength(0);
   });
 
   it("skips a file already examined earlier in the run", async () => {
@@ -681,7 +661,7 @@ describe("handleReviewFileTool", () => {
     expect(payload.alreadyExamined).toBe(true);
     expect(openDriveFile).toHaveBeenCalledTimes(1);
     expect(gradeFile).toHaveBeenCalledTimes(1);
-    expect(runState.keptFiles).toHaveLength(1);
+    expect(runState.kept.list()).toHaveLength(1);
   });
 
   it("attaches a diminishing-returns note once spend has stalled past the soft limit", async () => {
@@ -802,7 +782,7 @@ describe("handleSearchTool", () => {
     const payload = JSON.parse(result.content) as { files?: unknown[]; note?: string };
     expect(payload.files).toHaveLength(2);
     expect(payload.note).toBeUndefined();
-    expect(runState.touchedFiles).toHaveLength(2);
+    expect(runState.touched.list()).toHaveLength(2);
     // New results reset the diminishing-returns clock to the current spend.
     expect(runState.tokensAtLastProgress).toBe(5_000);
   });
@@ -824,7 +804,7 @@ describe("handleSearchTool", () => {
     // Candidates are still returned to the model and tracked/streamed as touched
     // for the audit disclosure...
     expect(payload.files).toHaveLength(2);
-    expect(runState.touchedFiles).toHaveLength(2);
+    expect(runState.touched.list()).toHaveLength(2);
     expect(events.filter((event) => event.type === "file")).toHaveLength(2);
     // ...but a bare search hit is a candidate, not a result, in curated mode, so
     // it must NOT reset the diminishing-returns clock (only an examiner keep does).
