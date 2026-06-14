@@ -10,6 +10,9 @@ A production-oriented Next.js app for Google-login users to connect one or more 
 The agent has a small, fixed set of app tools:
 
 - `search_drive`: search connected Google Drives with read-only Drive scopes.
+  Multi-word queries match any term (not the whole phrase) to favour recall, and a
+  search that makes no progress (a repeat, or no new files) returns a corrective
+  note nudging the agent to vary its terms.
 - `open_file`: read a selected file's contents (synthesis and uncurated list mode).
 - `review_file`: curated file-list mode only — read a candidate file and judge its
   relevance in an isolated grader call, keeping it only if relevant. Offered
@@ -99,7 +102,7 @@ npm run dev
 ## Tests
 
 Pure, security-sensitive helpers (MIME formatting, token encryption, the SSRF
-URL guard, Drive query escaping, and agent output parsing) are covered by a
+URL guard, Drive query building/escaping, and agent output parsing) are covered by a
 small [Vitest](https://vitest.dev) suite under `test/`. These tests touch no
 network, database, or browser:
 

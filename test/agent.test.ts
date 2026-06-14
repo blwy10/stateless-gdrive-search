@@ -82,6 +82,17 @@ function reviewCall(id: string, connectionId = "c1", fileId = "f1") {
   };
 }
 
+function searchCall(id: string, query: string, limit?: number) {
+  return {
+    id,
+    type: "function" as const,
+    function: {
+      name: "search_drive" as const,
+      arguments: JSON.stringify(limit === undefined ? { query } : { query, limit })
+    }
+  };
+}
+
 function curatedContext(overrides: Partial<AgentRunContext> = {}): AgentRunContext {
   return makeContext({
     input: { query: "q", mode: "list", driveIds: ["c1"], curateList: true },
@@ -470,5 +481,65 @@ describe("handleSearchTool", () => {
     expect(payload.message).toContain("Invalid arguments for search_drive");
     expect(searchDriveFiles).not.toHaveBeenCalled();
     expect(runState.searchCallCount).toBe(0);
+  });
+
+  it("returns files with no note when the search surfaces new files", async () => {
+    vi.mocked(searchDriveFiles).mockReset();
+    vi.mocked(searchDriveFiles).mockResolvedValue([file("c1", "f1"), file("c1", "f2")]);
+    const runState = makeState();
+
+    const result = await handleSearchTool(makeContext(), runState, 0, searchCall("s1", "alpha beta"));
+
+    const payload = JSON.parse(result.content) as { files?: unknown[]; note?: string };
+    expect(payload.files).toHaveLength(2);
+    expect(payload.note).toBeUndefined();
+    expect(runState.lowProgressSearchCount).toBe(0);
+  });
+
+  it("nudges the model to vary terms when it repeats the exact same query (H3)", async () => {
+    vi.mocked(searchDriveFiles).mockReset();
+    vi.mocked(searchDriveFiles).mockResolvedValue([file("c1", "f1")]);
+    const runState = makeState();
+    const context = makeContext();
+
+    await handleSearchTool(context, runState, 0, searchCall("s1", "Airwallex feedback"));
+    // Same query up to case/whitespace normalization => treated as a repeat.
+    const repeat = await handleSearchTool(
+      context,
+      runState,
+      1,
+      searchCall("s2", "airwallex   FEEDBACK")
+    );
+
+    const payload = JSON.parse(repeat.content) as { files?: unknown[]; note?: string };
+    expect(payload.note).toContain("exact query you already ran");
+    // The files are still returned (consistent), just with the corrective note.
+    expect(payload.files).toHaveLength(1);
+  });
+
+  it("nudges when a new query surfaces only files already seen", async () => {
+    vi.mocked(searchDriveFiles).mockReset();
+    // Both searches return the same file, so the second makes no progress.
+    vi.mocked(searchDriveFiles).mockResolvedValue([file("c1", "f1")]);
+    const runState = makeState();
+    const context = makeContext();
+
+    await handleSearchTool(context, runState, 0, searchCall("s1", "alpha"));
+    const result = await handleSearchTool(context, runState, 1, searchCall("s2", "beta"));
+
+    const payload = JSON.parse(result.content) as { note?: string };
+    expect(payload.note).toContain("no files you had not already seen");
+  });
+
+  it("nudges when a query matches no files at all", async () => {
+    vi.mocked(searchDriveFiles).mockReset();
+    vi.mocked(searchDriveFiles).mockResolvedValue([]);
+    const runState = makeState();
+
+    const result = await handleSearchTool(makeContext(), runState, 0, searchCall("s1", "zzz"));
+
+    const payload = JSON.parse(result.content) as { files?: unknown[]; note?: string };
+    expect(payload.files).toHaveLength(0);
+    expect(payload.note).toContain("matched no files");
   });
 });

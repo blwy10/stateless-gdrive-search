@@ -1,0 +1,8 @@
+# Copyright (c) 2026 Benjamin Lau
+# SPDX-License-Identifier: MIT
+#
+# Dependencies for utils/sample_open_file_coverage.py
+requests>=2.31
+cryptography>=42.0          # AES-256-GCM decrypt of the DB-stored OAuth token
+pypdf>=4.2                  # PDF text extraction (the only binary type needing a lib)
+tiktoken>=0.7              # optional: accurate token counts (falls back to chars/4)

@@ -432,6 +432,37 @@ function normalizeSearchQuery(query: string) {
   return query.trim().toLowerCase().replace(/\s+/g, " ");
 }
 
+/**
+ * Build a short corrective note to append to a `search_drive` observation when a
+ * search made no progress, so the model gets an explicit signal instead of being
+ * handed an identical (or empty) result list with no context.
+ *
+ * Without this, a model that re-runs the same query — or runs a different query
+ * that surfaces nothing new — tends to read the unchanged list as confirmation
+ * that nothing else exists and stops early, even though varying the terms would
+ * find more (the failure seen in production: an identical query repeated twice,
+ * then a one-file synthesis). The note nudges it to vary terms while still
+ * permitting it to stop, so it complements the harder low-progress stop guard.
+ *
+ * Returns null when the search did make progress (new files were found), so a
+ * productive search carries no note.
+ */
+function searchResultNote(
+  wasRepeatedQuery: boolean,
+  newResultCount: number,
+  totalResultCount: number
+): string | null {
+  if (wasRepeatedQuery) {
+    return "This is the exact query you already ran, so these results are identical to before — do not run it again. To find more files, search with different terms: synonyms, a broader or narrower phrasing, or a single distinctive keyword. If you already have enough, stop searching and continue with the files found so far.";
+  }
+  if (newResultCount === 0) {
+    return totalResultCount === 0
+      ? "This query matched no files. Try different terms: synonyms, a broader phrasing, or a single distinctive keyword."
+      : "This query surfaced no files you had not already seen. Try different terms (synonyms, a broader phrasing, or a single distinctive keyword), or continue with the files found so far.";
+  }
+  return null;
+}
+
 function partialAnswer(reason: string, mode: AgentRequest["mode"]) {
   if (mode === "list") {
     return { answer: "", answerFormat: "plain" as const };
@@ -709,10 +740,11 @@ export async function handleSearchTool(
       await emit({ type: "file", file });
     }
   }
+  const note = searchResultNote(wasRepeatedQuery, newFiles.length, files.length);
   return {
     role: "tool",
     tool_call_id: toolCall.id,
-    content: safeJson({ files })
+    content: safeJson(note ? { files, note } : { files })
   };
 }
 

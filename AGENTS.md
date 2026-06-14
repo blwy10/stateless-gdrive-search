@@ -9,7 +9,8 @@
   They cover mostly pure helpers (no network/DB/browser): `formatMimeType`,
   `encryptSecret`/`decryptSecret`, the SSRF guard
   (`validatePublicHttpsBaseUrl`/`isPrivateIpv4`/`isPrivateIpv6`/`isPrivateAddress`),
-  `escapeDriveQuery`, `emptyExtractionNote`, `parseFinalAnswer`,
+  `escapeDriveQuery`, `buildDriveSearchQuery` (the Drive `q` builder — see "Drive
+  search recall" below), `emptyExtractionNote`, `parseFinalAnswer`,
   `normalizeGradeVerdict` (the curated-mode grader's verdict normaliser — trims and
   caps the `reason` and supplies a default sentence when the model omits one), and
   the debug-log gating helpers (`debugText`/`isDebugLogEnabled`/
@@ -22,7 +23,11 @@
   out-of-scope-connectionId path (a connectionId not in `selectedDriveIds` — usually
   the model hallucinating an id — is rejected as an observation without opening the
   file, never thrown), invalid tool arguments (malformed JSON or a schema violation,
-  via `parseToolArgs`, in the `open_file` and `search_drive` handlers), and the
+  via `parseToolArgs`, in the `open_file` and `search_drive` handlers), the
+  `search_drive` no-progress nudge (a productive search carries no `note`; a
+  repeated query, a query that surfaces only already-seen files, and a query that
+  matches nothing each attach a distinct corrective `note` — see "Drive search
+  recall" below), and the
   curated `review_file` flow via `handleReviewFileTool` (keep on a relevant grade,
   discard on an irrelevant one, dedupe of already-reviewed files, the review budget,
   the out-of-scope guard, and the open-failure path — and that the file's content is
@@ -30,6 +35,42 @@
   OpenAI-style `ToolCall` shape; the AI SDK tools in `buildAgentTools` are thin
   adapters over them, so testing the handlers directly still exercises the real
   run-resilience behaviour. Add new tests here when you touch these functions.
+
+## Drive search recall & no-progress nudges
+
+  Two related concerns keep the agent from prematurely concluding "nothing else
+  is relevant" after a weak search.
+
+  Recall (`buildDriveSearchQuery` in `lib/drive.ts`): Drive's `contains` operator
+  matches the *whole* string, so a naive `name contains 'a b' or fullText contains
+  'a b'` requires every term together and silently drops files that contain only
+  some of them — e.g. the query "Airwallex feedback" misses a doc named "Airwallex
+  Reflection" that never says "feedback". `buildDriveSearchQuery` therefore splits a
+  multi-word query into terms (deduped case-insensitively, capped at
+  `MAX_SEARCH_TERMS = 12`) and OR-s a `name`/`fullText` `contains` pair per term, so
+  a partial match still surfaces. This only ever *widens* the candidate set (it is a
+  strict superset of the old whole-string match); the agent and the curated grader
+  filter for true relevance afterwards. Single-word queries are unchanged. `orderBy`
+  is intentionally left unset: Drive v3 has no `relevance` sort key, and omitting
+  `orderBy` is the only way to get relevance ordering, which keeps the best matches
+  near the top of the (20-capped) page. `escapeDriveQuery` is now only called from
+  inside `buildDriveSearchQuery` (per-term), so `searchDriveFiles` passes the raw,
+  trimmed query down rather than pre-escaping it.
+
+  No-progress nudge (`searchResultNote` in `lib/agent.ts`): a `search_drive`
+  observation now carries a corrective `note` when the search made no progress, so
+  the model gets an explicit signal instead of an unchanged list it reads as
+  "nothing more exists". The cases: a *repeated* query (same `normalizeSearchQuery`
+  form already in `state.searchedQueries`) → strong "do not run it again, vary the
+  terms"; a *new* query that returns only already-known files (`newResultCount === 0`
+  but results exist) → "no files you had not already seen, try different terms"; a
+  query that matches nothing (`totalResultCount === 0`) → "matched no files, try
+  different terms". A productive search (new files found) carries no note. This is a
+  soft prompt-time nudge that complements — and fires earlier than — the hard
+  `lowProgressSearchCount`/`maxLowProgressSearches` stop guard, and it deliberately
+  also tells the model it may stop, so it does not push toward endless searching.
+  No new run state is introduced: the note is derived from `wasRepeatedQuery` and
+  the new-file count the handler already computes.
 
 ## LLM layer (Vercel AI SDK)
 

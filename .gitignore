@@ -13,3 +13,6 @@ coverage
 tsconfig.tsbuildinfo
 next-env.d.ts
 client_secret_*.json
+utils/.venv/
+utils/output/
+__pycache__/
