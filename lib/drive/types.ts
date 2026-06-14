@@ -12,6 +12,14 @@ export type DriveFile = {
   size?: string;
 };
 
+/**
+ * The mimeType Google Drive assigns to a folder. A folder has no extractable
+ * text, so the read paths (open_file/review_file) redirect it to list_folder
+ * instead of trying to download/grade it (see lib/drive/open.ts and the agent
+ * handlers). Also used by {@link listDriveFolder} as the navigation target.
+ */
+export const GOOGLE_DRIVE_FOLDER_MIME_TYPE = "application/vnd.google-apps.folder";
+
 export const MAX_FILE_CHARS = 32_000;
 
 /**

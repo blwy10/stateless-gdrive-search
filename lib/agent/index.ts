@@ -22,4 +22,5 @@ export { createRunState, FileSet, type AgentRunContext, type AgentRunState } fro
 export { handleSearchTool } from "./handlers/search";
 export { handleOpenFileTool } from "./handlers/open";
 export { handleReviewFileTool } from "./handlers/review";
+export { handleListFolderTool } from "./handlers/list-folder";
 export { runDriveAgent } from "./run";

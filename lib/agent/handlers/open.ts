@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Benjamin Lau
 // SPDX-License-Identifier: MIT
 
-import { openDriveFile, type DriveFile } from "@/lib/drive";
+import { GOOGLE_DRIVE_FOLDER_MIME_TYPE, openDriveFile, type DriveFile } from "@/lib/drive";
 import { debugError, hashForDebug, writeDebugLog } from "@/lib/debug-log";
 import { openArgs, type ToolCall, type ToolResultMessage } from "../types";
 import { recordTouched, type AgentRunContext, type AgentRunState } from "../state";
@@ -122,6 +122,33 @@ export async function handleOpenFileTool(
       toolCall.id,
       `Could not open this file: ${errorText(error)}. It may be inaccessible; continue with the other files.`
     );
+  }
+  // A folder has no readable content — redirect to list_folder instead of
+  // returning its (placeholder) content as if it were a file. We still record it
+  // in the touched audit set, but it is NOT collected into `opened` (so it can
+  // never become a synthesis source) and reading it is NOT useful progress.
+  if (opened.file.mimeType === GOOGLE_DRIVE_FOLDER_MIME_TYPE) {
+    await writeDebugLog({
+      event: "agent.tool.open_file.folder_redirect",
+      requestId,
+      step,
+      durationMs: Date.now() - toolStartedAt,
+      fileKeyHash: hashForDebug(fileKey(opened.file)),
+      openFileCallCount: state.openFileCallCount
+    });
+    state.knownFileKeys.add(fileKey(opened.file));
+    await emit({ type: "progress", message: `Found ${formatFileProgressLabel(opened.file)}` });
+    await recordTouched(state, opened.file, emit);
+    return {
+      role: "tool",
+      tool_call_id: toolCall.id,
+      content: safeJson({
+        isFolder: true,
+        connectionId: opened.file.connectionId,
+        fileId: opened.file.id,
+        message: `"${opened.file.name}" is a folder, not a readable file. Call list_folder with this connectionId and fileId to see the files inside it, then open the ones you need.`
+      })
+    };
   }
   await writeDebugLog({
     event: "agent.tool.open_file.completed",

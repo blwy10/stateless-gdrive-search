@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createRunState,
   describeSubjectIdentity,
+  handleListFolderTool,
   handleOpenFileTool,
   handleReviewFileTool,
   handleSearchTool,
@@ -20,7 +21,12 @@ import {
   type AgentRunState,
   type GradeVerdict
 } from "@/lib/agent";
-import { openDriveFile, searchDriveFiles } from "@/lib/drive";
+import {
+  GOOGLE_DRIVE_FOLDER_MIME_TYPE,
+  listDriveFolder,
+  openDriveFile,
+  searchDriveFiles
+} from "@/lib/drive";
 import type { DriveFile } from "@/lib/drive";
 import type { ResolvedModel } from "@/lib/model-provider";
 import { generateText } from "ai";
@@ -31,7 +37,8 @@ import type { DriveConnectionSummary } from "@/lib/drive-connections";
 vi.mock("@/lib/drive", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/drive")>()),
   openDriveFile: vi.fn(),
-  searchDriveFiles: vi.fn()
+  searchDriveFiles: vi.fn(),
+  listDriveFolder: vi.fn()
 }));
 
 // The handler/pure-helper tests never call the model; only summarizeOversizeContent
@@ -45,14 +52,18 @@ vi.mock("ai", () => ({
   stepCountIs: () => false
 }));
 
-function file(connectionId: string, id: string, name = id): DriveFile {
+function file(connectionId: string, id: string, name = id, mimeType = "text/plain"): DriveFile {
   return {
     connectionId,
     id,
     name,
     driveEmail: `${connectionId}@example.com`,
-    mimeType: "text/plain"
+    mimeType
   };
+}
+
+function folder(connectionId: string, id: string, name = id): DriveFile {
+  return file(connectionId, id, name, GOOGLE_DRIVE_FOLDER_MIME_TYPE);
 }
 
 function makeContext(overrides: Partial<AgentRunContext> = {}): AgentRunContext {
@@ -548,6 +559,40 @@ describe("handleOpenFileTool", () => {
     await passed.summarizeOversize?.({ file: f, fullText: "huge" });
     expect(summarize).toHaveBeenCalledWith(f, "huge", 7);
   });
+
+  it("redirects a folder to list_folder instead of returning it as a read", async () => {
+    // Opening a folder must not surface its placeholder content as if it were a
+    // file: the model is redirected to list_folder, the folder is recorded as
+    // touched (audit) but never collected as an opened source, and reading it is
+    // not counted as useful progress.
+    vi.mocked(openDriveFile).mockResolvedValue({
+      file: folder("c1", "f1", "Reports"),
+      content: "placeholder folder content"
+    });
+    const runState = makeState();
+    const events: AgentProgress[] = [];
+    const context = makeContext({
+      emit: (event) => {
+        events.push(event);
+      }
+    });
+
+    const result = await handleOpenFileTool(context, runState, 0, openCall("call-folder"));
+
+    const payload = JSON.parse(result.content) as {
+      isFolder?: boolean;
+      content?: string;
+      message?: string;
+    };
+    expect(payload.isFolder).toBe(true);
+    expect(payload.content).toBeUndefined();
+    expect(payload.message).toContain("list_folder");
+    // Touched (audit) but never an openable source, and not useful progress.
+    expect(runState.touched.list()).toHaveLength(1);
+    expect(runState.opened.list()).toHaveLength(0);
+    expect(runState.tokensAtLastProgress).toBe(0);
+    expect(events.some((event) => event.type === "file")).toBe(true);
+  });
 });
 
 describe("handleReviewFileTool", () => {
@@ -745,6 +790,45 @@ describe("handleReviewFileTool", () => {
     const payload = JSON.parse(result.content) as { note?: string };
     expect(payload.note).toContain("Returns are diminishing");
   });
+
+  it("redirects a folder to list_folder without grading or keeping it", async () => {
+    // The grader must NEVER see a folder: review_file detects the folder mimeType
+    // after opening and short-circuits to a list_folder redirect BEFORE gradeFile,
+    // with no keep/discard and no reviewing/examining event.
+    vi.mocked(openDriveFile).mockResolvedValue({
+      file: folder("c1", "f1", "Reports"),
+      content: "placeholder folder content"
+    });
+    const runState = makeState();
+    const events: AgentProgress[] = [];
+    const gradeFile = vi.fn(async () => ({
+      relevant: true,
+      reason: "x",
+      entities: [],
+      aboutSubject: "unknown" as const
+    }));
+    const context = curatedContext({
+      gradeFile,
+      emit: (event) => {
+        events.push(event);
+      }
+    });
+
+    const result = await handleReviewFileTool(context, runState, 0, reviewCall("r-folder"));
+
+    const payload = JSON.parse(result.content) as { isFolder?: boolean; message?: string };
+    expect(payload.isFolder).toBe(true);
+    expect(payload.message).toContain("list_folder");
+    // The grader never runs for a folder, and nothing is graded/kept/discarded.
+    expect(gradeFile).not.toHaveBeenCalled();
+    expect(runState.kept.list()).toHaveLength(0);
+    expect(runState.reviewed.list()).toHaveLength(0);
+    expect(events.some((event) => event.type === "reviewing")).toBe(false);
+    expect(events.some((event) => event.type === "kept")).toBe(false);
+    expect(events.some((event) => event.type === "discarded")).toBe(false);
+    // Still recorded in the touched audit set.
+    expect(runState.touched.list()).toHaveLength(1);
+  });
 });
 
 describe("summarizeOversizeContent", () => {
@@ -940,6 +1024,119 @@ describe("handleSearchTool", () => {
   });
 });
 
+describe("handleListFolderTool", () => {
+  function listFolderCall(id: string, connectionId = "c1", fileId = "fold1") {
+    return {
+      id,
+      type: "function" as const,
+      function: {
+        name: "list_folder" as const,
+        arguments: JSON.stringify({ connectionId, fileId })
+      }
+    };
+  }
+
+  beforeEach(() => {
+    vi.mocked(listDriveFolder).mockReset();
+  });
+
+  it("returns the folder's children and records them as touched candidates", async () => {
+    vi.mocked(listDriveFolder).mockResolvedValue([file("c1", "child1"), file("c1", "child2")]);
+    const runState = makeState({ tokensSpent: 5_000, tokensAtLastProgress: 0 });
+    const events: AgentProgress[] = [];
+    const context = makeContext({
+      emit: (event) => {
+        events.push(event);
+      }
+    });
+
+    const result = await handleListFolderTool(context, runState, 0, listFolderCall("lf1"));
+
+    const payload = JSON.parse(result.content) as { files?: DriveFile[] };
+    expect(payload.files).toHaveLength(2);
+    expect(runState.listFolderCallCount).toBe(1);
+    expect(runState.touched.list()).toHaveLength(2);
+    expect(events.filter((event) => event.type === "file")).toHaveLength(2);
+    // Synthesis (non-curated): surfaced children are results, so they reset the
+    // diminishing-returns clock (mirrors handleSearchTool).
+    expect(runState.tokensAtLastProgress).toBe(5_000);
+  });
+
+  it("does not count surfaced children as progress in curated list mode", async () => {
+    vi.mocked(listDriveFolder).mockResolvedValue([file("c1", "child1")]);
+    const runState = makeState({ tokensSpent: 5_000, tokensAtLastProgress: 0 });
+
+    await handleListFolderTool(curatedContext(), runState, 0, listFolderCall("lf-cur"));
+
+    // Curated keeps only examiner-kept files, so a bare child candidate is not
+    // progress — the clock must not move.
+    expect(runState.touched.list()).toHaveLength(1);
+    expect(runState.tokensAtLastProgress).toBe(0);
+  });
+
+  it("notes an empty folder so the model pivots back to search", async () => {
+    vi.mocked(listDriveFolder).mockResolvedValue([]);
+    const runState = makeState();
+
+    const result = await handleListFolderTool(makeContext(), runState, 0, listFolderCall("lf-empty"));
+
+    const payload = JSON.parse(result.content) as { files?: unknown[]; note?: string };
+    expect(payload.files).toHaveLength(0);
+    expect(payload.note).toContain("no files directly inside");
+    expect(runState.listFolderCallCount).toBe(1);
+  });
+
+  it("rejects an out-of-scope connectionId as an observation without listing", async () => {
+    const runState = makeState();
+    // selectedDriveIds is ["c1"], so "c2" is outside scope (a hallucinated id).
+    const result = await handleListFolderTool(
+      makeContext(),
+      runState,
+      0,
+      listFolderCall("lf-scope", "c2", "fold1")
+    );
+
+    const payload = JSON.parse(result.content) as { error?: boolean; message?: string };
+    expect(payload.error).toBe(true);
+    expect(payload.message).toContain("not one of the selected");
+    expect(listDriveFolder).not.toHaveBeenCalled();
+    expect(runState.listFolderCallCount).toBe(0);
+  });
+
+  it("returns an error observation (not a throw) when listing fails", async () => {
+    vi.mocked(listDriveFolder).mockRejectedValue(
+      new Error("Google Drive request failed with status 403")
+    );
+    const runState = makeState();
+
+    const result = await handleListFolderTool(makeContext(), runState, 0, listFolderCall("lf-fail"));
+
+    const payload = JSON.parse(result.content) as { error?: boolean; message?: string };
+    expect(payload.error).toBe(true);
+    expect(payload.message).toContain("403");
+    // Counted so it won't loop, but nothing surfaced into touched.
+    expect(runState.listFolderCallCount).toBe(1);
+    expect(runState.touched.list()).toHaveLength(0);
+  });
+
+  it("returns an error observation for schema-invalid arguments without listing", async () => {
+    const runState = makeState();
+    const missingField = {
+      id: "lf-bad",
+      type: "function" as const,
+      function: { name: "list_folder" as const, arguments: JSON.stringify({ connectionId: "c1" }) }
+    };
+
+    const result = await handleListFolderTool(makeContext(), runState, 0, missingField);
+
+    const payload = JSON.parse(result.content) as { error?: boolean; message?: string };
+    expect(payload.error).toBe(true);
+    expect(payload.message).toContain("Invalid arguments for list_folder");
+    expect(listDriveFolder).not.toHaveBeenCalled();
+    expect(runState.listFolderCallCount).toBe(0);
+  });
+});
+
 function conn(id: string, driveName: string | null, driveEmail: string): DriveConnectionSummary {
   return {
     id,
@@ -1078,5 +1275,40 @@ describe("systemPrompt subject anchoring", () => {
     const prompt = synthesisPrompt(null);
     expect(prompt).toContain("A complete response looks exactly like this");
     expect(prompt).toContain("SOURCES:");
+  });
+});
+
+describe("systemPrompt folder navigation", () => {
+  const synthesis = () =>
+    systemPrompt(
+      { query: "find the deck", mode: "synthesis", driveIds: ["c1"], curateList: false },
+      ["c1"],
+      null
+    );
+  const curatedList = () =>
+    systemPrompt(
+      { query: "find the deck", mode: "list", driveIds: ["c1"], curateList: true },
+      ["c1"],
+      null
+    );
+
+  it("offers list_folder and explains folder navigation in every mode", () => {
+    for (const prompt of [synthesis(), curatedList()]) {
+      expect(prompt).toContain("three tools");
+      expect(prompt).toContain("list_folder");
+      expect(prompt).toContain('mimeType "application/vnd.google-apps.folder"');
+    }
+  });
+
+  it("names the right read tool when telling the model not to examine a folder", () => {
+    // The folder paragraph uses the mode's examine tool, so it must read correctly
+    // per mode (open_file for synthesis, review_file for list).
+    expect(synthesis()).toContain("Do not call open_file on a folder.");
+    expect(curatedList()).toContain("Do not call review_file on a folder.");
+  });
+
+  it("lets ids be copied from a list_folder result, including as synthesis sources", () => {
+    expect(synthesis()).toContain("copy verbatim from a search_drive or list_folder result");
+    expect(synthesis()).toContain("from a search_drive, list_folder, or open_file result");
   });
 });

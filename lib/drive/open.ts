@@ -10,8 +10,13 @@ import {
   extractPptxText,
   extractXlsxText
 } from "./extract";
-import { normalizeFileContent, resolveFileContent, unsupportedGoogleAppsContent } from "./content";
-import type { DriveFile, OversizeSummarizer } from "./types";
+import {
+  folderRedirectContent,
+  normalizeFileContent,
+  resolveFileContent,
+  unsupportedGoogleAppsContent
+} from "./content";
+import { GOOGLE_DRIVE_FOLDER_MIME_TYPE, type DriveFile, type OversizeSummarizer } from "./types";
 
 export async function openDriveFile(input: {
   ownerSub: string;
@@ -59,6 +64,14 @@ export async function openDriveFile(input: {
   let content: string;
 
   switch (metadata.mimeType) {
+    case GOOGLE_DRIVE_FOLDER_MIME_TYPE:
+      // A folder has no extractable text — return a redirect to list_folder
+      // rather than attempting a download/export. The agent handlers detect the
+      // folder mimeType on the returned file and short-circuit to a structured
+      // redirect (so review_file never grades it), but this keeps the content
+      // sensible for any caller that reads it directly.
+      content = folderRedirectContent(metadata);
+      break;
     case "application/vnd.google-apps.document":
       content = (await exportBuffer(connection, input.fileId, "text/plain", input.debugRequestId)).toString("utf8");
       break;

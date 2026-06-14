@@ -7,6 +7,7 @@
 // tests) so callers are unaffected by the internal decomposition.
 
 export {
+  GOOGLE_DRIVE_FOLDER_MIME_TYPE,
   MAX_FILE_CHARS,
   MIN_SUMMARY_CHARS,
   type ContentDisposition,
@@ -14,6 +15,7 @@ export {
   type OversizeSummarizer
 } from "./types";
 export { buildDriveSearchQuery, escapeDriveQuery } from "./query";
+export { buildFolderChildrenQuery, listDriveFolder } from "./folder";
 export { emptyExtractionNote, resolveFileContent } from "./content";
 export { searchDriveFiles } from "./search";
 export { openDriveFile } from "./open";

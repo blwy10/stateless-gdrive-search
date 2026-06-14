@@ -10,7 +10,9 @@
   `encryptSecret`/`decryptSecret`, the SSRF guard
   (`validatePublicHttpsBaseUrl`/`isPrivateIpv4`/`isPrivateIpv6`/`isPrivateAddress`),
   `escapeDriveQuery`, `buildDriveSearchQuery` (the Drive `q` builder — see "Drive
-  search recall" below), `emptyExtractionNote`, `resolveFileContent` (the
+  search recall" below), `buildFolderChildrenQuery` (the `'<id>' in parents and
+  trashed = false` child-listing query for folder navigation, escaped defensively
+  — see "Folder navigation" below), `emptyExtractionNote`, `resolveFileContent` (the
   per-file content-cap resolver in `lib/drive.ts` — full/empty/truncated/summarized
   disposition, with a fake summarizer hook; see "Oversize files" below),
   `parseFinalAnswer` (the synthesis answer parser: extracts/strips the
@@ -84,7 +86,18 @@
   `{ summary: null }` so the caller truncates, never aborts), and that
   `handleOpenFileTool` passes the `summarizeOversize` hook to `openDriveFile`
   (so an oversize synthesis read is condensed) while `handleReviewFileTool` does
-  NOT (list mode keeps truncation). The handlers still take the
+  NOT (list mode keeps truncation). It also covers folder navigation (see "Folder
+  navigation" below): `handleListFolderTool` (returns a folder's children as
+  touched candidates shaped like a search result, with the same useful-progress
+  rule as search — resets the diminishing-returns clock in non-curated modes, not
+  in curated — plus the empty-folder note, the out-of-scope guard, the
+  listing-failure path, and schema-invalid args), and the folder redirect in BOTH
+  read handlers (`handleOpenFileTool`/`handleReviewFileTool` detect the folder
+  mimeType after opening and return a `list_folder` redirect — the `review_file`
+  path does so BEFORE `gradeFile`, so the examiner never grades a folder, and
+  neither handler keeps/cites it), plus `systemPrompt`'s folder guidance (every
+  mode names `list_folder` and tells the model not to open/review a folder). The
+  handlers still take the
   OpenAI-style `ToolCall` shape; the AI SDK tools in `buildAgentTools` are thin
   adapters over them, so testing the handlers directly still exercises the real
   run-resilience behaviour. Add new tests here when you touch these functions.
@@ -102,14 +115,16 @@
     (limits + diminishing-returns notes), `state` (`FileSet`, `AgentRunContext`,
     `AgentRunState`, `createRunState`, `recordTouched`), `tool-runtime`
     (safeJson/retries/`parseToolArgs`), `tools` (`buildAgentTools`),
-    `handlers/{search,open,review}` (the tested tool handlers), and `run`
+    `handlers/{search,open,review,list-folder}` (the tested tool handlers), and `run`
     (`runDriveAgent`, decomposed into `resolveRunModels`/`selectDriveIds`/
     `buildRunContext`/`runMainModelLoop`/`forceSynthesis`/`finalizeRun`).
   - `lib/drive/` (was `lib/drive.ts`): `types`, `query`
     (`buildDriveSearchQuery`/`escapeDriveQuery`), `client` (token refresh +
     `googleFetch` + metadata/download/export), `extract` (pdf/pptx/xlsx/docx text),
-    `content` (`resolveFileContent`/`emptyExtractionNote` + the `MAX_FILE_CHARS`
-    cap), `search` (`searchDriveFiles`), `open` (`openDriveFile`).
+    `content` (`resolveFileContent`/`emptyExtractionNote`/`folderRedirectContent` +
+    the `MAX_FILE_CHARS` cap), `search` (`searchDriveFiles`), `folder`
+    (`buildFolderChildrenQuery`/`listDriveFolder` — direct-children listing for
+    folder navigation, see "Folder navigation" below), `open` (`openDriveFile`).
   - `lib/model-settings/` (was `lib/model-settings.ts`): `constants`
     (enums + coercion), `types` (summaries/effective/inputs + parsers), `env`
     (`envSettings`), `resolve` (`resolveRoleSettings` + summary/SSRF helpers),
@@ -183,6 +198,55 @@
   `evaluateTokenBudget` (in `prepareStep`) hard-winds-down past
   `hardProgressTokenLimit`. The note fires on both `search_drive` and `review_file`
   results.
+
+## Folder navigation
+
+  Full design rationale + trade-offs (and the deferred curated-folder-relevance
+  discussion we plan to revisit): `docs/folder-navigation.md`. The summary:
+
+  Folders surface in `search_drive` results (a folder's *name* matches `name
+  contains`, see "Drive search recall"), and the model naturally tries to open
+  them. A folder has no extractable text, so reading one is a dead-end — the value
+  is *navigating into it*.
+
+  The `list_folder` tool (offered in every mode, in `buildAgentTools`) lists a
+  folder's **direct children** via `listDriveFolder` →
+  `buildFolderChildrenQuery` (`'<id>' in parents and trashed = false`), returning
+  them in the same `{ files }` shape as a `search_drive` result. So children flow
+  through the shared touched-set / dedupe / diminishing-returns machinery
+  (`handleListFolderTool` mirrors `handleSearchTool`: new children are useful
+  progress only in non-curated modes). Listing is one level only — the model
+  drills deeper by calling `list_folder` on a child subfolder. An empty result
+  (empty folder *or* a non-folder id — a folder has no children either way)
+  attaches a note steering the model back to search. `list_folder` stays active
+  during the search backstop (`stopSearchingReason`) alongside the read tool —
+  it's cheap discovery — but drops on a full wind-down.
+
+  Redirect (the read tools): if the model still calls `open_file`/`review_file` on
+  a folder, the handler detects the folder mimeType *after* `openDriveFile`
+  returns (`openDriveFile` itself returns `folderRedirectContent` for a folder, so
+  no download/export happens) and returns a `list_folder` redirect observation
+  instead of content/a verdict. Crucially the `review_file` redirect lands BEFORE
+  `gradeFile`, so **the grader never sees a folder** (it would otherwise waste a
+  model call grading the redirect string); the summarizer never sees one either
+  (a folder's content is a tiny string, never oversize, and only `open_file` wires
+  the summarizer). A folder is recorded in the *touched* audit set but is never
+  collected into `opened`/`reviewed`/`kept` and never cited — it is navigation,
+  not a result.
+
+  Folders are **expand-only**: a folder is never a curated result. The relevant
+  *files inside* it become results via the normal per-file examiner grade (the
+  model lists the folder, then reviews the promising children). This keeps the
+  examiner the single relevance authority and preserves recall, at the cost of the
+  model having to expand a folder rather than the folder being graded as a unit.
+
+  Deferred (huge folders): for a folder too large to fully expand we would judge
+  it by **names only** (folder name + child file names — one list call, no content
+  reads) and aggregate child relevance by **density/count, never the mean** (a
+  mean drops a "Personal" folder hiding the one wanted file). Even then a folder
+  stays navigation and is never kept. Not built yet — `list_folder` is
+  direct-children-only and the model's existing title-based triage picks which
+  children to review.
 
 ## Entity conflation: subject anchoring
 

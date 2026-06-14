@@ -124,6 +124,7 @@ export type AgentRunState = {
   searchCallCount: number;
   openFileCallCount: number;
   reviewFileCallCount: number;
+  listFolderCallCount: number;
   /**
    * Cumulative tokens across every model call in the run — the main loop (folded
    * in by `onStepFinish`) and the isolated examiner (folded in by the `gradeFile`
@@ -177,6 +178,7 @@ export function createRunState(): AgentRunState {
     searchCallCount: 0,
     openFileCallCount: 0,
     reviewFileCallCount: 0,
+    listFolderCallCount: 0,
     tokensSpent: 0,
     tokensAtLastProgress: 0,
     lastInputTokens: 0,

@@ -6,6 +6,7 @@ import {
   MAX_FILE_CHARS,
   MIN_SUMMARY_CHARS,
   buildDriveSearchQuery,
+  buildFolderChildrenQuery,
   emptyExtractionNote,
   escapeDriveQuery,
   resolveFileContent,
@@ -102,6 +103,20 @@ describe("buildDriveSearchQuery", () => {
     expect(q).toContain("name contains 't0'");
     expect(q).toContain("name contains 't11'");
     expect(q).not.toContain("name contains 't12'");
+  });
+});
+
+describe("buildFolderChildrenQuery", () => {
+  it("filters by parent and trashed-state", () => {
+    expect(buildFolderChildrenQuery("folder123")).toBe(
+      "'folder123' in parents and trashed = false"
+    );
+  });
+
+  it("escapes the folder id defensively (quotes cannot terminate the query)", () => {
+    // A real folder id never contains a quote, but the builder must still escape
+    // it so a crafted/edge id cannot break out of the `q` string.
+    expect(buildFolderChildrenQuery("a'b")).toBe("'a\\'b' in parents and trashed = false");
   });
 });
 

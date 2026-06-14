@@ -220,7 +220,12 @@ function runMainModelLoop(params: {
       evaluateTokenBudget(state, budget);
       if (state.windDownReason) return { activeTools: [] };
       if (state.stopSearchingReason) {
-        return { activeTools: listMode ? ["review_file"] : ["open_file"] };
+        // Drop search_drive but keep the read tool AND list_folder: the search
+        // backstop stops unbounded *searching*, while folder navigation is cheap
+        // discovery that lets the model finish exploring what it already found.
+        return {
+          activeTools: listMode ? ["review_file", "list_folder"] : ["open_file", "list_folder"]
+        };
       }
       return undefined;
     },
@@ -318,6 +323,7 @@ async function finalizeRun(params: {
     searchCallCount: state.searchCallCount,
     openFileCallCount: state.openFileCallCount,
     reviewFileCallCount: state.reviewFileCallCount,
+    listFolderCallCount: state.listFolderCallCount,
     touchedFileCount: state.touched.size,
     keptFileCount: state.kept.size,
     reviewedFileCount: state.reviewed.size,

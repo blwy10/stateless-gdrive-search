@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Benjamin Lau
 // SPDX-License-Identifier: MIT
 
-import { openDriveFile, type DriveFile } from "@/lib/drive";
+import { GOOGLE_DRIVE_FOLDER_MIME_TYPE, openDriveFile, type DriveFile } from "@/lib/drive";
 import { debugError, debugText, hashForDebug, writeDebugLog } from "@/lib/debug-log";
 import { isCuratingRequest, reviewArgs, type ToolCall, type ToolResultMessage } from "../types";
 import { recordTouched, type AgentRunContext, type AgentRunState } from "../state";
@@ -116,6 +116,35 @@ export async function handleReviewFileTool(
       toolCall.id,
       `Could not open this file to review it: ${errorText(error)}. It may be inaccessible; continue with the other files.`
     );
+  }
+
+  // A folder has no readable content to grade — redirect to list_folder and
+  // return BEFORE the examiner runs, so gradeFile never sees a folder and no
+  // keep/discard decision is made for it (folders are navigation, never a
+  // result). Recorded in the touched audit set, but not collected into
+  // `reviewed` (it was never graded) and no reviewing/examining event is emitted.
+  if (opened.file.mimeType === GOOGLE_DRIVE_FOLDER_MIME_TYPE) {
+    await writeDebugLog({
+      event: "agent.tool.review_file.folder_redirect",
+      requestId,
+      step,
+      durationMs: Date.now() - toolStartedAt,
+      fileKeyHash: hashForDebug(fileKey(opened.file)),
+      reviewFileCallCount: state.reviewFileCallCount
+    });
+    state.knownFileKeys.add(fileKey(opened.file));
+    await emit({ type: "progress", message: `Found ${formatFileProgressLabel(opened.file)}` });
+    await recordTouched(state, opened.file, emit);
+    return {
+      role: "tool",
+      tool_call_id: toolCall.id,
+      content: safeJson({
+        isFolder: true,
+        connectionId: opened.file.connectionId,
+        fileId: opened.file.id,
+        message: `"${opened.file.name}" is a folder, not a readable file. Call list_folder with this connectionId and fileId to list the files inside it, then review the ones you need.`
+      })
+    };
   }
 
   const openedKey = fileKey(opened.file);

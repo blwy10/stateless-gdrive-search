@@ -34,7 +34,7 @@ export type ToolCall = {
   id: string;
   type: "function";
   function: {
-    name: "search_drive" | "open_file" | "review_file";
+    name: "search_drive" | "open_file" | "review_file" | "list_folder";
     arguments: string;
   };
 };
@@ -159,6 +159,12 @@ export const openArgs = z.object({
 export const reviewArgs = z.object({
   connectionId: z.string().min(1),
   fileId: z.string().min(1)
+});
+
+export const listFolderArgs = z.object({
+  connectionId: z.string().min(1),
+  fileId: z.string().min(1),
+  limit: z.number().int().min(1).max(200).optional()
 });
 
 export function isCuratingRequest(input: AgentRequest) {

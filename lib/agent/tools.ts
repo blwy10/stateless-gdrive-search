@@ -7,6 +7,7 @@ import type { AgentRunContext, AgentRunState } from "./state";
 import { handleSearchTool } from "./handlers/search";
 import { handleOpenFileTool } from "./handlers/open";
 import { handleReviewFileTool } from "./handlers/review";
+import { handleListFolderTool } from "./handlers/list-folder";
 
 /** Shared JSON schema for the connectionId/fileId pair open_file and review_file take. */
 const ID_ARGS_SCHEMA = {
@@ -18,6 +19,26 @@ const ID_ARGS_SCHEMA = {
   required: ["connectionId", "fileId"],
   additionalProperties: false
 };
+
+/** JSON schema for list_folder: the connectionId/fileId pair plus an optional cap. */
+const LIST_FOLDER_ARGS_SCHEMA = {
+  type: "object",
+  properties: {
+    connectionId: { type: "string" },
+    fileId: { type: "string" },
+    limit: { type: "number", description: "Maximum children to list, up to 200." }
+  },
+  required: ["connectionId", "fileId"],
+  additionalProperties: false
+};
+
+/**
+ * Shared description for the list_folder tool (offered in every mode). Folders
+ * carry no readable text, so they are navigation: list the direct children, then
+ * open/review the relevant ones.
+ */
+const LIST_FOLDER_DESCRIPTION =
+  "List the files and subfolders directly inside a Google Drive folder (a result whose mimeType is application/vnd.google-apps.folder). Use this to look inside a folder, then open or review the files it returns. Returns only the folder's direct children — call list_folder again on a subfolder to go deeper. Copy connectionId and fileId verbatim from a single search_drive or list_folder result — never invent, guess, or modify an id. connectionId must be one of the selected Drive connection IDs.";
 
 /**
  * Model-facing schema for a tool whose validation is deferred to its handler.
@@ -91,23 +112,30 @@ export function buildAgentTools(context: AgentRunContext, state: AgentRunState):
       runToolHandler(handleSearchTool, context, state, "search_drive", toolCallId, input)
   });
 
+  const listFolder = tool({
+    description: LIST_FOLDER_DESCRIPTION,
+    inputSchema: looseToolSchema(LIST_FOLDER_ARGS_SCHEMA),
+    execute: (input, { toolCallId }) =>
+      runToolHandler(handleListFolderTool, context, state, "list_folder", toolCallId, input)
+  });
+
   if (context.input.mode === "list") {
     const reviewFile = tool({
       description:
-        "Open a file from a search_drive result, read it in isolation, and report whether it is relevant to the query plus any notable names, projects, or terms worth searching for next. In curated mode relevant files are kept automatically and irrelevant ones dropped; in uncurated mode every match is returned regardless, so use this mainly to discover related search terms. Copy connectionId and fileId verbatim from a single search_drive result — never invent, guess, or modify an id, and never pair the connectionId of one file with the fileId of another. connectionId must be one of the selected Drive connection IDs.",
+        "Open a file from a search_drive or list_folder result, read it in isolation, and report whether it is relevant to the query plus any notable names, projects, or terms worth searching for next. In curated mode relevant files are kept automatically and irrelevant ones dropped; in uncurated mode every match is returned regardless, so use this mainly to discover related search terms. Folders cannot be reviewed — use list_folder to look inside one. Copy connectionId and fileId verbatim from a single search_drive or list_folder result — never invent, guess, or modify an id, and never pair the connectionId of one file with the fileId of another. connectionId must be one of the selected Drive connection IDs.",
       inputSchema: looseToolSchema(ID_ARGS_SCHEMA),
       execute: (input, { toolCallId }) =>
         runToolHandler(handleReviewFileTool, context, state, "review_file", toolCallId, input)
     });
-    return { search_drive: searchDrive, review_file: reviewFile };
+    return { search_drive: searchDrive, review_file: reviewFile, list_folder: listFolder };
   }
 
   const openFile = tool({
     description:
-      "Open and read a file returned by search_drive. Copy connectionId and fileId verbatim from a single search_drive result — never invent, guess, or modify an id, and never pair the connectionId of one file with the fileId of another. connectionId must be one of the selected Drive connection IDs.",
+      "Open and read a file returned by search_drive or list_folder. Folders cannot be opened — use list_folder to look inside one. Copy connectionId and fileId verbatim from a single search_drive or list_folder result — never invent, guess, or modify an id, and never pair the connectionId of one file with the fileId of another. connectionId must be one of the selected Drive connection IDs.",
     inputSchema: looseToolSchema(ID_ARGS_SCHEMA),
     execute: (input, { toolCallId }) =>
       runToolHandler(handleOpenFileTool, context, state, "open_file", toolCallId, input)
   });
-  return { search_drive: searchDrive, open_file: openFile };
+  return { search_drive: searchDrive, open_file: openFile, list_folder: listFolder };
 }

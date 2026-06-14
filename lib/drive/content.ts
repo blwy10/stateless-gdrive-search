@@ -66,6 +66,18 @@ export async function resolveFileContent(args: {
   return { content: truncateToMaxChars(normalized), disposition: "truncated" };
 }
 
+/**
+ * Content returned when a read targets a folder. A folder has no extractable
+ * text, so instead of the generic "unsupported type" note we point the model at
+ * list_folder. The agent handlers also detect the folder mimeType and return a
+ * structured redirect before this string is used (so review_file never grades a
+ * folder); this is the fallback that keeps openDriveFile's contract intact.
+ */
+export function folderRedirectContent(file: Omit<DriveFile, "connectionId" | "driveEmail">) {
+  const linkText = file.webViewLink ? ` Open it in Drive: ${file.webViewLink}` : "";
+  return `"${file.name}" is a Google Drive folder, not a readable file. Use the list_folder tool with this connectionId and fileId to list the files inside it, then open or review the ones you need.${linkText}`;
+}
+
 function googleAppsTypeName(mimeType: string) {
   return mimeType.replace("application/vnd.google-apps.", "Google ");
 }
