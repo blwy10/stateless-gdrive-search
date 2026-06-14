@@ -14,11 +14,29 @@
   `parseSources`/`resolveSources` (the synthesis citation parser + resolver — see
   "File display: results vs touched" below), `resolveRoleSettings`
   (the per-role main/grader model resolver in `lib/model-settings.ts`, covered by
-  `test/model-settings.test.ts`),
+  `test/model-settings.test.ts`) and `coerceReasoningEffort` (the
+  reasoning-effort normaliser for STORED values — trims/lower-cases to one of
+  `none|minimal|low|medium|high`, else defaults to `"none"` = the explicit
+  provider default; never null; same file/test — see "Reasoning effort" below),
+  the per-provider wiring of which is asserted in
+  `test/model-provider.test.ts` (`resolveModel`: openai's `reasoningEffort`,
+  openai-compatible's name-independent `openaiCompatible.reasoningEffort`, and
+  Anthropic's effort→thinking-budget mapping with temperature dropped + max-tokens
+  bumped),
   `normalizeGradeVerdict` (the examiner's verdict normaliser — trims and caps the
   `reason`, supplies a default sentence when the model omits one, and normalises
   the `entities` list: trim, drop blanks, dedupe case-insensitively, cap to
-  `MAX_GRADE_ENTITIES`), and
+  `MAX_GRADE_ENTITIES`),
+  `describeSubjectIdentity` (the subject/identity anchor — formats `Name <email>`
+  per *selected* connection, deduped case-insensitively, email-only when the
+  drive name is missing, null when nothing is selected/resolvable) and
+  `systemPrompt` (asserts the entity-conflation guard renders *without
+  over-correcting*: the owner identity + the "authorship/mention ≠ aboutness"
+  caution appear in every mode, the universal anti-conflation rule appears in
+  synthesis while owner-profiling stays *gated* on a person-specific request — the
+  prompt must NOT say "attribute facts only to the subject" — and the whole block
+  is omitted when no owner is resolvable — see "Entity conflation: subject
+  anchoring" below), and
   the debug-log gating helpers (`debugText`/`isDebugLogEnabled`/
   `isDebugContentLogEnabled`/`isDebugTranscriptLogEnabled`, which force all debug
   logging — metadata, content previews, and the full transcript dump — off when
@@ -103,19 +121,63 @@
   `hardProgressTokenLimit`. The note fires on both `search_drive` and `review_file`
   results.
 
+## Entity conflation: subject anchoring
+
+  A self-referential query ("synthesize my career") never names *who* the subject
+  is, so the agent used to infer identity from filenames and could bleed a second
+  person's identity into the answer. The classic trap: a recommendation letter the
+  owner *wrote for a friend* — its filename carries the owner's name (the author),
+  its body is about the friend — which is genuinely career-relevant, so neither the
+  retriever nor the relevance examiner filters it out, and synthesis then merged
+  the friend's name in as an alias (the real "Yen" incident). Relevance ≠
+  aboutness, so a relevance filter alone cannot catch this.
+
+  Guard (prompt-level): `describeSubjectIdentity(connections, selectedDriveIds)`
+  (in `lib/agent.ts`) builds a `Name <email>` identity from the *selected*
+  connections' `driveName`/`driveEmail` and `runDriveAgent` threads it into every
+  prompt via `systemPrompt` → `basePrompt`/`synthesisSystemPrompt`. Crucially the
+  system prompt is query-INDEPENDENT (it depends only on `mode`/`curateList`; the
+  query is a separate user message), so the wording must stay neutral or it
+  over-corrects *topical* queries that aren't about a person at all. So `basePrompt`
+  states the owner identity as a *fact* and binds only first-person words
+  ("my"/"me"/"I") to it (inert when none appear), plus the universally-true caution
+  that a file may be authored-by / addressed-to / merely-mention a person without
+  being *about* them (a title name is often the author/recipient, not the topic).
+  `synthesisSystemPrompt` adds a universal correctness rule (attribute each fact to
+  the correct person; never merge two people or alias one to another unless a source
+  says they're the same) and GATES the build-a-profile-of-the-owner behavior on
+  "when the request is specifically about a person" — so "summarize the finance
+  deck" is NOT forced to be about the owner. The first draft ("the subject of the
+  request is the owner" + "attribute facts only to the subject") was exactly that
+  over-correction and was removed; `test/agent.test.ts` locks this in (asserts the
+  prompt does NOT contain "Attribute facts only to the subject" and DOES gate on a
+  person-specific request). When no identity resolves the whole block is omitted.
+  The resolved identity is content/PII, so `agent.connections.selected` logs it only
+  through `debugText` (gated, production-off). This is prompt-only — it reduces but
+  does not *guarantee* prevention; the structural fix (a subject-aware examiner
+  verdict, e.g. an `about_subject` vs `about_other_person` field) is a deliberate
+  follow-up, not yet implemented.
+
 ## LLM layer (Vercel AI SDK)
 
   The agent runs on the Vercel AI SDK (`ai` v6). `lib/model-provider.ts`
   (`resolveModel`) maps `EffectiveModelSettings` to a concrete `LanguageModel`,
-  per-provider `providerOptions`, and a temperature:
+  per-provider `providerOptions`, a temperature, and a `maxOutputTokens` (see the
+  Anthropic note). The role's `reasoningEffort` (when set; `null` omits it) is
+  threaded into each provider's native shape — see "Reasoning effort" below:
   - `openai` → `createOpenAI().responses(model)`; stateless reasoning round-trip
     (`store: false` + `include: ["reasoning.encrypted_content"]` + `reasoningSummary`),
     so chain-of-thought is carried across steps without OpenAI retaining the convo.
-  - `anthropic` → `createAnthropic().languageModel(model)`; extended thinking is
-    opt-in via `ANTHROPIC_THINKING_BUDGET_TOKENS` (≥ 1024), which also drops the
-    temperature (thinking forces temp 1) and only works on thinking-capable models.
+    Effort → `reasoningEffort`.
+  - `anthropic` → `createAnthropic().languageModel(model)`; no `reasoning_effort`
+    param, so effort maps to an extended-thinking budget via
+    `reasoningEffortToAnthropicBudget` (`minimal`→1024 … `high`→16384; `none` → 0 =
+    thinking OFF, the safe default since thinking only works on thinking-capable
+    models and forces temp 1). When on, the temperature is dropped and
+    `maxOutputTokens` is set to `budget + 8192` (the API needs `max_tokens > budget`).
   - `openai-compatible` → `createOpenAICompatible().chatModel(model)` (Fireworks/
-    vLLM/custom; `baseUrl` required).
+    vLLM/custom; `baseUrl` required). Effort → `reasoning_effort` via the
+    name-independent `openaiCompatible` provider-options key.
   All providers share an SSRF-safe `fetch` wrapper that bounds each request with a
   60s timeout, refuses redirects, and — for user-supplied ("custom") endpoints —
   pins the connection to public IPs via `ssrfSafeDispatcher`. The operator default
@@ -299,6 +361,95 @@
   config columns are now nullable and parallel `grader_*` columns hold the grader
   override; the role-scoped DELETE clears one role and drops the row once neither
   role is set.
+
+## Reasoning effort
+
+  Each role (main + grader) carries a `reasoningEffort`
+  (`none|minimal|low|medium|high`; `"none"` is the EXPLICIT provider default — the
+  option is omitted — never an implicit "unset") on `EffectiveModelSettings`,
+  always set (never null), applied per-provider by `resolveModel` (see "LLM
+  layer"). The env vars `AI_REASONING_EFFORT` / `GRADER_AI_REASONING_EFFORT` are
+  REQUIRED and strictly validated — `requireReasoningEffortEnv` throws at startup
+  on an unrecognized value (env config is explicit; see "Environment variables").
+  Stored per-user overrides instead use the lenient `coerceReasoningEffort` (a
+  legacy/stray DB value degrades to `"none"`, since it comes from our own
+  enum-constrained UI). Per-user overrides live in the nullable `reasoning_effort`
+  / `grader_reasoning_effort` columns (plaintext — not a secret) and flow through
+  the same settings API/UI as the other model fields.
+  Design rule: effort is an *attribute* of a role's override, not an override on
+  its own — a role only counts as "custom" when its `model` + api key are both
+  stored (`resolveRoleSettings`), so effort rides along with a custom model;
+  a role left on its env default takes effort from its env var. Lowering the
+  grader's effort is the cheapest cost lever for the high-volume examiner. The
+  resolved effort is in the `agent.started` log (a coarse enum, not PII, so logged
+  plainly). It applies to all three model calls — the main loop, `forceSynthesis`,
+  and the examiner's `generateObject` (the grader is the dominant token cost in
+  list modes, so its effort matters most).
+
+  Per-provider mapping (`resolveModel` in `lib/model-provider.ts`). The OpenAI and
+  OpenAI-compatible providers take the effort string verbatim; Anthropic has no
+  `reasoning_effort` on the path we use, so the level maps to an extended-thinking
+  *integer* token budget (and, when on, drops temperature — the API forces it to 1
+  — and sets `maxOutputTokens = budget + 8192`, since the API requires
+  `max_tokens > budget_tokens`):
+
+  | Our setting | openai `reasoningEffort` | openai-compatible `reasoning_effort` | anthropic `thinking.budgetTokens` | anthropic `maxOutputTokens` |
+  | --- | --- | --- | --- | --- |
+  | `minimal` | `"minimal"` | `"minimal"` | `1024` | `9216` |
+  | `low` | `"low"` | `"low"` | `2048` | `10240` |
+  | `medium` | `"medium"` | `"medium"` | `8192` | `16384` |
+  | `high` | `"high"` | `"high"` | `16384` | `24576` |
+  | `none` | *omitted* | *omitted* | thinking off (`0`) | *omitted* |
+
+  CRITICAL DESIGN DECISION — Anthropic: integer thinking-budget, NOT the native
+  `effort` enum. The Anthropic Messages API exposes two *different* reasoning
+  controls (both visible in `@ai-sdk/anthropic`'s `anthropicLanguageModelOptions`):
+  (1) `thinking.budgetTokens` — an integer budget (floor 1024, counts against
+  `max_tokens`), supported across thinking-capable models 3.7 → 4.x; and (2) a
+  newer `effort` enum (`low|medium|high|xhigh|max`, default `high`) available only
+  on the newest models (Opus 4.5+). We deliberately map onto the **integer budget**
+  because: it works on the broad set of thinking-capable models (the enum would
+  fail on older ones); our `minimal` level has no native-enum equivalent (the enum
+  starts at `low`, and adds `xhigh`/`max` we don't expose); and the integer makes
+  the `max_tokens > budget` interplay explicit. Trade-off: the budget numbers are a
+  moderate, hand-tuned judgment call (see `reasoningEffortToAnthropicBudget`), not
+  Anthropic's own calibration. Revisit (switch to native `effort`, or hybrid:
+  `effort` on new models + budget fallback on old) IF the deployment standardises
+  on Opus 4.5+ OR we want Anthropic-calibrated levels rather than our budgets.
+
+## Environment variables: explicit, no silent defaults
+
+  PROJECT RULE: env config must be explicit. A var that selects model/provider
+  *behaviour* is `required(...)` in `lib/env.ts` (throws at startup when unset) —
+  never `process.env.X || "<default>"`. Rationale: a silent default (e.g. a model
+  name) lets you think you configured one thing while the app quietly runs another;
+  failing loudly at startup removes that whole class of confusion. Reasoning effort
+  follows the same spirit with an explicit `"none"` value (= provider default)
+  instead of relying on "unset".
+
+  Required (throw if unset): `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`,
+  `DATABASE_URL`, `TOKEN_ENCRYPTION_KEY`, `NEXTAUTH_URL`, `AI_API_KEY`,
+  `AI_PROVIDER`, `AI_MODEL`, `AI_REASONING_EFFORT`, `GRADER_AI_API_KEY`,
+  `GRADER_AI_PROVIDER`, `GRADER_AI_MODEL`, `GRADER_AI_REASONING_EFFORT`.
+  (`NEXTAUTH_SECRET` is also required, enforced by next-auth itself, not `env.ts`.)
+
+  Allowed exceptions — genuinely optional, where "unset" is a true no-op (a feature
+  off / not applicable), NOT a behaviour-picking default: `AI_BASE_URL` /
+  `GRADER_AI_BASE_URL` (only meaningful for `openai-compatible`; native providers
+  have no endpoint), `DATABASE_SSL` (no TLS when unset), the `DEBUG_*` flags (off,
+  and force-off in production), and the `AGENT_*` rate-limit knobs (operational
+  safety caps with sane values). `NODE_ENV` is set by the platform, not us.
+
+  When adding a new env var — MANDATORY: do NOT decide compulsory-vs-optional on
+  your own. ASK THE MAINTAINER, per variable, whether it should be compulsory
+  (`required(...)`) or optional, before wiring it up. Ask one explicit question for
+  each new var (don't batch a "they're all required, right?" assumption) and record
+  the decision here in the Required / Allowed-exceptions lists above. This applies
+  to every newly introduced env var, no exceptions. The earlier guidance still
+  frames the choice — prefer `required(...)`; "optional" is only for a genuine
+  no-op when unset; and if a behaviour needs a default, use an explicit sentinel
+  the operator must choose (as reasoning effort does with `"none"`) rather than a
+  silent `|| "default"` — but the maintainer makes the call.
 
 ## Railway MCP: pin the project/environment first
 

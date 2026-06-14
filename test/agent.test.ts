@@ -3,6 +3,7 @@
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  describeSubjectIdentity,
   handleOpenFileTool,
   handleReviewFileTool,
   handleSearchTool,
@@ -11,6 +12,7 @@ import {
   parseSources,
   resolveSources,
   resolveUsageTokens,
+  systemPrompt,
   type AgentProgress,
   type AgentRunContext,
   type AgentRunState,
@@ -18,6 +20,7 @@ import {
 } from "@/lib/agent";
 import { openDriveFile, searchDriveFiles } from "@/lib/drive";
 import type { DriveFile } from "@/lib/drive";
+import type { DriveConnectionSummary } from "@/lib/drive-connections";
 
 vi.mock("@/lib/drive", () => ({
   openDriveFile: vi.fn(),
@@ -773,5 +776,105 @@ describe("handleSearchTool", () => {
     const payload = JSON.parse(result.content) as { files?: unknown[]; note?: string };
     expect(payload.files).toHaveLength(0);
     expect(payload.note).toContain("matched no files");
+  });
+});
+
+function conn(id: string, driveName: string | null, driveEmail: string): DriveConnectionSummary {
+  return {
+    id,
+    driveEmail,
+    driveName,
+    expiresAt: null,
+    scope: "https://www.googleapis.com/auth/drive.readonly",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z"
+  };
+}
+
+describe("describeSubjectIdentity", () => {
+  it("formats Name <email> for selected connections only", () => {
+    const connections = [
+      conn("c1", "Benjamin Lau", "ben@example.com"),
+      conn("c2", "Someone Else", "else@example.com")
+    ];
+    expect(describeSubjectIdentity(connections, ["c1"])).toBe("Benjamin Lau <ben@example.com>");
+  });
+
+  it("dedupes the same owner reached via multiple connections", () => {
+    const connections = [
+      conn("c1", "Benjamin Lau", "ben@example.com"),
+      conn("c2", "Benjamin Lau", "ben@example.com")
+    ];
+    expect(describeSubjectIdentity(connections, ["c1", "c2"])).toBe(
+      "Benjamin Lau <ben@example.com>"
+    );
+  });
+
+  it("joins distinct selected owners", () => {
+    const connections = [
+      conn("c1", "Benjamin Lau", "ben@example.com"),
+      conn("c2", "Ben Work", "ben@work.com")
+    ];
+    expect(describeSubjectIdentity(connections, ["c1", "c2"])).toBe(
+      "Benjamin Lau <ben@example.com>, Ben Work <ben@work.com>"
+    );
+  });
+
+  it("falls back to the email when the drive name is missing", () => {
+    expect(describeSubjectIdentity([conn("c1", null, "ben@example.com")], ["c1"])).toBe(
+      "ben@example.com"
+    );
+  });
+
+  it("returns null when nothing is selected or resolvable", () => {
+    expect(describeSubjectIdentity([conn("c1", "Ben", "ben@example.com")], [])).toBeNull();
+  });
+});
+
+describe("systemPrompt subject anchoring", () => {
+  const synthesisPrompt = (subject: string | null) =>
+    systemPrompt(
+      { query: "synthesize my career", mode: "synthesis", driveIds: ["c1"], curateList: false },
+      ["c1"],
+      subject
+    );
+
+  it("embeds the owner identity and the entity-conflation guards in synthesis", () => {
+    const prompt = synthesisPrompt("Benjamin Lau <ben@example.com>");
+    expect(prompt).toContain("Benjamin Lau <ben@example.com>");
+    // owner stated as a fact + "authorship/mention != aboutness" (basePrompt)
+    expect(prompt).toContain("The owner of the connected Drive(s) is");
+    expect(prompt).toContain("often identifies the author or recipient, not the topic");
+    // universal anti-conflation rule (synthesis)
+    expect(prompt).toContain("keep distinct people distinct");
+    expect(prompt).toContain("never present one person's name as an alias of another");
+  });
+
+  it("does not over-correct generic queries (owner-profiling is gated, not forced)", () => {
+    // The system prompt is byte-identical for every synthesis query, so it must
+    // not unconditionally force the answer to be about the owner. The build-a-
+    // profile behavior is gated on the request actually being about a person.
+    const prompt = synthesisPrompt("Benjamin Lau <ben@example.com>");
+    expect(prompt).not.toContain("Attribute facts only to the subject");
+    expect(prompt).not.toContain("The subject of the user's request is the owner");
+    expect(prompt).toContain("Attribute every fact to the correct person");
+    expect(prompt).toContain("When the request is specifically about a person");
+  });
+
+  it("omits the owner anchor entirely when no identity is resolvable", () => {
+    const prompt = synthesisPrompt(null);
+    expect(prompt).not.toContain("The owner of the connected Drive(s) is");
+    expect(prompt).not.toContain("keep distinct people distinct");
+    expect(prompt).not.toContain("Attribute every fact to the correct person");
+  });
+
+  it("states the owner identity in list mode too", () => {
+    const prompt = systemPrompt(
+      { query: "find my docs", mode: "list", driveIds: ["c1"], curateList: true },
+      ["c1"],
+      "Benjamin Lau <ben@example.com>"
+    );
+    expect(prompt).toContain("The owner of the connected Drive(s) is");
+    expect(prompt).toContain("Benjamin Lau <ben@example.com>");
   });
 });

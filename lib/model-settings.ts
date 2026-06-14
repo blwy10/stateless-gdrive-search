@@ -21,6 +21,21 @@ export const MODEL_ROLES = ["main", "grader"] as const;
 export type ModelRole = (typeof MODEL_ROLES)[number];
 
 /**
+ * Reasoning-effort levels accepted for either role. `"none"` is the EXPLICIT
+ * "use the provider default" value — the option is omitted entirely (and for
+ * Anthropic, extended thinking stays off). There is intentionally no implicit
+ * "unset means default": the env vars are required (see "Environment variables"
+ * in AGENTS.md), so an operator must choose `none` on purpose rather than relying
+ * on a silent fallback. `minimal|low|medium|high` is the widely-supported active
+ * set (covers OpenAI and Fireworks gpt-oss); provider-specific extras like
+ * "xhigh" are deliberately not offered. Maps to OpenAI's `reasoningEffort` /
+ * OpenAI-compatible `reasoning_effort` directly, and to an Anthropic thinking
+ * budget by lib/model-provider.
+ */
+export const REASONING_EFFORTS = ["none", "minimal", "low", "medium", "high"] as const;
+export type ReasoningEffort = (typeof REASONING_EFFORTS)[number];
+
+/**
  * Coerce a stored/env provider string to a known {@link ModelProvider},
  * defaulting to "openai" for anything unset or unrecognized. DB rows carry a
  * NOT NULL default, so this mainly guards the operator-supplied AI_PROVIDER env.
@@ -31,12 +46,46 @@ export function coerceModelProvider(value: string | null | undefined): ModelProv
     : "openai";
 }
 
+/**
+ * Coerce a stored reasoning-effort string to a known {@link ReasoningEffort},
+ * defaulting to `"none"` (provider default) for anything unset, blank, or
+ * unrecognized. Trims and lower-cases first so a legacy DB value still resolves.
+ * This is the LENIENT path for STORED data (DB columns written by our own,
+ * enum-constrained UI, plus legacy null rows) — a stray value degrades to the
+ * provider default rather than breaking a run. The env vars take the strict path
+ * instead ({@link requireReasoningEffortEnv}), failing loudly on a typo.
+ */
+export function coerceReasoningEffort(value: string | null | undefined): ReasoningEffort {
+  const normalized = value?.trim().toLowerCase() ?? "";
+  return (REASONING_EFFORTS as readonly string[]).includes(normalized)
+    ? (normalized as ReasoningEffort)
+    : "none";
+}
+
+/**
+ * Strictly parse a REQUIRED reasoning-effort env var: the value must already be
+ * present (callers read it via `env`'s `required(...)`) and must be one of
+ * {@link REASONING_EFFORTS}. An unrecognized value throws rather than silently
+ * coercing — env config is explicit by design, so a typo should fail at startup,
+ * not quietly run at the provider default. (`none` is a valid, explicit choice.)
+ */
+function requireReasoningEffortEnv(rawValue: string, varName: string): ReasoningEffort {
+  const normalized = rawValue.trim().toLowerCase();
+  if (!(REASONING_EFFORTS as readonly string[]).includes(normalized)) {
+    throw new Error(
+      `Invalid ${varName}="${rawValue}". Must be one of: ${REASONING_EFFORTS.join(", ")}`
+    );
+  }
+  return normalized as ReasoningEffort;
+}
+
 export type RoleSettingsSummary = {
   hasCustomModel: boolean;
   apiKeyConfigured: boolean;
   provider: ModelProvider | null;
   baseUrl: string | null;
   model: string | null;
+  reasoningEffort: ReasoningEffort | null;
   updatedAt: string | null;
 };
 
@@ -54,6 +103,12 @@ export type EffectiveModelSettings = {
    */
   baseUrl: string | null;
   model: string;
+  /**
+   * Reasoning effort for this role. Always set (never null) — `"none"` is the
+   * explicit "provider default" value. Applied per-provider by
+   * lib/model-provider's resolveModel.
+   */
+  reasoningEffort: ReasoningEffort;
   source: "default" | "custom";
 };
 
@@ -68,7 +123,10 @@ const RoleSettingsInput = z
     provider: z.enum(MODEL_PROVIDERS).optional().default("openai-compatible"),
     apiKey: z.string().trim().min(1).max(4096).optional(),
     baseUrl: z.string().trim().min(1).max(2048).optional(),
-    model: z.string().trim().min(1).max(200)
+    model: z.string().trim().min(1).max(200),
+    // The UI always sends one of REASONING_EFFORTS ("none" = provider default);
+    // optional only so a partial API save can omit it (then stored as "none").
+    reasoningEffort: z.enum(REASONING_EFFORTS).optional()
   })
   // Native providers use their official endpoint, but an OpenAI-compatible
   // endpoint has no default, so its URL is mandatory.
@@ -97,10 +155,12 @@ type ModelSettingsRow = {
   base_url: string | null;
   model: string | null;
   provider: string | null;
+  reasoning_effort: string | null;
   grader_api_key_ciphertext: string | null;
   grader_base_url: string | null;
   grader_model: string | null;
   grader_provider: string | null;
+  grader_reasoning_effort: string | null;
   updated_at: Date;
 };
 
@@ -110,6 +170,7 @@ type RoleColumns = {
   baseUrl: string | null;
   model: string | null;
   provider: string | null;
+  reasoningEffort: string | null;
 };
 
 export function parseModelSettingsInput(value: unknown) {
@@ -126,7 +187,8 @@ function mainColumns(row: ModelSettingsRow | null): RoleColumns {
     apiKeyCiphertext: row?.api_key_ciphertext ?? null,
     baseUrl: row?.base_url ?? null,
     model: row?.model ?? null,
-    provider: row?.provider ?? null
+    provider: row?.provider ?? null,
+    reasoningEffort: row?.reasoning_effort ?? null
   };
 }
 
@@ -135,7 +197,8 @@ function graderColumns(row: ModelSettingsRow | null): RoleColumns {
     apiKeyCiphertext: row?.grader_api_key_ciphertext ?? null,
     baseUrl: row?.grader_base_url ?? null,
     model: row?.grader_model ?? null,
-    provider: row?.grader_provider ?? null
+    provider: row?.grader_provider ?? null,
+    reasoningEffort: row?.grader_reasoning_effort ?? null
   };
 }
 
@@ -146,6 +209,10 @@ function envSettings(role: ModelRole): EffectiveModelSettings {
       apiKey: env.graderAiApiKey(),
       baseUrl: env.graderAiBaseUrl(),
       model: env.graderAiModel(),
+      reasoningEffort: requireReasoningEffortEnv(
+        env.graderAiReasoningEffort(),
+        "GRADER_AI_REASONING_EFFORT"
+      ),
       source: "default"
     };
   }
@@ -154,6 +221,7 @@ function envSettings(role: ModelRole): EffectiveModelSettings {
     apiKey: env.aiApiKey(),
     baseUrl: env.aiBaseUrl(),
     model: env.aiModel(),
+    reasoningEffort: requireReasoningEffortEnv(env.aiReasoningEffort(), "AI_REASONING_EFFORT"),
     source: "default"
   };
 }
@@ -167,7 +235,13 @@ function envSettings(role: ModelRole): EffectiveModelSettings {
  * baseUrl validation for custom rows is applied separately by the async caller.
  */
 export function resolveRoleSettings(
-  columns: { apiKey: string | null; baseUrl: string | null; model: string | null; provider: string | null },
+  columns: {
+    apiKey: string | null;
+    baseUrl: string | null;
+    model: string | null;
+    provider: string | null;
+    reasoningEffort: string | null;
+  },
   envDefault: EffectiveModelSettings
 ): EffectiveModelSettings {
   if (!columns.model || !columns.apiKey) {
@@ -178,6 +252,7 @@ export function resolveRoleSettings(
     apiKey: columns.apiKey,
     baseUrl: columns.baseUrl,
     model: columns.model,
+    reasoningEffort: coerceReasoningEffort(columns.reasoningEffort),
     source: "custom"
   };
 }
@@ -200,6 +275,7 @@ function emptyRoleSummary(): RoleSettingsSummary {
     provider: null,
     baseUrl: null,
     model: null,
+    reasoningEffort: null,
     updatedAt: null
   };
 }
@@ -214,6 +290,7 @@ function roleSummary(columns: RoleColumns, updatedAt: string): RoleSettingsSumma
     provider: coerceModelProvider(columns.provider),
     baseUrl: columns.baseUrl,
     model: columns.model,
+    reasoningEffort: coerceReasoningEffort(columns.reasoningEffort),
     updatedAt
   };
 }
@@ -244,7 +321,8 @@ export async function getEffectiveModelSettings(
     apiKey: columns.apiKeyCiphertext ? decryptSecret(columns.apiKeyCiphertext) : null,
     baseUrl: columns.baseUrl,
     model: columns.model,
-    provider: columns.provider
+    provider: columns.provider,
+    reasoningEffort: columns.reasoningEffort
   });
 
   const main = resolveRoleSettings(decrypt(mainColumns(row)), envMain);
@@ -273,7 +351,14 @@ async function resolveRoleUpsert(
   if (!apiKeyCiphertext) {
     throw new Error("API key is required before custom model settings can be saved");
   }
-  return { apiKeyCiphertext, baseUrl, model: input.model, provider: input.provider };
+  return {
+    apiKeyCiphertext,
+    baseUrl,
+    model: input.model,
+    provider: input.provider,
+    // Store an explicit value; "none" is the provider-default sentinel.
+    reasoningEffort: input.reasoningEffort ?? "none"
+  };
 }
 
 export async function upsertModelSettings(ownerSub: string, input: ModelSettingsInput) {
@@ -284,21 +369,23 @@ export async function upsertModelSettings(ownerSub: string, input: ModelSettings
   await getPool().query(
     `insert into user_model_settings (
        owner_sub,
-       api_key_ciphertext, base_url, model, provider,
-       grader_api_key_ciphertext, grader_base_url, grader_model, grader_provider,
+       api_key_ciphertext, base_url, model, provider, reasoning_effort,
+       grader_api_key_ciphertext, grader_base_url, grader_model, grader_provider, grader_reasoning_effort,
        updated_at
      )
-     values ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
+     values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now())
      on conflict (owner_sub)
      do update set
        api_key_ciphertext = excluded.api_key_ciphertext,
        base_url = excluded.base_url,
        model = excluded.model,
        provider = excluded.provider,
+       reasoning_effort = excluded.reasoning_effort,
        grader_api_key_ciphertext = excluded.grader_api_key_ciphertext,
        grader_base_url = excluded.grader_base_url,
        grader_model = excluded.grader_model,
        grader_provider = excluded.grader_provider,
+       grader_reasoning_effort = excluded.grader_reasoning_effort,
        updated_at = now()`,
     [
       ownerSub,
@@ -306,10 +393,12 @@ export async function upsertModelSettings(ownerSub: string, input: ModelSettings
       main.baseUrl,
       main.model,
       main.provider,
+      main.reasoningEffort,
       grader.apiKeyCiphertext,
       grader.baseUrl,
       grader.model,
-      grader.provider
+      grader.provider,
+      grader.reasoningEffort
     ]
   );
 }
@@ -326,6 +415,7 @@ export async function deleteModelSettings(ownerSub: string, role: ModelRole | "a
              grader_base_url = null,
              grader_model = null,
              grader_provider = null,
+             grader_reasoning_effort = null,
              updated_at = now()
        where owner_sub = $1`,
       [ownerSub]
@@ -337,6 +427,7 @@ export async function deleteModelSettings(ownerSub: string, role: ModelRole | "a
              base_url = null,
              model = null,
              provider = null,
+             reasoning_effort = null,
              updated_at = now()
        where owner_sub = $1`,
       [ownerSub]
@@ -353,8 +444,8 @@ export async function deleteModelSettings(ownerSub: string, role: ModelRole | "a
 
 async function getModelSettingsRow(ownerSub: string): Promise<ModelSettingsRow | null> {
   const result = await getPool().query(
-    `select api_key_ciphertext, base_url, model, provider,
-            grader_api_key_ciphertext, grader_base_url, grader_model, grader_provider,
+    `select api_key_ciphertext, base_url, model, provider, reasoning_effort,
+            grader_api_key_ciphertext, grader_base_url, grader_model, grader_provider, grader_reasoning_effort,
             updated_at
      from user_model_settings
      where owner_sub = $1`,

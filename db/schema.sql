@@ -35,10 +35,12 @@ create table if not exists user_model_settings (
   base_url text,
   model text,
   provider text,
+  reasoning_effort text,
   grader_api_key_ciphertext text,
   grader_base_url text,
   grader_model text,
   grader_provider text,
+  grader_reasoning_effort text,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
@@ -77,3 +79,12 @@ alter table user_model_settings
 
 alter table user_model_settings
   add column if not exists grader_provider text;
+
+-- Per-role reasoning effort ("minimal" | "low" | "medium" | "high"). Nullable:
+-- when unset the role uses the provider default (the option is omitted). Not a
+-- secret, so stored in plaintext alongside model/provider/base_url.
+alter table user_model_settings
+  add column if not exists reasoning_effort text;
+
+alter table user_model_settings
+  add column if not exists grader_reasoning_effort text;

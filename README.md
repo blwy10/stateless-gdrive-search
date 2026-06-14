@@ -58,15 +58,29 @@ AI_PROVIDER=openai
 # AI_BASE_URL is optional: native providers (openai, anthropic) use their
 # official endpoint; openai-compatible requires it.
 AI_MODEL=gpt-4.1-mini
+# AI_REASONING_EFFORT is REQUIRED: "none" | "minimal" | "low" | "medium" | "high".
+# "none" = provider default (option omitted). OpenAI/openai-compatible get it as
+# reasoning_effort; Anthropic maps it to an extended-thinking budget ("none" =
+# thinking off). An unrecognized value fails at startup.
+AI_REASONING_EFFORT=none
 # Grader model (required). A separate, cheaper model used only to judge per-file
 # relevance; there is no fallback to the main model, so both must be set.
 GRADER_AI_API_KEY=...
 GRADER_AI_PROVIDER=openai
 # GRADER_AI_BASE_URL is optional (required for openai-compatible).
 GRADER_AI_MODEL=...
+# GRADER_AI_REASONING_EFFORT is REQUIRED (see AI_REASONING_EFFORT); lowering it
+# (e.g. "low") is often the cheapest cost lever for the high-volume grader.
+GRADER_AI_REASONING_EFFORT=none
 DEBUG_LOGS=0
 DEBUG_LOG_CONTENT=0
 ```
+
+> **Env vars are explicit — no silent defaults.** Every var above (except the
+> commented-out ones) is required and validated at startup; there are no in-code
+> fallback values for model/provider/reasoning-effort config. The only optional
+> vars are the `*_BASE_URL` endpoints, `DATABASE_SSL`, and the `DEBUG_*` / `AGENT_*`
+> knobs, where "unset" is a true no-op. See "Environment variables" in `AGENTS.md`.
 
 ### Model provider
 
@@ -77,12 +91,15 @@ Custom provider**:
 - `openai` — OpenAI's **Responses API**. Reasoning is requested statelessly
   (`store: false` with encrypted reasoning included) so chain-of-thought is
   round-tripped across tool steps without OpenAI retaining the conversation.
-- `anthropic` — Anthropic's Messages API. Extended thinking is off by default
+  Reasoning effort (unless `none`) is passed as `reasoningEffort`.
+- `anthropic` — Anthropic's Messages API. Extended thinking is off at `none`
   (it only applies to thinking-capable Claude models and forces `temperature`
-  to 1); enable it via `ANTHROPIC_THINKING_BUDGET_TOKENS` in `lib/model-provider.ts`.
+  to 1); any other level turns it on — mapped to an extended-thinking budget
+  (`minimal`→1024 … `high`→16384 tokens).
 - `openai-compatible` — any OpenAI-compatible endpoint (Fireworks, vLLM, …).
   `AI_BASE_URL` (or the per-user endpoint) is required here; reasoning is
-  surfaced automatically when the endpoint returns it.
+  surfaced automatically when the endpoint returns it. Reasoning effort (unless
+  `none`) is forwarded as `reasoning_effort`.
 
 Regardless of provider, reasoning is logged from one unified field and prior
 thinking is carried across turns by the SDK, so multi-turn tool calls keep their
@@ -92,9 +109,11 @@ IPs at connect time.
 The app uses **two independent models**. The **main** model runs the agent loop
 and writes the synthesis answer; the **grader** is a separate, cheaper model used
 only to judge per-file relevance, which has much lower requirements. Each role has
-its own provider, key, endpoint, and model: set the operator defaults via the
-`AI_*` (main) and `GRADER_AI_*` (grader) env vars — both are required, with no
-fallback between roles — and override them per-user and per-role in **Settings**.
+its own provider, key, endpoint, model, and reasoning effort: set the operator
+defaults via the `AI_*` (main) and `GRADER_AI_*` (grader) env vars — both are
+required, with no fallback between roles — and override them per-user and
+per-role in **Settings**. Reasoning effort travels with a role's custom override;
+a role left on its env default takes the effort from its env var.
 
 Optional per-user abuse protection on `/api/agent` (in-memory, keyed by the
 authenticated user). These have sensible defaults and only need to be set to

@@ -7,12 +7,15 @@ import { useEffect, useState } from "react";
 
 export type ModelProvider = "openai" | "anthropic" | "openai-compatible";
 
+export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high";
+
 export type RoleSettingsSummary = {
   hasCustomModel: boolean;
   apiKeyConfigured: boolean;
   provider: ModelProvider | null;
   baseUrl: string | null;
   model: string | null;
+  reasoningEffort: ReasoningEffort | null;
   updatedAt: string | null;
 };
 
@@ -45,6 +48,24 @@ const PROVIDER_LABELS: Record<ModelProvider, string> = {
   openai: "OpenAI",
   anthropic: "Anthropic",
   "openai-compatible": "OpenAI-compatible"
+};
+
+// "none" is the EXPLICIT "use the provider default" choice (no implicit unset).
+// These match REASONING_EFFORTS in lib/model-settings.
+const REASONING_EFFORT_OPTIONS: { value: ReasoningEffort; label: string }[] = [
+  { value: "none", label: "None (provider default)" },
+  { value: "minimal", label: "Minimal" },
+  { value: "low", label: "Low" },
+  { value: "medium", label: "Medium" },
+  { value: "high", label: "High" }
+];
+
+const REASONING_EFFORT_LABELS: Record<ReasoningEffort, string> = {
+  none: "None (provider default)",
+  minimal: "Minimal",
+  low: "Low",
+  medium: "Medium",
+  high: "High"
 };
 
 const ROLE_META: Record<ModelRole, { title: string; help: string }> = {
@@ -144,6 +165,10 @@ function RoleSettingsForm({
   const [provider, setProvider] = useState<ModelProvider>(() => summary?.provider ?? "openai");
   const [baseUrl, setBaseUrl] = useState(() => (hasCustomModel ? (summary?.baseUrl ?? "") : ""));
   const [model, setModel] = useState(() => (hasCustomModel ? (summary?.model ?? "") : ""));
+  // Always one of the levels; "none" is the explicit provider-default choice.
+  const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>(() =>
+    hasCustomModel ? (summary?.reasoningEffort ?? "none") : "none"
+  );
   const [apiKey, setApiKey] = useState("");
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
@@ -156,9 +181,17 @@ function RoleSettingsForm({
     setError("");
 
     try {
-      const roleBody: { provider: ModelProvider; model: string; baseUrl?: string; apiKey?: string } = {
+      const roleBody: {
+        provider: ModelProvider;
+        model: string;
+        baseUrl?: string;
+        apiKey?: string;
+        reasoningEffort: ReasoningEffort;
+      } = {
         provider,
-        model
+        model,
+        // Always sent explicitly ("none" = provider default).
+        reasoningEffort
       };
       // Native providers use their official endpoint; only send a base URL when
       // one was actually entered (required for openai-compatible).
@@ -184,6 +217,7 @@ function RoleSettingsForm({
       setProvider(updated.provider ?? "openai");
       setBaseUrl(updated.baseUrl ?? "");
       setModel(updated.model ?? "");
+      setReasoningEffort(updated.reasoningEffort ?? "none");
       setApiKey("");
       setMessage(`${meta.title} saved.`);
     } catch (caught) {
@@ -209,6 +243,7 @@ function RoleSettingsForm({
       setProvider("openai");
       setBaseUrl("");
       setModel("");
+      setReasoningEffort("none");
       setApiKey("");
       setMessage(`${meta.title} reset to default.`);
     } catch (caught) {
@@ -243,6 +278,14 @@ function RoleSettingsForm({
           <div>
             <dt>Model</dt>
             <dd>{summary?.model}</dd>
+          </div>
+          <div>
+            <dt>Reasoning effort</dt>
+            <dd>
+              {summary?.reasoningEffort
+                ? REASONING_EFFORT_LABELS[summary.reasoningEffort]
+                : "Provider default"}
+            </dd>
           </div>
           <div>
             <dt>API key</dt>
@@ -297,6 +340,26 @@ function RoleSettingsForm({
           onChange={(event) => setModel(event.target.value)}
           placeholder="gpt-4.1-mini"
         />
+      </div>
+
+      <div className="field">
+        <label htmlFor={`${role}-reasoning-effort`}>Reasoning effort</label>
+        <select
+          id={`${role}-reasoning-effort`}
+          value={reasoningEffort}
+          onChange={(event) => setReasoningEffort(event.target.value as ReasoningEffort)}
+        >
+          {REASONING_EFFORT_OPTIONS.map((option) => (
+            <option key={option.value} value={option.value}>
+              {option.label}
+            </option>
+          ))}
+        </select>
+        <p className="settings-help">
+          Higher effort spends more reasoning tokens. Anthropic maps this to an
+          extended-thinking budget; ignored by non-reasoning models. Choose
+          “None” to use the provider default.
+        </p>
       </div>
 
       <div className="field">

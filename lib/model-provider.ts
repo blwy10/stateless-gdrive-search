@@ -7,7 +7,7 @@ import { createOpenAI } from "@ai-sdk/openai";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import type { LanguageModel } from "ai";
 import type { ProviderOptions } from "@ai-sdk/provider-utils";
-import type { EffectiveModelSettings } from "@/lib/model-settings";
+import type { EffectiveModelSettings, ReasoningEffort } from "@/lib/model-settings";
 import { ssrfSafeDispatcher } from "@/lib/ssrf";
 
 /**
@@ -19,14 +19,53 @@ import { ssrfSafeDispatcher } from "@/lib/ssrf";
 const MODEL_REQUEST_TIMEOUT_MS = 60_000;
 
 /**
- * Anthropic extended-thinking budget in tokens. `0` disables thinking, the safe
- * default: extended thinking is only accepted by thinking-capable Claude models
- * (3.7 / 4+) and forces temperature to 1, so enabling it blindly would break
- * other models. Set this to >= 1024 when the configured model supports it; the
- * reasoning it then produces is logged and round-tripped through the same
- * unified path (`response.messages`) as every other provider.
+ * Anthropic API floor for an extended-thinking budget. Below this the API rejects
+ * the request, so it doubles as the "thinking off" threshold: a mapped budget of
+ * 0 (reasoning effort unset) stays under it and disables thinking entirely. That
+ * OFF default is deliberate — extended thinking is only accepted by
+ * thinking-capable Claude models (3.7 / 4+) and forces temperature to 1, so it
+ * must stay opt-in (set a reasoning effort to turn it on). The reasoning it then
+ * produces is logged and round-tripped through the same unified path
+ * (`response.messages`) as every other provider.
  */
-const ANTHROPIC_THINKING_BUDGET_TOKENS = 0;
+const ANTHROPIC_MIN_THINKING_BUDGET_TOKENS = 1024;
+
+/**
+ * Headroom added above the thinking budget for the visible answer: Anthropic
+ * requires `max_tokens > thinking.budget_tokens`, so we cap output at
+ * budget + this margin whenever thinking is enabled.
+ */
+const ANTHROPIC_ANSWER_TOKEN_MARGIN = 8192;
+
+/**
+ * Map our reasoning-effort levels onto an Anthropic extended-thinking *integer*
+ * token budget. `"none"` (the explicit provider default) returns 0, which keeps
+ * thinking OFF (see {@link ANTHROPIC_MIN_THINKING_BUDGET_TOKENS}).
+ *
+ * CRITICAL DESIGN DECISION (full rationale: AGENTS.md → "Reasoning effort"):
+ * Anthropic exposes two reasoning controls — `thinking.budgetTokens` (this integer
+ * budget, supported across thinking-capable models 3.7 → 4.x) and a newer `effort`
+ * enum (`low|medium|high|xhigh|max`, Opus 4.5+ only). We deliberately use the
+ * budget, NOT the native enum: it covers the broad model set (the enum 4xx's on
+ * older ones), our `minimal` has no native-enum equivalent, and the integer makes
+ * the `max_tokens > budget` interplay explicit. Trade-off: these numbers are a
+ * hand-tuned judgment call, not Anthropic's own calibration — revisit if the
+ * deployment standardises on Opus 4.5+ or wants Anthropic-calibrated levels.
+ */
+function reasoningEffortToAnthropicBudget(effort: ReasoningEffort): number {
+  switch (effort) {
+    case "minimal":
+      return 1024;
+    case "low":
+      return 2048;
+    case "medium":
+      return 8192;
+    case "high":
+      return 16384;
+    case "none":
+      return 0;
+  }
+}
 
 /** Low-variance default temperature for the research agent. */
 const DEFAULT_TEMPERATURE = 0.2;
@@ -76,20 +115,31 @@ export type ResolvedModel = {
    * (omitted for Anthropic when extended thinking is on, which forces temp 1).
    */
   temperature: number | undefined;
+  /**
+   * Max output tokens, or `undefined` to use the provider default. Set only for
+   * Anthropic when extended thinking is on, where the API requires
+   * `max_tokens > thinking.budget_tokens`.
+   */
+  maxOutputTokens: number | undefined;
 };
 
 /**
  * Map (default or custom) model settings onto a concrete AI SDK language model.
  * Centralizes provider selection, the SSRF-safe fetch, and per-provider
- * reasoning configuration so the agent loop stays provider-agnostic:
+ * reasoning configuration so the agent loop stays provider-agnostic. The
+ * role's `reasoningEffort` (when set) is threaded into each provider's native
+ * shape; `null` omits it and uses the provider default:
  *  - `openai`            -> Responses API, stateless (`store: false`) with
  *                          encrypted reasoning included so chain-of-thought
  *                          round-trips across tool steps without server-side
- *                          retention.
- *  - `anthropic`         -> Messages API; extended thinking is opt-in (see
- *                          {@link ANTHROPIC_THINKING_BUDGET_TOKENS}).
+ *                          retention. Effort -> `reasoningEffort`.
+ *  - `anthropic`         -> Messages API; no `reasoning_effort` param, so effort
+ *                          maps to an extended-thinking budget (off when `none`;
+ *                          see {@link reasoningEffortToAnthropicBudget}).
  *  - `openai-compatible` -> Fireworks / vLLM / custom; reasoning_content is
  *                          surfaced automatically by the provider when present.
+ *                          Effort -> `reasoning_effort` via the `openaiCompatible`
+ *                          provider-options key.
  */
 export function resolveModel(settings: EffectiveModelSettings): ResolvedModel {
   const fetchImpl = createModelFetch(settings.source === "custom");
@@ -100,16 +150,20 @@ export function resolveModel(settings: EffectiveModelSettings): ResolvedModel {
       ...(settings.baseUrl ? { baseURL: settings.baseUrl } : {}),
       fetch: fetchImpl
     });
-    const thinkingEnabled = ANTHROPIC_THINKING_BUDGET_TOKENS >= 1024;
+    const thinkingBudget = reasoningEffortToAnthropicBudget(settings.reasoningEffort);
+    const thinkingEnabled = thinkingBudget >= ANTHROPIC_MIN_THINKING_BUDGET_TOKENS;
     return {
       model: anthropic.languageModel(settings.model),
       providerOptions: thinkingEnabled
         ? {
             anthropic: {
-              thinking: { type: "enabled", budgetTokens: ANTHROPIC_THINKING_BUDGET_TOKENS }
+              thinking: { type: "enabled", budgetTokens: thinkingBudget }
             }
           }
         : {},
+      // The API requires max_tokens > thinking.budget_tokens; leave headroom for
+      // the answer. Omitted (provider default) when thinking is off.
+      maxOutputTokens: thinkingEnabled ? thinkingBudget + ANTHROPIC_ANSWER_TOKEN_MARGIN : undefined,
       temperature: thinkingEnabled ? undefined : DEFAULT_TEMPERATURE
     };
   }
@@ -126,7 +180,14 @@ export function resolveModel(settings: EffectiveModelSettings): ResolvedModel {
     });
     return {
       model: compatible.chatModel(settings.model),
-      providerOptions: {},
+      // The provider reads the name-independent `openaiCompatible` key and forwards
+      // `reasoningEffort` as `reasoning_effort` in the request body. Omitted on
+      // "none" so non-reasoning models (and the provider default) are unaffected.
+      providerOptions:
+        settings.reasoningEffort !== "none"
+          ? { openaiCompatible: { reasoningEffort: settings.reasoningEffort } }
+          : {},
+      maxOutputTokens: undefined,
       temperature: DEFAULT_TEMPERATURE
     };
   }
@@ -147,9 +208,15 @@ export function resolveModel(settings: EffectiveModelSettings): ResolvedModel {
         // All three are ignored by non-reasoning models (e.g. gpt-4.1-mini).
         store: false,
         include: ["reasoning.encrypted_content"],
-        reasoningSummary: "auto"
+        reasoningSummary: "auto",
+        // Effort is forwarded as-is; omitted on "none" so the model's own default
+        // applies (and so non-reasoning models are unaffected).
+        ...(settings.reasoningEffort !== "none"
+          ? { reasoningEffort: settings.reasoningEffort }
+          : {})
       }
     },
+    maxOutputTokens: undefined,
     temperature: DEFAULT_TEMPERATURE
   };
 }
