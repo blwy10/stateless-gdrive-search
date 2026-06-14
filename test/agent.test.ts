@@ -434,6 +434,36 @@ describe("handleOpenFileTool", () => {
     expect(runState.touched.list()).toHaveLength(0);
   });
 
+  it("does not retry a non-retryable Drive failure even when its message embeds a retryable-looking number", async () => {
+    // The enriched 403 message now carries Google's prose + reason code, which
+    // can contain a standalone number like "500". The retry classifier keys off
+    // the "status <N>" prefix (403 — not retryable), so open_file must run the
+    // underlying call exactly once and surface the reason to the model.
+    vi.mocked(openDriveFile).mockRejectedValue(
+      new Error("Google Drive request failed with status 403: limit is 500/day (cannotExportFile)")
+    );
+
+    const result = await handleOpenFileTool(makeContext(), makeState(), 0, openCall("call-403"));
+
+    expect(vi.mocked(openDriveFile)).toHaveBeenCalledTimes(1);
+    const payload = JSON.parse(result.content) as { error?: boolean; message?: string };
+    expect(payload.error).toBe(true);
+    expect(payload.message).toContain("cannotExportFile");
+  });
+
+  it("retries a retryable Drive failure up to the budget before surfacing an observation", async () => {
+    vi.mocked(openDriveFile).mockRejectedValue(
+      new Error("Google Drive request failed with status 503")
+    );
+
+    const result = await handleOpenFileTool(makeContext(), makeState(), 0, openCall("call-503"));
+
+    // maxToolRetries = 1 => one initial attempt + one retry = 2 underlying calls.
+    expect(vi.mocked(openDriveFile)).toHaveBeenCalledTimes(2);
+    const payload = JSON.parse(result.content) as { error?: boolean };
+    expect(payload.error).toBe(true);
+  });
+
   it("rejects an out-of-scope connectionId as an observation instead of throwing", async () => {
     const runState = makeState();
     const outOfScope = {

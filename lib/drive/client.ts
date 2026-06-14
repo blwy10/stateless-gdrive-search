@@ -15,6 +15,62 @@ import type { DriveDebugContext, DriveFile } from "./types";
  */
 const DRIVE_REQUEST_TIMEOUT_MS = 30_000;
 
+/**
+ * Caps for the fields pulled out of a Google Drive error body. `reason` is a
+ * short machine code (e.g. `cannotExportFile`); `message` is a human sentence we
+ * surface to the model. Both are bounded so a hostile or oversized body cannot
+ * bloat the thrown error (which `errorText` hands to the model verbatim) or the
+ * debug log.
+ */
+const MAX_DRIVE_ERROR_REASON_CHARS = 80;
+const MAX_DRIVE_ERROR_MESSAGE_CHARS = 300;
+
+/**
+ * Pull the machine `reason` and human `message` out of a Google Drive API error
+ * body. Drive returns a JSON envelope on failure:
+ *
+ *   { "error": { "code": 403, "message": "...",
+ *                "errors": [{ "reason": "cannotExportFile", "message": "..." }] } }
+ *
+ * The `reason` code (e.g. `cannotExportFile`, `notFound`,
+ * `insufficientFilePermissions`, `exportSizeLimitExceeded`) explains *why* the
+ * request failed. Threading it into the thrown error lets the agent tell the
+ * model a file is genuinely unreadable — so it stops retrying it and can note the
+ * gap in its answer — and lets `drive.google.failed` record the reason even when
+ * DEBUG_LOG_CONTENT is off (the raw body stays gated behind that flag).
+ *
+ * Defensive by design: the body may be empty, truncated, or HTML (gateway/proxy
+ * errors are not JSON), so anything non-conforming yields nulls and the caller
+ * falls back to the bare status.
+ */
+export function parseDriveApiError(body: string): {
+  reason: string | null;
+  message: string | null;
+} {
+  try {
+    const parsed = JSON.parse(body) as {
+      error?: { message?: unknown; errors?: Array<{ reason?: unknown } | null> | null };
+    };
+    const apiError = parsed?.error;
+    const rawMessage = typeof apiError?.message === "string" ? apiError.message.trim() : "";
+    let reason: string | null = null;
+    if (Array.isArray(apiError?.errors)) {
+      for (const entry of apiError.errors) {
+        if (entry && typeof entry.reason === "string" && entry.reason.trim()) {
+          reason = entry.reason.trim().slice(0, MAX_DRIVE_ERROR_REASON_CHARS);
+          break;
+        }
+      }
+    }
+    return {
+      reason,
+      message: rawMessage ? rawMessage.slice(0, MAX_DRIVE_ERROR_MESSAGE_CHARS) : null
+    };
+  } catch {
+    return { reason: null, message: null };
+  }
+}
+
 async function ensureAccessToken(
   connection: DriveConnection,
   requestId?: string
@@ -72,19 +128,32 @@ export async function googleFetch(connection: DriveConnection, url: URL, context
     });
     if (!response.ok) {
       const responseBody = await response.text();
+      const { reason, message } = parseDriveApiError(responseBody);
       await writeDebugLog({
         event: "drive.google.failed",
         level: "error",
         requestId: context.requestId,
         operation: context.operation,
         status: response.status,
+        // `reason` is a stable, non-sensitive Google error code, logged
+        // unconditionally so a 403 is diagnosable without DEBUG_LOG_CONTENT; the
+        // raw body (which may carry identifiers) stays gated in `response`.
+        reason,
         durationMs: Date.now() - startedAt,
         path: url.pathname,
         connectionIdHash: hashForDebug(connectionId),
         fileIdHash: context.fileId ? hashForDebug(context.fileId) : null,
         response: debugText(responseBody)
       });
-      throw new Error(`Google Drive request failed with status ${response.status}`);
+      // Append Google's own explanation so the model learns the failure is
+      // permanent (e.g. an export-disabled file) instead of seeing a bare status
+      // and pointlessly retrying. Keep the "status <N>" prefix verbatim — the
+      // retry classifier keys off it (see isRetryableToolError).
+      const detail = message ? `: ${message}` : "";
+      const reasonSuffix = reason ? ` (${reason})` : "";
+      throw new Error(
+        `Google Drive request failed with status ${response.status}${detail}${reasonSuffix}`
+      );
     }
     await writeDebugLog({
       event: "drive.google.completed",

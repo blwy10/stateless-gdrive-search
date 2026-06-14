@@ -12,7 +12,15 @@
   `escapeDriveQuery`, `buildDriveSearchQuery` (the Drive `q` builder — see "Drive
   search recall" below), `buildFolderChildrenQuery` (the `'<id>' in parents and
   trashed = false` child-listing query for folder navigation, escaped defensively
-  — see "Folder navigation" below), `emptyExtractionNote`, `resolveFileContent` (the
+  — see "Folder navigation" below), `parseDriveApiError` (the Google Drive
+  error-body parser in `lib/drive/client.ts` — pulls the machine `reason` code,
+  e.g. `cannotExportFile`, and the human `message` out of Drive's
+  `{ error: { message, errors: [{ reason }] } }` JSON envelope, both trimmed and
+  length-capped, returning nulls for an empty/non-JSON/non-envelope body so a
+  gateway HTML error degrades to the bare status; `googleFetch` folds these into
+  the thrown error so the model learns *why* a read failed and stops retrying, and
+  records `reason` in `drive.google.failed` even when DEBUG_LOG_CONTENT is off —
+  see "Inaccessible files" below), `emptyExtractionNote`, `resolveFileContent` (the
   per-file content-cap resolver in `lib/drive.ts` — full/empty/truncated/summarized
   disposition, with a fake summarizer hook; see "Oversize files" below),
   `parseFinalAnswer` (the synthesis answer parser: extracts/strips the
@@ -60,7 +68,12 @@
   `NODE_ENV=production`).
   `test/agent.test.ts` also covers the tool handlers directly:
   `handleOpenFileTool`'s failure path with a mocked `openDriveFile` (a tool
-  execution error must become a tool-result observation, never abort the run), its
+  execution error must become a tool-result observation, never abort the run; plus
+  the retry classifier `isRetryableToolError`, exercised through the handler's
+  call count: a non-retryable failure runs the underlying call once even when the
+  enriched Drive message embeds a retryable-looking number like "500" — the
+  classifier keys off the `status <N>` prefix, see "Inaccessible files" — while a
+  retryable `status 503` runs it twice under `maxToolRetries: 1`), its
   out-of-scope-connectionId path (a connectionId not in `selectedDriveIds` — usually
   the model hallucinating an id — is rejected as an observation without opening the
   file, never thrown), invalid tool arguments (malformed JSON or a schema violation,
@@ -120,7 +133,9 @@
     `buildRunContext`/`runMainModelLoop`/`forceSynthesis`/`finalizeRun`).
   - `lib/drive/` (was `lib/drive.ts`): `types`, `query`
     (`buildDriveSearchQuery`/`escapeDriveQuery`), `client` (token refresh +
-    `googleFetch` + metadata/download/export), `extract` (pdf/pptx/xlsx/docx text),
+    `googleFetch` + metadata/download/export + `parseDriveApiError`, which enriches
+    a failed request's thrown error/log with Google's `reason`/`message` — see
+    "Inaccessible files"), `extract` (pdf/pptx/xlsx/docx text),
     `content` (`resolveFileContent`/`emptyExtractionNote`/`folderRedirectContent` +
     the `MAX_FILE_CHARS` cap), `search` (`searchDriveFiles`), `folder`
     (`buildFolderChildrenQuery`/`listDriveFolder` — direct-children listing for
@@ -559,6 +574,38 @@
   fill the target. An over-short summary is flagged at `warn` level on
   `agent.summarize.completed` (`belowUsefulFloor` + `compressionRatio`). Like the
   grader, failures degrade safely (return null → truncation) and never throw.
+
+## Inaccessible files: surface Google's error reason
+
+  Some files return `200` on metadata but fail the content fetch. The canonical
+  case (seen in `.debug`): a Google Sheet whose owner has disabled
+  download/export (IRM/DLP) returns `403` on `/export` with
+  `{ error: { message: "This file cannot be exported by the user.",
+  errors: [{ reason: "cannotExportFile" }] } }`. It is NOT a size limit (the file
+  can be tiny) and NOT something the app can work around — Google blocks the bytes
+  server-side. Other permanent reasons in this family: `notFound`,
+  `insufficientFilePermissions`, `fileNotDownloadable`; `exportSizeLimitExceeded`
+  is the genuinely-too-large case.
+
+  `googleFetch` (in `lib/drive/client.ts`) used to throw a bare
+  `"Google Drive request failed with status 403"`, which (a) told the model
+  nothing — so it might pointlessly re-open the same file — and (b) hid the reason
+  unless DEBUG_LOG_CONTENT was on (the body is logged via `debugText`, so it's
+  `{length, hash}` when content logging is off). Now `parseDriveApiError` (tested,
+  see top) pulls the `reason` + `message` out of the body and `googleFetch`:
+  - throws `"...failed with status 403: This file cannot be exported by the user.
+    (cannotExportFile)"` — the message reaches the model via `errorText` so it
+    skips the file and can note the gap in its answer; and
+  - adds `reason` (a stable, non-sensitive code) to the `drive.google.failed` log
+    unconditionally, so 403s are diagnosable without DEBUG_LOG_CONTENT (the raw
+    body stays gated in `response`).
+
+  Retry interaction: `isRetryableToolError` (in `lib/agent/tool-runtime.ts`) keys
+  off the `status <N>` prefix, NOT any digits in the message — otherwise the
+  appended Google prose (which can contain a standalone `500`-like number) could
+  trigger a pointless retry of a hard `403`. Only `408/409/429/5xx` after
+  `status ` are retried. Both behaviours are covered in `test/agent.test.ts`
+  (handler call-count) and `test/drive.test.ts` (`parseDriveApiError`).
 
 ## Reasoning effort
 

@@ -14,6 +14,7 @@ export {
   type DriveFile,
   type OversizeSummarizer
 } from "./types";
+export { parseDriveApiError } from "./client";
 export { buildDriveSearchQuery, escapeDriveQuery } from "./query";
 export { buildFolderChildrenQuery, listDriveFolder } from "./folder";
 export { emptyExtractionNote, resolveFileContent } from "./content";

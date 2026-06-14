@@ -9,6 +9,7 @@ import {
   buildFolderChildrenQuery,
   emptyExtractionNote,
   escapeDriveQuery,
+  parseDriveApiError,
   resolveFileContent,
   type DriveFile
 } from "@/lib/drive";
@@ -230,5 +231,78 @@ describe("resolveFileContent", () => {
     });
     expect(hook).not.toHaveBeenCalled();
     expect(result.disposition).toBe("full");
+  });
+});
+
+describe("parseDriveApiError", () => {
+  it("extracts reason and message from a real Drive error envelope", () => {
+    // The exact 403 body observed in the .debug logs for an export-disabled file.
+    const body = JSON.stringify({
+      error: {
+        code: 403,
+        message: "This file cannot be exported by the user.",
+        errors: [
+          {
+            message: "This file cannot be exported by the user.",
+            domain: "global",
+            reason: "cannotExportFile"
+          }
+        ]
+      }
+    });
+    expect(parseDriveApiError(body)).toEqual({
+      reason: "cannotExportFile",
+      message: "This file cannot be exported by the user."
+    });
+  });
+
+  it("returns the first errors[] entry that carries a reason", () => {
+    const body = JSON.stringify({
+      error: {
+        message: "Not Found",
+        errors: [{ domain: "global" }, { reason: "notFound" }]
+      }
+    });
+    expect(parseDriveApiError(body).reason).toBe("notFound");
+  });
+
+  it("trims whitespace and caps reason/message length", () => {
+    const body = JSON.stringify({
+      error: {
+        message: `  ${"m".repeat(400)}  `,
+        errors: [{ reason: `  ${"r".repeat(120)}  ` }]
+      }
+    });
+    const result = parseDriveApiError(body);
+    expect(result.reason).toBe("r".repeat(80));
+    expect(result.message).toBe("m".repeat(300));
+  });
+
+  it("yields nulls when fields are missing or empty", () => {
+    expect(parseDriveApiError(JSON.stringify({ error: {} }))).toEqual({
+      reason: null,
+      message: null
+    });
+    expect(parseDriveApiError(JSON.stringify({ error: { errors: [{ reason: "  " }] } }))).toEqual({
+      reason: null,
+      message: null
+    });
+  });
+
+  it("yields nulls for a non-JSON body (gateway/HTML errors) without throwing", () => {
+    expect(parseDriveApiError("<html><body>502 Bad Gateway</body></html>")).toEqual({
+      reason: null,
+      message: null
+    });
+    expect(parseDriveApiError("")).toEqual({ reason: null, message: null });
+  });
+
+  it("yields nulls when the JSON is well-formed but not an error envelope", () => {
+    expect(parseDriveApiError(JSON.stringify({ files: [] }))).toEqual({
+      reason: null,
+      message: null
+    });
+    expect(parseDriveApiError("null")).toEqual({ reason: null, message: null });
+    expect(parseDriveApiError("[]")).toEqual({ reason: null, message: null });
   });
 });

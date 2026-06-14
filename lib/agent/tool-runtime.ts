@@ -12,7 +12,12 @@ export function safeJson(value: unknown) {
 
 function isRetryableToolError(error: unknown) {
   if (!(error instanceof Error)) return false;
-  return /\b(408|409|429|500|502|503|504)\b/.test(error.message);
+  // Key off the HTTP status in googleFetch's thrown message
+  // ("...failed with status <N>...") rather than any digits anywhere in it:
+  // Drive errors now append Google's human-readable text + reason code, which
+  // could otherwise contain a standalone retryable-looking number and cause us
+  // to pointlessly retry a hard failure (e.g. a 403 cannotExportFile).
+  return /\bstatus (408|409|429|500|502|503|504)\b/.test(error.message);
 }
 
 export async function withToolRetries<T>(
