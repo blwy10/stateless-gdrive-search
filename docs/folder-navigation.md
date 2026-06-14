@@ -6,8 +6,9 @@
 Status: **shipped (v1 = expand-only)**. This document records *why* the current
 design is what it is, the alternatives we weighed, and the sharp edges/deferred
 work — so the next iteration starts from the reasoning, not from scratch. The
-operational summary lives in `AGENTS.md` ("Folder navigation"); this is the
-rationale.
+operational summary is §2 ("What shipped") below; this document is the full
+rationale. Part of the [project documentation](./README.md); operating rules
+live in [`AGENTS.md`](../AGENTS.md).
 
 The two topics most likely to change on revisit are flagged inline with
 **[REVISIT]** and collected at the end.

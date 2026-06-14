@@ -92,7 +92,7 @@ DEBUG_LOG_CONTENT=0
 > commented-out ones) is required and validated at startup; there are no in-code
 > fallback values for model/provider/reasoning-effort config. The only optional
 > vars are the `*_BASE_URL` endpoints, `DATABASE_SSL`, and the `DEBUG_*` / `AGENT_*`
-> knobs, where "unset" is a true no-op. See "Environment variables" in `AGENTS.md`.
+> knobs, where "unset" is a true no-op. See [`docs/configuration.md`](docs/configuration.md) for the full policy.
 
 ### Model provider
 

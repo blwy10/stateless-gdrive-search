@@ -7,9 +7,9 @@ export type ModelProvider = (typeof MODEL_PROVIDERS)[number];
 /**
  * The three independent model roles. `main` runs the agent loop and writes the
  * synthesis answer; `grader` is a separate, cheaper model that only judges
- * per-file relevance (see gradeFileRelevance in lib/agent.ts); `summarizer` is a
+ * per-file relevance (see gradeFileRelevance in lib/agent/examiner.ts); `summarizer` is a
  * separate model that condenses an oversize file into the synthesis budget rather
- * than hard-truncating it (see summarizeOversizeContent in lib/agent.ts). Each
+ * than hard-truncating it (see summarizeOversizeContent in lib/agent/summarizer.ts). Each
  * role is configured independently at the env level (all required — there is no
  * fallback between roles) and may be overridden per-user independently.
  */
@@ -20,8 +20,8 @@ export type ModelRole = (typeof MODEL_ROLES)[number];
  * Reasoning-effort levels accepted for either role. `"none"` is the EXPLICIT
  * "use the provider default" value — the option is omitted entirely (and for
  * Anthropic, extended thinking stays off). There is intentionally no implicit
- * "unset means default": the env vars are required (see "Environment variables"
- * in AGENTS.md), so an operator must choose `none` on purpose rather than relying
+ * "unset means default": the env vars are required (see the env-var policy in
+ * docs/configuration.md), so an operator must choose `none` on purpose rather than relying
  * on a silent fallback. `minimal|low|medium|high` is the widely-supported active
  * set (covers OpenAI and Fireworks gpt-oss); provider-specific extras like
  * "xhigh" are deliberately not offered. Maps to OpenAI's `reasoningEffort` /

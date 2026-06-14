@@ -54,7 +54,7 @@ const ANTHROPIC_ANSWER_TOKEN_MARGIN = 8192;
  * token budget. `"none"` (the explicit provider default) returns 0, which keeps
  * thinking OFF (see {@link ANTHROPIC_MIN_THINKING_BUDGET_TOKENS}).
  *
- * CRITICAL DESIGN DECISION (full rationale: AGENTS.md → "Reasoning effort"):
+ * CRITICAL DESIGN DECISION (full rationale: docs/llm-and-agent-loop.md → "Reasoning effort"):
  * Anthropic exposes two reasoning controls — `thinking.budgetTokens` (this integer
  * budget, supported across thinking-capable models 3.7 → 4.x) and a newer `effort`
  * enum (`low|medium|high|xhigh|max`, Opus 4.5+ only). We deliberately use the

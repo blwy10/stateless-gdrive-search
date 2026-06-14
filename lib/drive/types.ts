@@ -38,7 +38,7 @@ export const MIN_SUMMARY_CHARS = MAX_FILE_CHARS / 4;
  * extracted text exceeds {@link MAX_FILE_CHARS} instead of hard-truncating it.
  * Receives the assembled {@link DriveFile} and the full (normalized) text and
  * returns a summary, or null to fall back to truncation (the hook owns its own
- * failure handling — see summarizeOversizeContent in lib/agent.ts). Kept as a
+ * failure handling — see summarizeOversizeContent in lib/agent/summarizer.ts). Kept as a
  * plain function so lib/drive stays free of any model/provider dependency and is
  * still usable (with truncation) by callers that pass no hook (tests, utils).
  */

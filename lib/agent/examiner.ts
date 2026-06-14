@@ -20,7 +20,7 @@ import { fileKey } from "./files";
  * Relevance is judged separately and is NOT gated on this — a file about a
  * different person can still be relevant (e.g. a recommendation letter the owner
  * wrote for a colleague). The field is auditable (logged) so the entity-conflation
- * risk is visible and can later gate curation/synthesis (see AGENTS.md).
+ * risk is visible and can later gate curation/synthesis (see docs/entity-conflation.md).
  */
 export const ABOUT_SUBJECT_VALUES = ["subject", "other_person", "not_person", "unknown"] as const;
 export type AboutSubject = (typeof ABOUT_SUBJECT_VALUES)[number];
