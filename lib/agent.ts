@@ -72,35 +72,61 @@ type ToolResultMessage = { role: "tool"; tool_call_id: string; content: string }
  * Per-run limits that bound how much work the agent may do before it must stop
  * and return a (possibly partial) answer. Defaults live in
  * {@link defaultAgentBudgets} and can be overridden via {@link resolveAgentBudget}.
+ *
+ * Philosophy (see the long design thread in git history): the *normal* stop is
+ * diminishing returns — we keep going while the run is still producing new useful
+ * results per token spent, and stop once it isn't ({@link softProgressTokenLimit}
+ * / {@link hardProgressTokenLimit}). Everything else here is a deterministic
+ * *backstop* — the seatbelt for degenerate cases (a provider that doesn't report
+ * token usage, a runaway examiner, an outright loop), never the thing that should
+ * normally bind. We measure spend in tokens because that's the resource we care
+ * about; searches and steps are bounded only as loop insurance.
  */
 export type AgentBudget = {
   /**
-   * Maximum number of model tool-use iterations (assistant turns that may issue
-   * tool calls). Once this many steps elapse without the agent finishing, tools
-   * are disabled and the model is given one final turn to return a result that
-   * respects the mode (e.g. synthesis still synthesizes rather than returning
-   * only the raw list of files read).
+   * Hard ceiling on model tool-use steps. A backstop only — it exists mainly
+   * because it's the one limiter that still works when a provider doesn't report
+   * token usage (so the token guards below can't fire). Set high so diminishing
+   * returns normally stops the run long before this binds.
    */
   maxToolSteps: number;
   /**
-   * Maximum total number of `search_drive` calls allowed across the run. Also
-   * communicated to the model in the system prompt; further searches are
-   * skipped once the limit is hit.
+   * Hard ceiling on `search_drive` calls. A backstop — searches are cheap (only
+   * a small result list enters context), so this is set high and the
+   * diminishing-returns guard normally stops searching first.
    */
   maxSearchCalls: number;
   /**
-   * Maximum total number of `open_file` calls allowed across the run. Also
-   * communicated to the model in the system prompt; further opens are skipped
-   * once the limit is hit.
+   * Cumulative-token cost seatbelt across ALL model calls in the run (the main
+   * loop *and* the isolated examiner). Last-resort wind-down if the run keeps
+   * spending without diminishing returns tripping (e.g. an examiner stuck
+   * marking everything useful). Set high so DR is the normal stop.
    */
-  maxOpenFileCalls: number;
+  maxTotalTokens: number;
   /**
-   * Maximum number of *consecutive* low-progress searches (a repeated query, or
-   * one that returns no new files) tolerated before the agent is instructed to
-   * stop searching. The counter resets to zero whenever a search surfaces new
-   * files.
+   * Per-call context-window health limit: when a single model call's input
+   * exceeds this many tokens, wind down. Mainly bites synthesis, which reads file
+   * content into the main context; list modes keep content out of context (the
+   * examiner reads it in isolation) so they rarely approach it. Set comfortably
+   * below the model's actual context window.
    */
-  maxLowProgressSearches: number;
+  maxContextInputTokens: number;
+  /**
+   * Diminishing-returns SOFT nudge: tokens spent since the result set last grew,
+   * after which a corrective note is attached to tool results telling the model
+   * returns are diminishing (wrap up unless it has a genuinely new angle). The
+   * clock resets whenever the run produces a new useful result. This is a prompt
+   * nudge, not enforcement — the model, which has the task context, decides.
+   */
+  softProgressTokenLimit: number;
+  /**
+   * Diminishing-returns HARD wind-down: tokens since the result set last grew
+   * after which tools are dropped and the model must finish. The deterministic
+   * floor under {@link softProgressTokenLimit}; set generously above it so the
+   * model gets a window to pivot (e.g. follow a newly-discovered search term)
+   * before this enforces.
+   */
+  hardProgressTokenLimit: number;
   /**
    * Number of *additional* retry attempts for a failed tool call, on top of the
    * initial attempt (e.g. `1` means up to two attempts total). Only retryable
@@ -147,21 +173,29 @@ function isCuratingRequest(input: AgentRequest) {
   return input.mode === "list" && input.curateList;
 }
 
+/**
+ * Default budget, applied uniformly across modes (see the design thread: we trust
+ * the model to explore widely and govern by diminishing returns, not per-mode
+ * caps). Numbers are deliberately generous starting points — instrument the
+ * `tokensSpent` / progress logs and tune the two `*ProgressTokenLimit`s from real
+ * runs rather than treating these as load-bearing constants. Rough sizing on an
+ * ~8k-token-per-file read: 32k soft ≈ ~4 unproductive examinations before a
+ * nudge, 80k hard ≈ ~10 before a forced wind-down; `maxContextInputTokens` 96k
+ * sits below a 128k window (lower it for smaller-window models).
+ */
+const UNIFORM_BUDGET: AgentBudget = {
+  maxToolSteps: 100,
+  maxSearchCalls: 50,
+  maxTotalTokens: 1_000_000,
+  maxContextInputTokens: 96_000,
+  softProgressTokenLimit: 32_000,
+  hardProgressTokenLimit: 80_000,
+  maxToolRetries: 1
+};
+
 export const defaultAgentBudgets: Record<AgentRequest["mode"], AgentBudget> = {
-  list: {
-    maxToolSteps: 20,
-    maxSearchCalls: 10,
-    maxOpenFileCalls: 15,
-    maxLowProgressSearches: 2,
-    maxToolRetries: 1
-  },
-  synthesis: {
-    maxToolSteps: 20,
-    maxSearchCalls: 10,
-    maxOpenFileCalls: 20,
-    maxLowProgressSearches: 2,
-    maxToolRetries: 1
-  }
+  list: UNIFORM_BUDGET,
+  synthesis: UNIFORM_BUDGET
 };
 
 export function resolveAgentBudget(
@@ -174,13 +208,10 @@ export function resolveAgentBudget(
   };
 }
 
-function basePrompt(allowedDriveIds: string[], budget: AgentBudget, curating = false) {
-  const toolList = curating
-    ? "You have exactly two tools: search_drive and review_file."
-    : "You have exactly two tools: search_drive and open_file.";
-  const readBudgetLine = curating
-    ? `Use at most ${budget.maxOpenFileCalls} review_file calls.`
-    : `Use at most ${budget.maxOpenFileCalls} open_file calls.`;
+function basePrompt(allowedDriveIds: string[], listMode = false) {
+  // List modes read files with the isolated examiner (review_file); synthesis
+  // reads them directly (open_file).
+  const examineTool = listMode ? "review_file" : "open_file";
   // Smaller models occasionally fabricate a connectionId — e.g. inventing a
   // second connection even when only one exists. Spell out that ids are opaque
   // values to be copied verbatim, and when there is a single connection pin it
@@ -191,24 +222,22 @@ function basePrompt(allowedDriveIds: string[], budget: AgentBudget, curating = f
       : `Every connectionId you pass must be exactly one of those IDs.`;
   return `You are a Google Drive research agent.
 
-${toolList}
+You have exactly two tools: search_drive and ${examineTool}.
 You may only work with these selected Drive connection IDs: ${allowedDriveIds.join(", ")}.
 Every connectionId and fileId you pass to a tool is an opaque identifier you must copy verbatim from a search_drive result — never invent, guess, modify, or take an id from a different file.
 ${idRule}
-Use at most ${budget.maxSearchCalls} search_drive calls.
-${readBudgetLine}
-Search using targeted query variants before deciding there is not enough evidence.
-Do not repeat equivalent searches.
-If searches stop producing new relevant files, answer with the evidence found.
+Search broadly with varied, targeted terms. When a file you read reveals a new name, project, product, person, or term, search for that too — it often surfaces relevant files a generic query misses.
+Do not repeat an identical search.
+There is no fixed limit on how many times you may search or ${examineTool}: keep going while you are still finding new useful files, and stop once you are not. If a tool result tells you returns are diminishing, wrap up unless you have a genuinely new angle.
 Never claim you searched outside Google Drive.
 Never ask for permissions or tokens.
 If evidence is weak, say that directly.`;
 }
 
-function synthesisSystemPrompt(allowedDriveIds: string[], budget: AgentBudget) {
-  return `${basePrompt(allowedDriveIds, budget)}
+function synthesisSystemPrompt(allowedDriveIds: string[]) {
+  return `${basePrompt(allowedDriveIds)}
 
-Open files when their titles or snippets appear relevant.
+Open files whose titles look relevant; what you read can suggest new searches.
 Return a concise synthesis answering the user's query, followed by the source files you relied on.
 Your final response must start with exactly one format line:
 FORMAT: markdown
@@ -221,38 +250,83 @@ Never return HTML or any format other than markdown or plain.`;
 
 function listSystemPrompt(
   allowedDriveIds: string[],
-  budget: AgentBudget,
   curateList: boolean
 ) {
   if (curateList) {
-    return `${basePrompt(allowedDriveIds, budget, true)}
+    return `${basePrompt(allowedDriveIds, true)}
 
 Find relevant files only. Do not synthesize an answer.
-For every file that looks promising from its title or snippet, call review_file with its connectionId and fileId.
-review_file opens the file, reads it, and judges its relevance for you: relevant files are kept in the results automatically and irrelevant ones are discarded. You do not judge relevance yourself, and there is no separate step to open or keep a file.
-Only files you review can be returned, and only the relevant ones are kept, so review every promising file.
-When you have reviewed the promising files, stop calling tools and reply with exactly:
+For every file that looks promising from its title, call review_file with its connectionId and fileId.
+review_file reads the file in isolation and judges its relevance for you: relevant files are kept in the results automatically and irrelevant ones are dropped. You do not judge relevance yourself, and there is no separate step to open or keep a file.
+review_file also reports notable names, projects, or terms found in the file — use those to search for related files you would not have found from the query alone.
+Only files you review can be kept, so review every promising file.
+When further searches and reviews stop turning up new relevant files, stop calling tools and reply with exactly:
 FORMAT: plain
 DONE`;
   }
 
-  return `${basePrompt(allowedDriveIds, budget)}
+  return `${basePrompt(allowedDriveIds, true)}
 
-Find relevant files only. Do not synthesize an answer.
-Open files when their titles or snippets appear relevant and opening is needed to judge relevance.
-When you are done, return exactly:
+Return the files that match the query. Do not synthesize an answer.
+Every file a search surfaces is included in the results automatically — you do not keep, mark, or judge files.
+Use review_file on promising files to read them and discover related names, projects, or terms, then search for those to widen coverage.
+When further searches stop surfacing new files, return exactly:
 FORMAT: plain
 FILE_LIST_COMPLETE`;
 }
 
-function systemPrompt(input: AgentRequest, allowedDriveIds: string[], budget: AgentBudget) {
+function systemPrompt(input: AgentRequest, allowedDriveIds: string[]) {
   return input.mode === "synthesis"
-    ? synthesisSystemPrompt(allowedDriveIds, budget)
-    : listSystemPrompt(allowedDriveIds, budget, input.curateList);
+    ? synthesisSystemPrompt(allowedDriveIds)
+    : listSystemPrompt(allowedDriveIds, input.curateList);
 }
 
 function safeJson(value: unknown) {
   return JSON.stringify(value, null, 2);
+}
+
+/** Rough chars-per-token for the estimate-only fallback (see {@link resolveUsageTokens}). */
+const CHARS_PER_TOKEN = 4;
+/**
+ * Calibration applied ONLY to the char-based estimate fallback, never to real
+ * provider usage. char/4 tends to under-count code/structured text; bump this if
+ * your no-usage endpoints consistently under-report. Default 1 (no adjustment).
+ */
+const TOKEN_ESTIMATE_MULTIPLIER = 1;
+
+/** Minimal structural view of the SDK's LanguageModelUsage we read. */
+type UsageLike =
+  | {
+      inputTokens?: number;
+      outputTokens?: number;
+      totalTokens?: number;
+      reasoningTokens?: number;
+    }
+  | undefined;
+
+function estimateTokensFromText(text: string) {
+  return Math.ceil((text.length / CHARS_PER_TOKEN) * TOKEN_ESTIMATE_MULTIPLIER);
+}
+
+/**
+ * Resolve one model call's token cost for the run-wide total that drives the
+ * diminishing-returns budget and cost seatbelt. Order of preference:
+ *  1. `totalTokens` — the provider's reported total. On every provider we use this
+ *     ALREADY includes reasoning/thinking tokens (they are billed as output), so
+ *     we never add `reasoningTokens` on top — that would double-count.
+ *  2. `inputTokens + outputTokens` — when only those are reported.
+ *  3. a char-based estimate of the visible text (`estimateText`) — only when a
+ *     provider reports no usage at all. Pass the assistant text AND reasoning text
+ *     so "thinking" is still counted (it isn't invisible to us — it's in
+ *     `reasoningText`). Only this path is scaled by TOKEN_ESTIMATE_MULTIPLIER.
+ * Returns 0 when there's neither usage nor text, leaving the step backstop as the
+ * floor (the documented no-usage-provider case).
+ */
+export function resolveUsageTokens(usage: UsageLike, estimateText = ""): number {
+  if (typeof usage?.totalTokens === "number") return usage.totalTokens;
+  const sum = (usage?.inputTokens ?? 0) + (usage?.outputTokens ?? 0);
+  if (sum > 0) return sum;
+  return estimateText ? estimateTokensFromText(estimateText) : 0;
 }
 
 /**
@@ -282,6 +356,14 @@ async function logModelStep(
     toolCallCount: step.toolCalls.length,
     responseContentLength: step.text.length,
     reasoningContentLength: reasoning?.length ?? 0,
+    // Raw usage breakdown (whatever the provider reported) so you can see per
+    // provider what's actually available and tune the budget. `totalTokens`
+    // already includes reasoning; `reasoningTokens` is a subset, logged for
+    // visibility only — never summed on top (see resolveUsageTokens).
+    inputTokens: step.usage?.inputTokens ?? null,
+    outputTokens: step.usage?.outputTokens ?? null,
+    totalTokens: step.usage?.totalTokens ?? null,
+    reasoningTokens: step.usage?.reasoningTokens ?? null,
     warningCount: step.warnings?.length ?? 0
   });
   if (isDebugTranscriptLogEnabled()) {
@@ -302,24 +384,37 @@ async function logModelStep(
 }
 
 /**
- * Verdict from grading one file against the query in curated list mode. The
- * `reason` is a short, auditable justification (surfaced in debug logs and the
- * review_file tool result), not shown to the end user.
+ * Verdict from examining one file against the query. `reason` is a short,
+ * auditable justification (surfaced in debug logs and the review_file tool
+ * result), not shown to the end user. `entities` are notable, specific terms the
+ * examiner found in the file (names, projects, products, people, codenames,
+ * jargon) that the agent can search for to find related files — the "berry
+ * picking" channel that lets discovery follow leads only knowable after reading,
+ * without ever pulling file content into the main loop's context.
  */
-export type GradeVerdict = { relevant: boolean; reason: string };
+export type GradeVerdict = { relevant: boolean; reason: string; entities: string[] };
 
 const MAX_GRADE_REASON_CHARS = 300;
+const MAX_GRADE_ENTITIES = 8;
+const MAX_GRADE_ENTITY_CHARS = 60;
 
-/** Structured verdict the curated grader is asked to produce. */
+/** Structured verdict the examiner is asked to produce. */
 const gradeSchema = z.object({
   relevant: z
     .boolean()
     .describe("True if the document would help answer or directly concerns the query."),
-  reason: z.string().optional().describe("One short sentence justifying the decision.")
+  reason: z.string().optional().describe("One short sentence justifying the decision."),
+  entities: z
+    .array(z.string())
+    .optional()
+    .describe(
+      "Up to a few notable, specific terms from the document (names, projects, products, people, codenames, domain jargon) worth searching for to find related files. Prefer distinctive terms over generic words; return an empty list if none stand out."
+    )
 });
 
-const GRADE_SYSTEM_PROMPT = `You decide whether a single document is relevant to a user's search query.
-Relevant means the document's content would help answer or directly concerns the query — sharing a keyword alone is not enough.`;
+const GRADE_SYSTEM_PROMPT = `You examine a single document for a research agent.
+Decide whether it is relevant to the user's search query — relevant means its content would help answer or directly concerns the query; sharing a keyword alone is not enough.
+Also extract a few notable, specific terms from the document (names, projects, products, people, codenames, or domain jargon) that could be used to search for related files. Prefer distinctive terms over generic ones; if none stand out, return an empty list.`;
 
 /**
  * Normalize the grader's structured output into a {@link GradeVerdict}: trim and
@@ -327,14 +422,32 @@ Relevant means the document's content would help answer or directly concerns the
  * pure (and exported) so the keep/discard + reason behaviour stays unit-testable
  * without exercising the model call.
  */
-export function normalizeGradeVerdict(object: { relevant: boolean; reason?: string | null }): GradeVerdict {
+export function normalizeGradeVerdict(object: {
+  relevant: boolean;
+  reason?: string | null;
+  entities?: (string | null)[] | null;
+}): GradeVerdict {
   const reason =
     typeof object.reason === "string" && object.reason.trim()
       ? object.reason.trim().slice(0, MAX_GRADE_REASON_CHARS)
       : object.relevant
         ? "Judged relevant."
         : "Judged not relevant.";
-  return { relevant: object.relevant, reason };
+  // Dedupe case-insensitively, trim/cap each term, and cap the count, so a noisy
+  // or oversized entity list can't bloat the berry-picking channel.
+  const seen = new Set<string>();
+  const entities: string[] = [];
+  for (const raw of object.entities ?? []) {
+    if (typeof raw !== "string") continue;
+    const trimmed = raw.trim().slice(0, MAX_GRADE_ENTITY_CHARS);
+    if (!trimmed) continue;
+    const key = trimmed.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    entities.push(trimmed);
+    if (entities.length >= MAX_GRADE_ENTITIES) break;
+  }
+  return { relevant: object.relevant, reason, entities };
 }
 
 /**
@@ -354,59 +467,80 @@ ${content}`;
 }
 
 /**
- * Grade one already-read file against the query using an isolated, single-shot
+ * Examine one already-read file against the query using an isolated, single-shot
  * structured model call (`generateObject`, no tools, its own minimal prompt).
- * The file's content never enters the main agent loop's context — only this
- * verdict does. On any failure — the request erroring out after retries, or
- * output that fails schema validation — we KEEP the file rather than abort or
- * drop it, so a transient grader problem degrades to extra recall instead of a
- * missing result. Logs under `agent.grade.*`, distinct from the main loop's
- * `agent.model.*`, tagged with the file it is judging.
+ * The file's content never enters the main agent loop's context — only the
+ * verdict (relevance + a few entities) does. On any failure — the request
+ * erroring out after retries, or output that fails schema validation — we KEEP
+ * the file rather than abort or drop it, so a transient examiner problem degrades
+ * to extra recall instead of a missing result. Logs under `agent.grade.*`,
+ * distinct from the main loop's `agent.model.*`, tagged with the file it judges.
+ *
+ * Returns the verdict together with the call's token usage so the caller can fold
+ * it into the run-wide token total that drives the diminishing-returns budget
+ * (the examiner is the dominant token cost in list modes, so it must be counted).
  */
 export async function gradeFileRelevance(
   resolved: ResolvedModel,
+  logSettings: { model: string; provider: ModelProvider },
   query: string,
   file: DriveFile,
   content: string,
   requestId: string,
   step: number
-): Promise<GradeVerdict> {
+): Promise<{ verdict: GradeVerdict; usageTokens: number }> {
   const fileKeyHash = hashForDebug(fileKey(file));
   try {
-    const { object } = await generateObject({
+    const { object, usage } = await generateObject({
       model: resolved.model,
       providerOptions: resolved.providerOptions,
       ...(resolved.temperature !== undefined ? { temperature: resolved.temperature } : {}),
       maxRetries: MODEL_REQUEST_MAX_RETRIES,
       schema: gradeSchema,
-      schemaName: "FileRelevance",
-      schemaDescription: "Whether a document is relevant to the user's search query.",
+      schemaName: "FileExamination",
+      schemaDescription:
+        "Whether a document is relevant to the query, plus notable terms to search next.",
       system: GRADE_SYSTEM_PROMPT,
       prompt: buildGradePrompt(query, file, content)
     });
-    const { relevant, reason } = normalizeGradeVerdict(object);
+    const verdict = normalizeGradeVerdict(object);
+    // Estimate basis when the provider reports no usage: the file content
+    // dominates the examiner's input (the prompt scaffolding is tiny), so it's a
+    // good proxy. Real usage is preferred via resolveUsageTokens.
+    const usageTokens = resolveUsageTokens(usage, `${content}${verdict.reason}`);
     await writeDebugLog({
       event: "agent.grade.completed",
       requestId,
       step,
+      model: logSettings.model,
+      provider: logSettings.provider,
       fileKeyHash,
-      relevant,
-      // The grader's justification is auditable (see GradeVerdict); surface it
+      relevant: verdict.relevant,
+      // The examiner's justification is auditable (see GradeVerdict); surface it
       // at the metadata tier (gated via debugText) so a keep/discard decision is
       // explained even without the full DEBUG_LOG_TRANSCRIPT dump.
-      reason: debugText(reason)
+      reason: debugText(verdict.reason),
+      entityCount: verdict.entities.length,
+      usageTokens,
+      totalTokens: usage?.totalTokens ?? null,
+      reasoningTokens: usage?.reasoningTokens ?? null
     });
-    return { relevant, reason };
+    return { verdict, usageTokens };
   } catch (error) {
     await writeDebugLog({
       event: "agent.grade.failed",
       level: "warn",
       requestId,
       step,
+      model: logSettings.model,
+      provider: logSettings.provider,
       fileKeyHash,
       error: debugError(error)
     });
-    return { relevant: true, reason: "Relevance check unavailable; kept by default." };
+    return {
+      verdict: { relevant: true, reason: "Relevance check unavailable; kept by default.", entities: [] },
+      usageTokens: 0
+    };
   }
 }
 
@@ -433,34 +567,88 @@ function normalizeSearchQuery(query: string) {
 }
 
 /**
- * Build a short corrective note to append to a `search_drive` observation when a
- * search made no progress, so the model gets an explicit signal instead of being
- * handed an identical (or empty) result list with no context.
- *
- * Without this, a model that re-runs the same query — or runs a different query
- * that surfaces nothing new — tends to read the unchanged list as confirmation
- * that nothing else exists and stops early, even though varying the terms would
- * find more (the failure seen in production: an identical query repeated twice,
- * then a one-file synthesis). The note nudges it to vary terms while still
- * permitting it to stop, so it complements the harder low-progress stop guard.
- *
- * Returns null when the search did make progress (new files were found), so a
- * productive search carries no note.
+ * Build a short corrective note for a `search_drive` observation in the two cases
+ * worth flagging even under the cheap-search philosophy: an *exact* repeat (pure
+ * token waste, zero chance of new information) and a query that matched *nothing*
+ * (the model should vary terms). Overlap with already-seen files is deliberately
+ * NOT flagged here — searches are cheap and an overlapping query is often the
+ * model triangulating toward a new angle; whether returns are diminishing is
+ * judged holistically by {@link diminishingReturnsNote} over tokens, not by any
+ * single search's novelty. Returns null otherwise.
  */
-function searchResultNote(
-  wasRepeatedQuery: boolean,
-  newResultCount: number,
-  totalResultCount: number
-): string | null {
+function searchResultNote(wasRepeatedQuery: boolean, totalResultCount: number): string | null {
   if (wasRepeatedQuery) {
-    return "This is the exact query you already ran, so these results are identical to before — do not run it again. To find more files, search with different terms: synonyms, a broader or narrower phrasing, or a single distinctive keyword. If you already have enough, stop searching and continue with the files found so far.";
+    return "This is the exact query you already ran — do not repeat it. To find more, search with different terms: a related name, project, or term you have learned, a synonym, or a single distinctive keyword. Otherwise finish with the files found so far.";
   }
-  if (newResultCount === 0) {
-    return totalResultCount === 0
-      ? "This query matched no files. Try different terms: synonyms, a broader phrasing, or a single distinctive keyword."
-      : "This query surfaced no files you had not already seen. Try different terms (synonyms, a broader phrasing, or a single distinctive keyword), or continue with the files found so far.";
+  if (totalResultCount === 0) {
+    return "This query matched no files. Try different terms: synonyms, a broader phrasing, or a single distinctive keyword.";
   }
   return null;
+}
+
+/**
+ * Tokens spent since the run last produced a new useful result (a kept file in
+ * curated mode, or a newly-surfaced/read file otherwise). This is the
+ * diminishing-returns signal, denominated in the resource we actually care about
+ * (tokens) rather than a step or call count.
+ */
+function tokensSinceProgress(state: AgentRunState) {
+  return state.tokensSpent - state.tokensAtLastProgress;
+}
+
+/**
+ * Mark that the run's result set just grew, resetting the diminishing-returns
+ * clock. Called wherever a new useful result is recorded so a productive run
+ * keeps going and only a genuine plateau in useful output trips the guard.
+ */
+function recordUsefulProgress(state: AgentRunState) {
+  state.tokensAtLastProgress = state.tokensSpent;
+}
+
+/**
+ * Diminishing-returns SOFT nudge, attached to tool results once
+ * {@link AgentBudget.softProgressTokenLimit} tokens have been spent without the
+ * result set growing. A prompt-time hint, not enforcement — it deliberately also
+ * tells the model it may stop, and explicitly preserves the berry-picking escape
+ * hatch (a genuinely new angle), so it nudges toward wrapping up without killing
+ * a productive pivot. The hard floor lives in {@link evaluateTokenBudget}.
+ */
+function diminishingReturnsNote(state: AgentRunState, budget: AgentBudget): string | null {
+  if (tokensSinceProgress(state) >= budget.softProgressTokenLimit) {
+    return "Returns are diminishing: recent work has not produced new useful results. Wrap up and answer with what you have, unless you have a genuinely new angle to search (e.g. a name, project, or term you just learned).";
+  }
+  return null;
+}
+
+/** Join a search-specific note with the diminishing-returns nudge, if either fires. */
+function combineNotes(...notes: (string | null)[]): string | null {
+  const joined = notes.filter((note): note is string => Boolean(note)).join(" ");
+  return joined || null;
+}
+
+/**
+ * Evaluate the token-based budget guards before a step and set the matching stop
+ * reason on `state`. Diminishing returns (tokens since the result set last grew)
+ * is the primary, normal stop; the cumulative-token seatbelt and per-call
+ * context-window limit are backstops. All three set `windDownReason` (drop every
+ * tool and finish) — they mean "stop spending", not "stop searching". The
+ * `stopSearchingReason` (search-call backstop) is set in the search handler
+ * instead, so a search plateau stops searching while still letting the model
+ * finish reading/examining what it already found.
+ */
+function evaluateTokenBudget(state: AgentRunState, budget: AgentBudget) {
+  if (state.windDownReason) return;
+  if (state.tokensSpent >= budget.maxTotalTokens) {
+    state.windDownReason = `Total-token seatbelt reached (${state.tokensSpent} tokens).`;
+    return;
+  }
+  if (state.lastInputTokens >= budget.maxContextInputTokens) {
+    state.windDownReason = `Context-window limit reached (${state.lastInputTokens} input tokens in one call).`;
+    return;
+  }
+  if (tokensSinceProgress(state) >= budget.hardProgressTokenLimit) {
+    state.windDownReason = `Diminishing returns: ${tokensSinceProgress(state)} tokens spent with no new useful results.`;
+  }
 }
 
 function partialAnswer(reason: string, mode: AgentRequest["mode"]) {
@@ -601,12 +789,12 @@ export type AgentRunState = {
   referencedFiles: DriveFile[];
   openedFiles: DriveFile[];
   /**
-   * Curated list mode only: every file run through the relevance grader (kept or
-   * discarded). Tracked for visibility/logging; the result is `keptFiles`.
+   * List modes: every file run through the examiner. Tracked for visibility/
+   * logging; in curated mode the kept subset is the result (`keptFiles`).
    */
   reviewedFiles: DriveFile[];
   /**
-   * Curated list mode only: files the grader judged relevant. This is the
+   * Curated list mode only: files the examiner judged relevant. This is the
    * authoritative curated result, populated live as the run progresses.
    */
   keptFiles: DriveFile[];
@@ -618,8 +806,35 @@ export type AgentRunState = {
   searchCallCount: number;
   openFileCallCount: number;
   reviewFileCallCount: number;
-  lowProgressSearchCount: number;
-  stopAfterToolUseReason: string | null;
+  /**
+   * Cumulative tokens across every model call in the run — the main loop (folded
+   * in by `onStepFinish`) and the isolated examiner (folded in by the `gradeFile`
+   * closure). The unit the diminishing-returns budget and the cost seatbelt are
+   * measured in.
+   */
+  tokensSpent: number;
+  /**
+   * Value of {@link tokensSpent} when the result set last grew. `tokensSpent`
+   * minus this is the diminishing-returns signal (see {@link tokensSinceProgress}).
+   */
+  tokensAtLastProgress: number;
+  /**
+   * Input tokens of the most recent model step, used for the per-call
+   * context-window health guard (mainly synthesis). Updated in `onStepFinish`.
+   */
+  lastInputTokens: number;
+  /**
+   * Set when searching should stop (the search-call backstop) but reading/
+   * examining may continue. `prepareStep` drops `search_drive` while keeping the
+   * read tool, so the model can still finish with the files it already found.
+   */
+  stopSearchingReason: string | null;
+  /**
+   * Set when the run should wind down entirely (diminishing-returns hard limit,
+   * cost seatbelt, or context-window limit). `prepareStep` drops every tool so
+   * the model must produce its final result.
+   */
+  windDownReason: string | null;
   /**
    * Zero-based index of the step currently executing, set by `prepareStep`
    * before each step so the tool handlers (which the SDK may run in parallel
@@ -654,17 +869,18 @@ export async function handleSearchTool(
     searchCallCount: state.searchCallCount
   });
   if (state.searchCallCount >= budget.maxSearchCalls) {
-    const reason = `Search budget reached after ${state.searchCallCount} search_drive call(s).`;
+    const reason = `Search backstop reached after ${state.searchCallCount} search_drive call(s).`;
     await emit({ type: "progress", message: reason });
     await writeDebugLog({
       event: "agent.tool.search_drive.skipped",
       level: "warn",
       requestId,
       step,
-      reason: "search_budget_reached",
+      reason: "search_backstop_reached",
       searchCallCount: state.searchCallCount
     });
-    state.stopAfterToolUseReason = reason;
+    // Stop *searching* but let the model keep reading/examining what it found.
+    state.stopSearchingReason = reason;
     return {
       role: "tool",
       tool_call_id: toolCall.id,
@@ -719,28 +935,22 @@ export async function handleSearchTool(
   for (const file of files) {
     state.knownFileKeys.add(fileKey(file));
   }
-  if (wasRepeatedQuery || newFiles.length === 0) {
-    state.lowProgressSearchCount += 1;
-  } else {
-    state.lowProgressSearchCount = 0;
-  }
-  if (state.lowProgressSearchCount >= budget.maxLowProgressSearches) {
-    state.stopAfterToolUseReason = `Searches stopped producing new files after ${state.lowProgressSearchCount} low-progress search(es).`;
-    await writeDebugLog({
-      event: "agent.low_progress_search_limit_reached",
-      level: "warn",
-      requestId,
-      step,
-      lowProgressSearchCount: state.lowProgressSearchCount
-    });
-  }
-  if (!input.curateList) {
-    state.referencedFiles.push(...files);
-    for (const file of files) {
+  // Non-curated runs (synthesis and uncurated list) return every file a search
+  // surfaces, so each newly-seen file is a result: record it (and only emit it
+  // once). Surfacing new files is "useful progress" that resets the
+  // diminishing-returns clock. Curated runs return only examiner-kept files, so
+  // search hits there are candidates, not results.
+  if (!input.curateList && newFiles.length > 0) {
+    state.referencedFiles.push(...newFiles);
+    for (const file of newFiles) {
       await emit({ type: "file", file });
     }
+    recordUsefulProgress(state);
   }
-  const note = searchResultNote(wasRepeatedQuery, newFiles.length, files.length);
+  const note = combineNotes(
+    searchResultNote(wasRepeatedQuery, files.length),
+    diminishingReturnsNote(state, budget)
+  );
   return {
     role: "tool",
     tool_call_id: toolCall.id,
@@ -749,9 +959,11 @@ export async function handleSearchTool(
 }
 
 /**
- * Handle a single `open_file` tool call: enforce drive scope, dedupe already
- * opened files, enforce the open-file budget, read the file, and emit progress.
- * Mutates {@link state} in place and returns the tool message to append.
+ * Handle a single `open_file` tool call (synthesis only): enforce drive scope,
+ * dedupe already-opened files, read the file, and emit progress. There is no
+ * open-count budget — reading is governed by diminishing returns and the
+ * per-call context-window guard. Mutates {@link state} in place and returns the
+ * tool message to append.
  *
  * An out-of-scope connectionId (the model fabricating an id instead of copying
  * one from a search result) is rejected as a tool-result observation, not
@@ -815,25 +1027,9 @@ export async function handleOpenFileTool(
       content: safeJson({ skipped: true, reason })
     };
   }
-  if (state.openFileCallCount >= budget.maxOpenFileCalls) {
-    const reason = `Open-file budget reached after ${state.openFileCallCount} open_file call(s).`;
-    await emit({ type: "progress", message: reason });
-    await writeDebugLog({
-      event: "agent.tool.open_file.skipped",
-      level: "warn",
-      requestId,
-      step,
-      reason: "open_file_budget_reached",
-      openFileCallCount: state.openFileCallCount
-    });
-    state.stopAfterToolUseReason = reason;
-    return {
-      role: "tool",
-      tool_call_id: toolCall.id,
-      content: safeJson({ skipped: true, reason })
-    };
-  }
-
+  // No open-count budget: reading is governed by diminishing returns and the
+  // per-call context-window guard (open_file pulls file content into the main
+  // context, so synthesis is bounded by maxContextInputTokens), not a fixed cap.
   state.openFileCallCount += 1;
   state.openedFileKeys.add(key);
   const toolStartedAt = Date.now();
@@ -877,9 +1073,11 @@ export async function handleOpenFileTool(
   });
   state.knownFileKeys.add(fileKey(opened.file));
   state.openedFiles.push(opened.file);
-  // open_file is offered only outside curated mode (curated runs review files
-  // via review_file instead), so an opened file is always a result to surface.
+  // open_file is offered only in synthesis (list modes examine via review_file
+  // instead), so an opened file is always a result to surface — and reading a new
+  // file is useful progress that resets the diminishing-returns clock.
   state.referencedFiles.push(opened.file);
+  recordUsefulProgress(state);
   await emit({ type: "progress", message: `Opened ${formatFileProgressLabel(opened.file)}` });
   await emit({ type: "file", file: opened.file });
   return {
@@ -893,17 +1091,19 @@ export async function handleOpenFileTool(
 }
 
 /**
- * Handle a single `review_file` tool call (curated list mode only): open a
- * candidate file, grade its relevance in an isolated model call, and keep it iff
- * the grader says it is relevant. Unlike open_file, the file's content is never
- * returned into the main loop's context — only a compact verdict — so the
- * curating conversation stays small however many files are reviewed.
+ * Handle a single `review_file` tool call (both list modes): open a candidate
+ * file, examine it in an isolated model call, and return a compact verdict
+ * (relevance + entities). Unlike open_file, the file's content is never returned
+ * into the main loop's context — only the verdict — so the conversation stays
+ * small however many files are examined, and the extracted entities feed the
+ * berry-picking search loop.
  *
- * Mirrors open_file's guards (out-of-scope connectionId, dedupe, budget, open
- * failure) which are all surfaced as recoverable observations rather than thrown,
- * so a single bad file never aborts the run. Emits a provisional `reviewing`
- * event before grading, then `kept` or `discarded` once the verdict is in, so
- * the UI shows each review as it happens instead of a lingering queue.
+ * Curated mode additionally keeps the file iff the examiner judged it relevant
+ * (emitting the provisional `reviewing` -> `kept`/`discarded` sequence the UI
+ * shows). Uncurated mode returns every match regardless, so it only examines for
+ * entities and emits a neutral progress line. Mirrors open_file's guards
+ * (out-of-scope connectionId, dedupe, open failure) as recoverable observations
+ * rather than throws, so a single bad file never aborts the run.
  */
 export async function handleReviewFileTool(
   context: AgentRunContext,
@@ -954,27 +1154,11 @@ export async function handleReviewFileTool(
     return {
       role: "tool",
       tool_call_id: toolCall.id,
-      content: safeJson({ reviewed: true, alreadyReviewed: true, kept: state.keptFileKeys.has(key) })
+      content: safeJson({ examined: true, alreadyExamined: true })
     };
   }
-  if (state.reviewFileCallCount >= budget.maxOpenFileCalls) {
-    const reason = `Review budget reached after ${state.reviewFileCallCount} review_file call(s).`;
-    await emit({ type: "progress", message: reason });
-    await writeDebugLog({
-      event: "agent.tool.review_file.skipped",
-      level: "warn",
-      requestId,
-      step,
-      reason: "review_budget_reached",
-      reviewFileCallCount: state.reviewFileCallCount
-    });
-    state.stopAfterToolUseReason = reason;
-    return {
-      role: "tool",
-      tool_call_id: toolCall.id,
-      content: safeJson({ skipped: true, reason })
-    };
-  }
+  // No review-count budget: examining is governed by diminishing returns (the
+  // examiner's token usage is folded into the run total) and the cost seatbelt.
 
   state.reviewFileCallCount += 1;
   state.reviewedFileKeys.add(key);
@@ -1009,11 +1193,19 @@ export async function handleReviewFileTool(
   }
 
   const openedKey = fileKey(opened.file);
+  const curating = isCuratingRequest(context.input);
   state.knownFileKeys.add(openedKey);
   state.reviewedFileKeys.add(openedKey);
   state.reviewedFiles.push(opened.file);
-  await emit({ type: "progress", message: `Reviewing ${formatFileProgressLabel(opened.file)}` });
-  await emit({ type: "reviewing", file: opened.file });
+  // The provisional `reviewing` -> `kept`/`discarded` event sequence is a curated
+  // UI concept (it shows files being filtered live). Uncurated returns every match
+  // regardless, so it only emits a neutral "Examining" progress line.
+  if (curating) {
+    await emit({ type: "progress", message: `Reviewing ${formatFileProgressLabel(opened.file)}` });
+    await emit({ type: "reviewing", file: opened.file });
+  } else {
+    await emit({ type: "progress", message: `Examining ${formatFileProgressLabel(opened.file)}` });
+  }
 
   const verdict = await gradeFile(opened.file, opened.content, step);
   await writeDebugLog({
@@ -1025,31 +1217,49 @@ export async function handleReviewFileTool(
     mimeType: opened.file.mimeType,
     contentLength: opened.content.length,
     relevant: verdict.relevant,
-    // The grader's justification is meant to be auditable (see GradeVerdict);
+    // The examiner's justification is meant to be auditable (see GradeVerdict);
     // surface it here at the metadata tier (gated like other model-derived text
     // via debugText) so a keep/discard decision is explained even without the
     // full DEBUG_LOG_TRANSCRIPT dump.
     reason: debugText(verdict.reason),
+    entityCount: verdict.entities.length,
+    curating,
     reviewFileCallCount: state.reviewFileCallCount,
     keptFileCount: state.keptFiles.length
   });
 
-  if (verdict.relevant) {
-    if (!state.keptFileKeys.has(openedKey)) {
-      state.keptFileKeys.add(openedKey);
-      state.keptFiles.push(opened.file);
+  // Only curated mode keeps/discards by relevance; in uncurated the file is
+  // already a result (surfaced at search time). Keeping a new file is useful
+  // progress that resets the diminishing-returns clock.
+  if (curating) {
+    if (verdict.relevant) {
+      if (!state.keptFileKeys.has(openedKey)) {
+        state.keptFileKeys.add(openedKey);
+        state.keptFiles.push(opened.file);
+        recordUsefulProgress(state);
+      }
+      await emit({ type: "progress", message: `Kept ${formatFileProgressLabel(opened.file)}` });
+      await emit({ type: "kept", file: opened.file });
+    } else {
+      await emit({ type: "progress", message: `Discarded ${formatFileProgressLabel(opened.file)}` });
+      await emit({ type: "discarded", file: opened.file });
     }
-    await emit({ type: "progress", message: `Kept ${formatFileProgressLabel(opened.file)}` });
-    await emit({ type: "kept", file: opened.file });
-  } else {
-    await emit({ type: "progress", message: `Discarded ${formatFileProgressLabel(opened.file)}` });
-    await emit({ type: "discarded", file: opened.file });
   }
 
+  // Surface the verdict and — the berry-picking channel — the extracted entities
+  // back to the model so it can search for related files. The file's CONTENT is
+  // never returned into the main loop's context, only this compact verdict.
+  const drNote = diminishingReturnsNote(state, budget);
+  const payload = {
+    examined: true,
+    relevant: verdict.relevant,
+    reason: verdict.reason,
+    entities: verdict.entities
+  };
   return {
     role: "tool",
     tool_call_id: toolCall.id,
-    content: safeJson({ reviewed: true, kept: verdict.relevant, reason: verdict.reason })
+    content: safeJson(drNote ? { ...payload, note: drNote } : payload)
   };
 }
 
@@ -1110,10 +1320,11 @@ async function runToolHandler(
 }
 
 /**
- * Build the AI SDK tool set for a run, closing over its context and state.
- * Curated list mode swaps `open_file` for `review_file` (file contents are graded
- * in isolation and never enter this loop's context). Each tool defers to its
- * tested handler via {@link runToolHandler}.
+ * Build the AI SDK tool set for a run, closing over its context and state. Both
+ * list modes (curated and uncurated) use `review_file`, which examines files in
+ * isolation so content never enters this loop's context; synthesis uses
+ * `open_file`, which reads content directly into context for synthesis. Each tool
+ * defers to its tested handler via {@link runToolHandler}.
  */
 function buildAgentTools(context: AgentRunContext, state: AgentRunState): ToolSet {
   const searchDrive = tool({
@@ -1135,10 +1346,10 @@ function buildAgentTools(context: AgentRunContext, state: AgentRunState): ToolSe
       runToolHandler(handleSearchTool, context, state, "search_drive", toolCallId, input)
   });
 
-  if (isCuratingRequest(context.input)) {
+  if (context.input.mode === "list") {
     const reviewFile = tool({
       description:
-        "Open a file returned by search_drive, read it, and judge whether it is relevant to the query. Relevant files are kept in the curated results automatically; irrelevant ones are discarded. Copy connectionId and fileId verbatim from a single search_drive result — never invent, guess, or modify an id, and never pair the connectionId of one file with the fileId of another. connectionId must be one of the selected Drive connection IDs.",
+        "Open a file from a search_drive result, read it in isolation, and report whether it is relevant to the query plus any notable names, projects, or terms worth searching for next. In curated mode relevant files are kept automatically and irrelevant ones dropped; in uncurated mode every match is returned regardless, so use this mainly to discover related search terms. Copy connectionId and fileId verbatim from a single search_drive result — never invent, guess, or modify an id, and never pair the connectionId of one file with the fileId of another. connectionId must be one of the selected Drive connection IDs.",
       inputSchema: looseToolSchema(ID_ARGS_SCHEMA),
       execute: (input, { toolCallId }) =>
         runToolHandler(handleReviewFileTool, context, state, "review_file", toolCallId, input)
@@ -1213,11 +1424,17 @@ export async function runDriveAgent(
   const startedAt = Date.now();
   const budget = resolveAgentBudget(input.mode, options.budget);
   const modelSettings = await getEffectiveModelSettings(ownerSub);
-  const resolved = resolveModel(modelSettings);
+  const resolvedMain = resolveModel(modelSettings.main);
+  const resolvedGrader = resolveModel(modelSettings.grader);
   const logSettings = {
-    model: modelSettings.model,
-    provider: modelSettings.provider,
-    source: modelSettings.source
+    model: modelSettings.main.model,
+    provider: modelSettings.main.provider,
+    source: modelSettings.main.source
+  };
+  const graderLogSettings = {
+    model: modelSettings.grader.model,
+    provider: modelSettings.grader.provider,
+    source: modelSettings.grader.source
   };
   await writeDebugLog({
     event: "agent.started",
@@ -1227,9 +1444,12 @@ export async function runDriveAgent(
     query: debugText(input.query),
     requestedDriveCount: input.driveIds.length,
     ownerSubHash: hashForDebug(ownerSub),
-    modelSettingsSource: modelSettings.source,
-    provider: modelSettings.provider,
-    model: modelSettings.model,
+    modelSettingsSource: modelSettings.main.source,
+    provider: modelSettings.main.provider,
+    model: modelSettings.main.model,
+    graderModelSettingsSource: modelSettings.grader.source,
+    graderProvider: modelSettings.grader.provider,
+    graderModel: modelSettings.grader.model,
     budget
   });
 
@@ -1258,16 +1478,6 @@ export async function runDriveAgent(
     throw new Error("No connected Drive selected");
   }
 
-  const context: AgentRunContext = {
-    ownerSub,
-    input,
-    budget,
-    selectedDriveIds,
-    requestId,
-    emit,
-    gradeFile: (file, content, step) =>
-      gradeFileRelevance(resolved, input.query, file, content, requestId, step)
-  };
   const state: AgentRunState = {
     referencedFiles: [],
     openedFiles: [],
@@ -1281,18 +1491,45 @@ export async function runDriveAgent(
     searchCallCount: 0,
     openFileCallCount: 0,
     reviewFileCallCount: 0,
-    lowProgressSearchCount: 0,
-    stopAfterToolUseReason: null,
+    tokensSpent: 0,
+    tokensAtLastProgress: 0,
+    lastInputTokens: 0,
+    stopSearchingReason: null,
+    windDownReason: null,
     currentStep: 0
   };
+  const context: AgentRunContext = {
+    ownerSub,
+    input,
+    budget,
+    selectedDriveIds,
+    requestId,
+    emit,
+    // Fold the isolated examiner's token usage into the run-wide total (it's the
+    // dominant token cost in list modes), then hand the verdict to the handler.
+    gradeFile: async (file, content, step) => {
+      const { verdict, usageTokens } = await gradeFileRelevance(
+        resolvedGrader,
+        graderLogSettings,
+        input.query,
+        file,
+        content,
+        requestId,
+        step
+      );
+      state.tokensSpent += usageTokens;
+      return verdict;
+    }
+  };
   const curating = isCuratingRequest(input);
+  const listMode = input.mode === "list";
   // In curated mode the result is exactly the set of files the grader kept, built
   // up live as review_file runs. An empty kept set is a valid "nothing relevant"
   // result, so there is no opened-files fallback. Uncurated/synthesis runs return
   // every referenced file.
   const finalFiles = () =>
     curating ? uniqueFiles(state.keptFiles) : uniqueFiles(state.referencedFiles);
-  const systemPromptText = systemPrompt(input, selectedDriveIds, budget);
+  const systemPromptText = systemPrompt(input, selectedDriveIds);
   const userText = `Query: ${input.query}\nMode: ${input.mode}\nCurate list: ${input.curateList}`;
   const tools = buildAgentTools(context, state);
   const stopReason = `Agent stopped after reaching the ${budget.maxToolSteps}-step tool-use budget.`;
@@ -1310,26 +1547,48 @@ export async function runDriveAgent(
     // handlers (see buildAgentTools); state is mutated in place so a throw can
     // still finalize with whatever was gathered.
     const result = await generateText({
-      model: resolved.model,
-      providerOptions: resolved.providerOptions,
-      ...(resolved.temperature !== undefined ? { temperature: resolved.temperature } : {}),
+      model: resolvedMain.model,
+      providerOptions: resolvedMain.providerOptions,
+      ...(resolvedMain.temperature !== undefined ? { temperature: resolvedMain.temperature } : {}),
       maxRetries: MODEL_REQUEST_MAX_RETRIES,
       system: systemPromptText,
       messages: [{ role: "user", content: userText }],
       tools,
       toolChoice: "auto",
+      // maxToolSteps is only the loop-insurance backstop; diminishing returns and
+      // the token guards (evaluated in prepareStep) are the normal stop.
       stopWhen: stepCountIs(budget.maxToolSteps),
-      // Set the step index before each step (so the possibly-parallel tool
-      // executes can attribute their logs) and gate tools once a budget forces a
-      // stop: drop search so the model winds down, but in curated mode keep
-      // review_file so a promising file found just before the stop is still
-      // reviewable (a review past budget just returns a skipped observation).
+      // Before each step: record the step index (so possibly-parallel tool
+      // executes attribute their logs), evaluate the token-based budget guards,
+      // then gate tools. A hard wind-down (diminishing-returns limit, cost
+      // seatbelt, or context-window limit) drops every tool so the model must
+      // finish; a search backstop drops only search_drive, leaving the read tool
+      // so the model can finish with the files it already found.
       prepareStep: ({ stepNumber }) => {
         state.currentStep = stepNumber;
-        if (!state.stopAfterToolUseReason) return undefined;
-        return { activeTools: curating ? ["review_file"] : [] };
+        evaluateTokenBudget(state, budget);
+        if (state.windDownReason) return { activeTools: [] };
+        if (state.stopSearchingReason) {
+          return { activeTools: listMode ? ["review_file"] : ["open_file"] };
+        }
+        return undefined;
       },
-      onStepFinish: (step) => logModelStep(requestId, logSettings, step)
+      onStepFinish: (step) => {
+        // Fold each main-loop step's tokens into the run total (drives the
+        // diminishing-returns budget and cost seatbelt), estimating from the
+        // visible text + reasoning when a provider reports no usage. The
+        // context-window guard tracks raw input tokens only (never an estimate or
+        // fudge) and simply doesn't fire when the provider omits them — the step
+        // backstop carries the run then (see AgentBudget docs).
+        state.tokensSpent += resolveUsageTokens(
+          step.usage,
+          `${step.text ?? ""}${step.reasoningText ?? ""}`
+        );
+        if (typeof step.usage?.inputTokens === "number") {
+          state.lastInputTokens = step.usage.inputTokens;
+        }
+        return logModelStep(requestId, logSettings, step);
+      }
     });
 
     // List mode answers are always empty (results come from state). For synthesis,
@@ -1339,7 +1598,7 @@ export async function runDriveAgent(
     let forcedFinalAnswer = false;
     if (input.mode === "synthesis" && !result.text.trim()) {
       finalText = await forceSynthesis(
-        resolved,
+        resolvedMain,
         systemPromptText,
         userText,
         result.response.messages,
@@ -1369,6 +1628,9 @@ export async function runDriveAgent(
       keptFileCount: state.keptFiles.length,
       reviewedFileCount: state.reviewedFiles.length,
       returnedFileCount: files.length,
+      tokensSpent: state.tokensSpent,
+      windDownReason: state.windDownReason,
+      stopSearchingReason: state.stopSearchingReason,
       answerFormat,
       answerLength: answer.length
     });
@@ -1401,6 +1663,7 @@ export async function runDriveAgent(
       keptFileCount: state.keptFiles.length,
       reviewedFileCount: state.reviewedFiles.length,
       returnedFileCount: files.length,
+      tokensSpent: state.tokensSpent,
       answerFormat,
       answerLength: answer.length
     });

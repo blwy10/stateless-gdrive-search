@@ -47,6 +47,12 @@ AI_PROVIDER=openai
 # AI_BASE_URL is optional: native providers (openai, anthropic) use their
 # official endpoint; openai-compatible requires it.
 AI_MODEL=gpt-4.1-mini
+# Grader model (required). A separate, cheaper model used only to judge per-file
+# relevance; there is no fallback to the main model, so both must be set.
+GRADER_AI_API_KEY=...
+GRADER_AI_PROVIDER=openai
+# GRADER_AI_BASE_URL is optional (required for openai-compatible).
+GRADER_AI_MODEL=...
 DEBUG_LOGS=0
 DEBUG_LOG_CONTENT=0
 ```
@@ -71,6 +77,13 @@ Regardless of provider, reasoning is logged from one unified field and prior
 thinking is carried across turns by the SDK, so multi-turn tool calls keep their
 chain-of-thought. User-supplied endpoints are SSRF-validated and pinned to public
 IPs at connect time.
+
+The app uses **two independent models**. The **main** model runs the agent loop
+and writes the synthesis answer; the **grader** is a separate, cheaper model used
+only to judge per-file relevance, which has much lower requirements. Each role has
+its own provider, key, endpoint, and model: set the operator defaults via the
+`AI_*` (main) and `GRADER_AI_*` (grader) env vars — both are required, with no
+fallback between roles — and override them per-user and per-role in **Settings**.
 
 Optional per-user abuse protection on `/api/agent` (in-memory, keyed by the
 authenticated user). These have sensible defaults and only need to be set to

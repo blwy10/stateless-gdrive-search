@@ -7,6 +7,7 @@ import { requireSession, withAuth } from "@/lib/auth";
 import {
   deleteModelSettings,
   getModelSettingsSummary,
+  parseModelRole,
   parseModelSettingsInput,
   upsertModelSettings
 } from "@/lib/model-settings";
@@ -28,9 +29,10 @@ export const PUT = withAuth(async (request: NextRequest) => {
   }
 });
 
-export const DELETE = withAuth(async () => {
+export const DELETE = withAuth(async (request: NextRequest) => {
   const session = await requireSession();
-  await deleteModelSettings(session.user.id);
+  const role = parseModelRole(new URL(request.url).searchParams.get("role"));
+  await deleteModelSettings(session.user.id, role);
   return NextResponse.json({ settings: await getModelSettingsSummary(session.user.id) });
 });
 

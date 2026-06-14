@@ -8,6 +8,7 @@ import {
   handleSearchTool,
   normalizeGradeVerdict,
   parseFinalAnswer,
+  resolveUsageTokens,
   type AgentProgress,
   type AgentRunContext,
   type AgentRunState,
@@ -36,16 +37,18 @@ function makeContext(overrides: Partial<AgentRunContext> = {}): AgentRunContext 
     ownerSub: "owner-1",
     input: { query: "q", mode: "synthesis", driveIds: ["c1"], curateList: false },
     budget: {
-      maxToolSteps: 20,
-      maxSearchCalls: 10,
-      maxOpenFileCalls: 20,
-      maxLowProgressSearches: 2,
+      maxToolSteps: 100,
+      maxSearchCalls: 50,
+      maxTotalTokens: 1_000_000,
+      maxContextInputTokens: 96_000,
+      softProgressTokenLimit: 32_000,
+      hardProgressTokenLimit: 80_000,
       maxToolRetries: 1
     },
     selectedDriveIds: ["c1"],
     requestId: "req-test",
     emit: () => {},
-    gradeFile: async () => ({ relevant: true, reason: "stub" }),
+    gradeFile: async () => ({ relevant: true, reason: "stub", entities: [] }),
     ...overrides
   };
 }
@@ -64,8 +67,11 @@ function makeState(overrides: Partial<AgentRunState> = {}): AgentRunState {
     searchCallCount: 0,
     openFileCallCount: 0,
     reviewFileCallCount: 0,
-    lowProgressSearchCount: 0,
-    stopAfterToolUseReason: null,
+    tokensSpent: 0,
+    tokensAtLastProgress: 0,
+    lastInputTokens: 0,
+    stopSearchingReason: null,
+    windDownReason: null,
     currentStep: 0,
     ...overrides
   };
@@ -96,6 +102,13 @@ function searchCall(id: string, query: string, limit?: number) {
 function curatedContext(overrides: Partial<AgentRunContext> = {}): AgentRunContext {
   return makeContext({
     input: { query: "q", mode: "list", driveIds: ["c1"], curateList: true },
+    ...overrides
+  });
+}
+
+function uncuratedContext(overrides: Partial<AgentRunContext> = {}): AgentRunContext {
+  return makeContext({
+    input: { query: "q", mode: "list", driveIds: ["c1"], curateList: false },
     ...overrides
   });
 }
@@ -167,26 +180,31 @@ describe("normalizeGradeVerdict", () => {
   it("passes through a relevant/irrelevant verdict with its reason", () => {
     expect(normalizeGradeVerdict({ relevant: true, reason: "matches the query" })).toEqual({
       relevant: true,
-      reason: "matches the query"
+      reason: "matches the query",
+      entities: []
     });
     expect(normalizeGradeVerdict({ relevant: false, reason: "off topic" })).toEqual({
       relevant: false,
-      reason: "off topic"
+      reason: "off topic",
+      entities: []
     });
   });
 
   it("supplies a default reason when the grader omits or blanks it", () => {
     expect(normalizeGradeVerdict({ relevant: true })).toEqual({
       relevant: true,
-      reason: "Judged relevant."
+      reason: "Judged relevant.",
+      entities: []
     });
     expect(normalizeGradeVerdict({ relevant: false, reason: "   " })).toEqual({
       relevant: false,
-      reason: "Judged not relevant."
+      reason: "Judged not relevant.",
+      entities: []
     });
     expect(normalizeGradeVerdict({ relevant: true, reason: null })).toEqual({
       relevant: true,
-      reason: "Judged relevant."
+      reason: "Judged relevant.",
+      entities: []
     });
   });
 
@@ -195,6 +213,48 @@ describe("normalizeGradeVerdict", () => {
     const verdict = normalizeGradeVerdict({ relevant: true, reason: `  ${long}  ` });
     expect(verdict.reason.length).toBe(300);
     expect(verdict.reason.startsWith("x")).toBe(true);
+  });
+
+  it("normalizes entities: trims, drops blanks, dedupes case-insensitively, caps count", () => {
+    const verdict = normalizeGradeVerdict({
+      relevant: true,
+      reason: "ok",
+      entities: ["  Project Atlas  ", "project atlas", "", "   ", "Airwallex"]
+    });
+    // "project atlas" is a case-insensitive dup of "Project Atlas"; blanks dropped.
+    expect(verdict.entities).toEqual(["Project Atlas", "Airwallex"]);
+  });
+
+  it("caps the number of entities", () => {
+    const many = Array.from({ length: 20 }, (_, i) => `term-${i}`);
+    const verdict = normalizeGradeVerdict({ relevant: true, reason: "ok", entities: many });
+    expect(verdict.entities.length).toBe(8);
+    expect(verdict.entities[0]).toBe("term-0");
+  });
+});
+
+describe("resolveUsageTokens", () => {
+  it("prefers the provider's totalTokens (which already includes reasoning)", () => {
+    // reasoningTokens is a subset of output/total — must NOT be added on top.
+    expect(
+      resolveUsageTokens({ inputTokens: 100, outputTokens: 50, totalTokens: 150, reasoningTokens: 30 })
+    ).toBe(150);
+  });
+
+  it("falls back to input + output when totalTokens is missing", () => {
+    expect(resolveUsageTokens({ inputTokens: 100, outputTokens: 50 })).toBe(150);
+    expect(resolveUsageTokens({ inputTokens: 100 })).toBe(100);
+  });
+
+  it("falls back to a char-based estimate (incl. reasoning text) when no usage is reported", () => {
+    // 40 chars / 4 = 10 tokens; this is the no-usage-provider path.
+    expect(resolveUsageTokens(undefined, "x".repeat(40))).toBe(10);
+    expect(resolveUsageTokens({}, "x".repeat(40))).toBe(10);
+  });
+
+  it("returns 0 when there is neither usage nor text (step backstop is the floor)", () => {
+    expect(resolveUsageTokens(undefined, "")).toBe(0);
+    expect(resolveUsageTokens(undefined)).toBe(0);
   });
 });
 
@@ -361,14 +421,25 @@ describe("handleReviewFileTool", () => {
     return { runState, events, gradeFile, context };
   }
 
-  it("keeps a file the grader judges relevant and never returns its content", async () => {
-    const { runState, events, gradeFile, context } = setup({ relevant: true, reason: "on topic" });
+  it("keeps a file the grader judges relevant, returns entities, never returns its content", async () => {
+    const { runState, events, gradeFile, context } = setup({
+      relevant: true,
+      reason: "on topic",
+      entities: ["Project Atlas"]
+    });
 
     const result = await handleReviewFileTool(context, runState, 0, reviewCall("r1"));
 
-    const payload = JSON.parse(result.content) as { reviewed?: boolean; kept?: boolean; content?: string };
-    expect(payload.reviewed).toBe(true);
-    expect(payload.kept).toBe(true);
+    const payload = JSON.parse(result.content) as {
+      examined?: boolean;
+      relevant?: boolean;
+      entities?: string[];
+      content?: string;
+    };
+    expect(payload.examined).toBe(true);
+    expect(payload.relevant).toBe(true);
+    // The berry-picking channel: extracted entities come back to the model.
+    expect(payload.entities).toEqual(["Project Atlas"]);
     // The file's content must NOT leak back into the main loop's context.
     expect(payload.content).toBeUndefined();
     expect(gradeFile).toHaveBeenCalledTimes(1);
@@ -380,13 +451,13 @@ describe("handleReviewFileTool", () => {
   });
 
   it("discards a file the grader judges irrelevant", async () => {
-    const { runState, events, context } = setup({ relevant: false, reason: "off topic" });
+    const { runState, events, context } = setup({ relevant: false, reason: "off topic", entities: [] });
 
     const result = await handleReviewFileTool(context, runState, 0, reviewCall("r2"));
 
-    const payload = JSON.parse(result.content) as { reviewed?: boolean; kept?: boolean };
-    expect(payload.reviewed).toBe(true);
-    expect(payload.kept).toBe(false);
+    const payload = JSON.parse(result.content) as { examined?: boolean; relevant?: boolean };
+    expect(payload.examined).toBe(true);
+    expect(payload.relevant).toBe(false);
     expect(runState.keptFiles).toHaveLength(0);
     expect(runState.reviewedFiles).toHaveLength(1);
     expect(events.some((event) => event.type === "reviewing")).toBe(true);
@@ -394,9 +465,38 @@ describe("handleReviewFileTool", () => {
     expect(events.some((event) => event.type === "kept")).toBe(false);
   });
 
+  it("in uncurated list mode, examines for entities but never keeps/discards", async () => {
+    vi.mocked(openDriveFile).mockResolvedValue({
+      file: file("c1", "f1", "Doc"),
+      content: "hello world"
+    });
+    const runState = makeState();
+    const events: AgentProgress[] = [];
+    const gradeFile = vi.fn(async () => ({ relevant: true, reason: "x", entities: ["Airwallex"] }));
+    const context = uncuratedContext({
+      emit: (event) => {
+        events.push(event);
+      },
+      gradeFile
+    });
+
+    const result = await handleReviewFileTool(context, runState, 0, reviewCall("u1"));
+
+    const payload = JSON.parse(result.content) as { examined?: boolean; entities?: string[] };
+    expect(payload.examined).toBe(true);
+    expect(payload.entities).toEqual(["Airwallex"]);
+    // Uncurated returns every match at search time, so review never keeps/discards
+    // and emits none of the curated lifecycle events.
+    expect(runState.keptFiles).toHaveLength(0);
+    expect(runState.reviewedFiles).toHaveLength(1);
+    expect(events.some((event) => event.type === "reviewing")).toBe(false);
+    expect(events.some((event) => event.type === "kept")).toBe(false);
+    expect(events.some((event) => event.type === "discarded")).toBe(false);
+  });
+
   it("rejects an out-of-scope connectionId as an observation without opening or grading", async () => {
     const runState = makeState();
-    const gradeFile = vi.fn(async () => ({ relevant: true, reason: "x" }));
+    const gradeFile = vi.fn(async () => ({ relevant: true, reason: "x", entities: [] }));
     const context = curatedContext({ gradeFile });
 
     // selectedDriveIds is ["c1"], so "c2" is outside scope (a hallucinated id).
@@ -416,7 +516,7 @@ describe("handleReviewFileTool", () => {
       new Error("Google Drive request failed with status 403")
     );
     const runState = makeState();
-    const gradeFile = vi.fn(async () => ({ relevant: true, reason: "x" }));
+    const gradeFile = vi.fn(async () => ({ relevant: true, reason: "x", entities: [] }));
     const context = curatedContext({ gradeFile });
 
     const result = await handleReviewFileTool(context, runState, 0, reviewCall("r4"));
@@ -430,35 +530,36 @@ describe("handleReviewFileTool", () => {
     expect(runState.keptFiles).toHaveLength(0);
   });
 
-  it("skips a file already reviewed earlier in the run", async () => {
-    const { runState, gradeFile, context } = setup({ relevant: true, reason: "on topic" });
+  it("skips a file already examined earlier in the run", async () => {
+    const { runState, gradeFile, context } = setup({ relevant: true, reason: "on topic", entities: [] });
 
     await handleReviewFileTool(context, runState, 0, reviewCall("r5"));
     const second = await handleReviewFileTool(context, runState, 0, reviewCall("r6"));
 
-    const payload = JSON.parse(second.content) as { reviewed?: boolean; alreadyReviewed?: boolean; kept?: boolean };
-    expect(payload.alreadyReviewed).toBe(true);
-    expect(payload.kept).toBe(true);
+    const payload = JSON.parse(second.content) as { examined?: boolean; alreadyExamined?: boolean };
+    expect(payload.alreadyExamined).toBe(true);
     expect(openDriveFile).toHaveBeenCalledTimes(1);
     expect(gradeFile).toHaveBeenCalledTimes(1);
     expect(runState.keptFiles).toHaveLength(1);
   });
 
-  it("skips reviewing once the review budget is reached", async () => {
-    const runState = makeState();
-    const gradeFile = vi.fn(async () => ({ relevant: true, reason: "x" }));
-    const context = curatedContext({
-      budget: { ...makeContext().budget, maxOpenFileCalls: 0 },
-      gradeFile
+  it("attaches a diminishing-returns note once spend has stalled past the soft limit", async () => {
+    vi.mocked(openDriveFile).mockResolvedValue({
+      file: file("c1", "f1", "Doc"),
+      content: "hello world"
     });
+    const runState = makeState({
+      // Spend well past the soft limit with no progress recorded.
+      tokensSpent: 40_000,
+      tokensAtLastProgress: 0
+    });
+    const gradeFile = vi.fn(async () => ({ relevant: false, reason: "x", entities: [] }));
+    const context = curatedContext({ gradeFile });
 
     const result = await handleReviewFileTool(context, runState, 0, reviewCall("r7"));
 
-    const payload = JSON.parse(result.content) as { skipped?: boolean; reason?: string };
-    expect(payload.skipped).toBe(true);
-    expect(payload.reason).toContain("Review budget reached");
-    expect(openDriveFile).not.toHaveBeenCalled();
-    expect(gradeFile).not.toHaveBeenCalled();
+    const payload = JSON.parse(result.content) as { note?: string };
+    expect(payload.note).toContain("Returns are diminishing");
   });
 });
 
@@ -483,17 +584,52 @@ describe("handleSearchTool", () => {
     expect(runState.searchCallCount).toBe(0);
   });
 
-  it("returns files with no note when the search surfaces new files", async () => {
+  it("returns files with no note and records progress when the search surfaces new files", async () => {
     vi.mocked(searchDriveFiles).mockReset();
     vi.mocked(searchDriveFiles).mockResolvedValue([file("c1", "f1"), file("c1", "f2")]);
-    const runState = makeState();
+    // Synthesis context: search hits are results, so new files are useful progress.
+    const runState = makeState({ tokensSpent: 5_000, tokensAtLastProgress: 0 });
 
     const result = await handleSearchTool(makeContext(), runState, 0, searchCall("s1", "alpha beta"));
 
     const payload = JSON.parse(result.content) as { files?: unknown[]; note?: string };
     expect(payload.files).toHaveLength(2);
     expect(payload.note).toBeUndefined();
-    expect(runState.lowProgressSearchCount).toBe(0);
+    expect(runState.referencedFiles).toHaveLength(2);
+    // New results reset the diminishing-returns clock to the current spend.
+    expect(runState.tokensAtLastProgress).toBe(5_000);
+  });
+
+  it("does NOT flag a search that overlaps already-seen files (cheap searches are not penalized)", async () => {
+    vi.mocked(searchDriveFiles).mockReset();
+    // Both searches return the same file, so the second adds nothing new — but
+    // under the cheap-search philosophy that is not flagged; diminishing returns
+    // is judged over tokens, not a single search's novelty.
+    vi.mocked(searchDriveFiles).mockResolvedValue([file("c1", "f1")]);
+    const runState = makeState();
+    const context = makeContext();
+
+    await handleSearchTool(context, runState, 0, searchCall("s1", "alpha"));
+    const result = await handleSearchTool(context, runState, 1, searchCall("s2", "beta"));
+
+    const payload = JSON.parse(result.content) as { note?: string };
+    expect(payload.note).toBeUndefined();
+  });
+
+  it("stops searching (not the whole run) when the search backstop is reached", async () => {
+    vi.mocked(searchDriveFiles).mockReset();
+    vi.mocked(searchDriveFiles).mockResolvedValue([file("c1", "f1")]);
+    const runState = makeState({ searchCallCount: 50 });
+    const context = makeContext();
+
+    const result = await handleSearchTool(context, runState, 0, searchCall("s1", "alpha"));
+
+    const payload = JSON.parse(result.content) as { skipped?: boolean; reason?: string };
+    expect(payload.skipped).toBe(true);
+    expect(searchDriveFiles).not.toHaveBeenCalled();
+    // The search backstop stops searching but does not wind down the whole run.
+    expect(runState.stopSearchingReason).not.toBeNull();
+    expect(runState.windDownReason).toBeNull();
   });
 
   it("nudges the model to vary terms when it repeats the exact same query (H3)", async () => {
@@ -515,20 +651,6 @@ describe("handleSearchTool", () => {
     expect(payload.note).toContain("exact query you already ran");
     // The files are still returned (consistent), just with the corrective note.
     expect(payload.files).toHaveLength(1);
-  });
-
-  it("nudges when a new query surfaces only files already seen", async () => {
-    vi.mocked(searchDriveFiles).mockReset();
-    // Both searches return the same file, so the second makes no progress.
-    vi.mocked(searchDriveFiles).mockResolvedValue([file("c1", "f1")]);
-    const runState = makeState();
-    const context = makeContext();
-
-    await handleSearchTool(context, runState, 0, searchCall("s1", "alpha"));
-    const result = await handleSearchTool(context, runState, 1, searchCall("s2", "beta"));
-
-    const payload = JSON.parse(result.content) as { note?: string };
-    expect(payload.note).toContain("no files you had not already seen");
   });
 
   it("nudges when a query matches no files at all", async () => {

@@ -26,10 +26,19 @@ create unique index if not exists drive_connections_owner_email_idx
 
 create table if not exists user_model_settings (
   owner_sub text primary key,
-  api_key_ciphertext text not null,
+  -- Per-role model overrides (main = agent + synthesis, grader = the cheaper
+  -- relevance examiner). A role is "present" iff its model and api_key_ciphertext
+  -- are both non-null; otherwise it falls back to that role's env default. The
+  -- two roles are independent — a user may override one, the other, both, or
+  -- neither.
+  api_key_ciphertext text,
   base_url text,
-  model text not null,
-  provider text not null default 'openai-compatible',
+  model text,
+  provider text,
+  grader_api_key_ciphertext text,
+  grader_base_url text,
+  grader_model text,
+  grader_provider text,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
@@ -43,3 +52,28 @@ alter table user_model_settings
 
 alter table user_model_settings
   alter column base_url drop not null;
+
+-- Independent per-role overrides: a user may override just the grader and leave
+-- the main config on its env default, so the main columns are no longer required.
+alter table user_model_settings
+  alter column api_key_ciphertext drop not null;
+
+alter table user_model_settings
+  alter column model drop not null;
+
+alter table user_model_settings
+  alter column provider drop not null;
+
+-- Separate grader-role columns (a cheaper model that only grades file relevance).
+-- Nullable: the grader uses its env default when unset.
+alter table user_model_settings
+  add column if not exists grader_api_key_ciphertext text;
+
+alter table user_model_settings
+  add column if not exists grader_base_url text;
+
+alter table user_model_settings
+  add column if not exists grader_model text;
+
+alter table user_model_settings
+  add column if not exists grader_provider text;

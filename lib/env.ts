@@ -23,5 +23,13 @@ export const env = {
   // when unset; openai-compatible requires it. Returns null when unset.
   aiBaseUrl: (): string | null => process.env.AI_BASE_URL || null,
   aiModel: () => process.env.AI_MODEL || "gpt-4.1-mini",
+  // Grader role: a separate, cheaper model used only to judge per-file relevance
+  // (see gradeFileRelevance in lib/agent.ts). Key and model are required with no
+  // fallback to the main model — both roles must be configured. Provider mirrors
+  // the main default ("openai"); endpoint is optional except for openai-compatible.
+  graderAiApiKey: () => required("GRADER_AI_API_KEY"),
+  graderAiProvider: () => process.env.GRADER_AI_PROVIDER || "openai",
+  graderAiBaseUrl: (): string | null => process.env.GRADER_AI_BASE_URL || null,
+  graderAiModel: () => required("GRADER_AI_MODEL"),
   nextAuthUrl: () => required("NEXTAUTH_URL")
 };
