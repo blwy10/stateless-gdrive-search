@@ -8,7 +8,7 @@ import {
   type EffectiveModelSettings,
   type EffectiveModelSettingsBundle
 } from "@/lib/model-settings";
-import { resolveModel, type ResolvedModel } from "@/lib/model-provider";
+import { resolveModel, SUMMARIZER_REQUEST_TIMEOUT_MS, type ResolvedModel } from "@/lib/model-provider";
 import {
   createDebugRequestId,
   debugError,
@@ -53,7 +53,11 @@ function resolveRunModels(settings: EffectiveModelSettingsBundle): RunModels {
   return {
     main: resolveModel(settings.main),
     grader: resolveModel(settings.grader),
-    summarizer: resolveModel(settings.summarizer),
+    // The summarizer makes a single large (~8k-token) generation, so it gets a
+    // longer per-request timeout than the small main/grader calls (see
+    // SUMMARIZER_REQUEST_TIMEOUT_MS) — otherwise a slow-but-healthy summary is
+    // aborted into a truncation fallback.
+    summarizer: resolveModel(settings.summarizer, SUMMARIZER_REQUEST_TIMEOUT_MS),
     mainLog: logSettingsFor(settings.main),
     graderLog: logSettingsFor(settings.grader),
     summarizerLog: logSettingsFor(settings.summarizer)
@@ -136,7 +140,8 @@ function buildRunContext(
     emit: (event: AgentProgress) => void | Promise<void>;
   },
   models: RunModels,
-  state: AgentRunState
+  state: AgentRunState,
+  subjectIdentity: string | null
 ): AgentRunContext {
   return {
     ...base,
@@ -145,6 +150,7 @@ function buildRunContext(
         models.grader,
         models.graderLog,
         base.input.query,
+        subjectIdentity,
         file,
         content,
         base.requestId,
@@ -362,7 +368,8 @@ export async function runDriveAgent(
   const context = buildRunContext(
     { ownerSub, input, budget, selectedDriveIds, requestId, emit },
     models,
-    state
+    state,
+    subjectIdentity
   );
   const systemPromptText = systemPrompt(input, selectedDriveIds, subjectIdentity);
   const userText = `Query: ${input.query}\nMode: ${input.mode}\nCurate list: ${input.curateList}`;

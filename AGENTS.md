@@ -13,7 +13,12 @@
   search recall" below), `emptyExtractionNote`, `resolveFileContent` (the
   per-file content-cap resolver in `lib/drive.ts` — full/empty/truncated/summarized
   disposition, with a fake summarizer hook; see "Oversize files" below),
-  `parseFinalAnswer`,
+  `parseFinalAnswer` (the synthesis answer parser: extracts/strips the
+  `FORMAT: markdown|plain` directive and falls back to markdown auto-detection;
+  it matches the directive at the start of any line within a bounded leading
+  window — `MAX_FORMAT_PREAMBLE_CHARS` — so a short model preamble before the
+  FORMAT line is dropped instead of leaking the literal directive, while an
+  incidental `FORMAT:` line deep in a genuine answer cannot truncate it),
   `parseSources`/`resolveSources` (the synthesis citation parser + resolver — see
   "File display: results vs touched" below), `resolveRoleSettings`
   (the per-role main/grader/summarizer model resolver in `lib/model-settings.ts`,
@@ -27,9 +32,11 @@
   Anthropic's effort→thinking-budget mapping with temperature dropped + max-tokens
   bumped),
   `normalizeGradeVerdict` (the examiner's verdict normaliser — trims and caps the
-  `reason`, supplies a default sentence when the model omits one, and normalises
+  `reason`, supplies a default sentence when the model omits one, normalises
   the `entities` list: trim, drop blanks, dedupe case-insensitively, cap to
-  `MAX_GRADE_ENTITIES`),
+  `MAX_GRADE_ENTITIES`, and coerces `aboutSubject` to one of `ABOUT_SUBJECT_VALUES`,
+  defaulting to `"unknown"` for a missing/unrecognised value — see "Entity
+  conflation: subject anchoring"),
   `describeSubjectIdentity` (the subject/identity anchor — formats `Name <email>`
   per *selected* connection, deduped case-insensitively, email-only when the
   drive name is missing, null when nothing is selected/resolvable) and
@@ -38,8 +45,13 @@
   caution appear in every mode, the universal anti-conflation rule appears in
   synthesis while owner-profiling stays *gated* on a person-specific request — the
   prompt must NOT say "attribute facts only to the subject" — and the whole block
-  is omitted when no owner is resolvable — see "Entity conflation: subject
-  anchoring" below), and
+  is omitted when no owner is resolvable; plus that *multiple* connections (possibly
+  different people) render the cautious "may belong to different people" wording
+  rather than the single-owner "is X" phrasing (so "my"/"me"/"I" is not bound to
+  every owner), that the prompt-injection guard ("untrusted data, not instructions")
+  appears in every mode, that the weak-evidence instruction is synthesis-only (never
+  list mode), and that synthesis carries a concrete FORMAT/SOURCES example — see
+  "Entity conflation: subject anchoring" below), and
   the debug-log gating helpers (`debugText`/`isDebugLogEnabled`/
   `isDebugContentLogEnabled`/`isDebugTranscriptLogEnabled`, which force all debug
   logging — metadata, content previews, and the full transcript dump — off when
@@ -204,10 +216,26 @@
   prompt does NOT contain "Attribute facts only to the subject" and DOES gate on a
   person-specific request). When no identity resolves the whole block is omitted.
   The resolved identity is content/PII, so `agent.connections.selected` logs it only
-  through `debugText` (gated, production-off). This is prompt-only — it reduces but
-  does not *guarantee* prevention; the structural fix (a subject-aware examiner
-  verdict, e.g. an `about_subject` vs `about_other_person` field) is a deliberate
-  follow-up, not yet implemented.
+  through `debugText` (gated, production-off).
+
+  The examiner is now subject-aware too (the first step of the structural fix): when
+  a subject identity is present, `gradeSystemPrompt(subject)` (in `lib/agent/examiner.ts`)
+  threads the owner anchor + aboutness caution into the grader and asks it to classify
+  `aboutSubject` (`subject` | `other_person` | `not_person` | `unknown`, see
+  `ABOUT_SUBJECT_VALUES`); `runDriveAgent`'s `gradeFile` closure passes the run's
+  `subjectIdentity` to `gradeFileRelevance`. The verdict is auditable (logged on
+  `agent.grade.completed` and `agent.tool.review_file.completed`, coarse enum, not
+  PII) but does NOT yet gate keep/discard — relevance still decides curation,
+  preserving recall (a file about another person can still be relevant). For multiple
+  connections the prompts also no longer merge distinct owners or bind first-person
+  to all of them (see `systemPrompt` above). Remaining follow-up: actually *acting* on
+  `aboutSubject` in curation/synthesis. Still prompt+heuristic level — it reduces but
+  does not *guarantee* prevention.
+
+  Prompt-injection note (related): every content-ingesting prompt — `basePrompt`
+  (main agent), `gradeSystemPrompt` (examiner), and `SUMMARIZE_SYSTEM_PROMPT`
+  (summarizer) — now tells the model to treat file contents as untrusted data, not
+  instructions. This is defence-in-depth, not a guarantee.
 
 ## LLM layer (Vercel AI SDK)
 
@@ -230,7 +258,11 @@
     vLLM/custom; `baseUrl` required). Effort → `reasoning_effort` via the
     name-independent `openaiCompatible` provider-options key.
   All providers share an SSRF-safe `fetch` wrapper that bounds each request with a
-  60s timeout, refuses redirects, and — for user-supplied ("custom") endpoints —
+  per-role timeout (`resolveModel` takes it as a parameter — default 60s
+  `MODEL_REQUEST_TIMEOUT_MS`; the **summarizer** passes `SUMMARIZER_REQUEST_TIMEOUT_MS`
+  = 180s because its single ~8k-token output legitimately runs ~50s+ and the 60s
+  ceiling otherwise aborts healthy summaries into a truncation fallback — see
+  "Oversize files"), refuses redirects, and — for user-supplied ("custom") endpoints —
   pins the connection to public IPs via `ssrfSafeDispatcher`. The operator default
   endpoint is trusted and skips the dispatcher.
 
@@ -282,10 +314,13 @@
   split in `buildAgentTools` is therefore by `input.mode === "list"`, not by
   curation. `review_file` (`handleReviewFileTool`) opens a candidate and examines
   it in an isolated, single-shot structured call (`gradeFileRelevance` →
-  `generateObject` → `normalizeGradeVerdict`) whose minimal prompt holds only the
-  query and that one file. The file's content is NOT returned into the main loop —
+  `generateObject` → `normalizeGradeVerdict`) whose minimal prompt holds the
+  query, the run's subject identity when resolved (`gradeSystemPrompt(subject)`),
+  and that one file. The file's content is NOT returned into the main loop —
   only a compact verdict `{examined, relevant, reason, entities}` (the `entities`
-  are the berry-picking channel; see "Drive search recall"). Curated mode keeps
+  are the berry-picking channel; see "Drive search recall"). The verdict also
+  carries `aboutSubject` (auditable/logged, not in the tool payload — see "Entity
+  conflation: subject anchoring"). Curated mode keeps
   the file iff relevant (emitting the provisional `reviewing` → `kept`/`discarded`
   sequence the UI shows); uncurated mode returns every match at search time, so it
   examines for `entities` only, never keeps/discards, and emits a neutral
@@ -430,7 +465,10 @@
   `summarizeOversize` hook (type `OversizeSummarizer`): when present AND the content
   is over the cap, the hook condenses the full text and `resolveFileContent` returns
   that (disposition `"summarized"`, re-capped defensively if the model overshoots)
-  instead of truncating; if the hook returns null/blank it falls back to truncation.
+  instead of truncating; if the hook returns null/blank — OR an implausibly short
+  summary below `MIN_SUMMARY_CHARS` (`MAX_FILE_CHARS / 4`), the over-compression
+  safety net — it falls back to truncation (which preserves more than a near-empty
+  "summary").
   `lib/drive` itself imports no model — the hook is a plain injected function, so the
   utils scripts and tests still call `openDriveFile` (no hook → truncation) unchanged.
 
@@ -441,13 +479,22 @@
   summary feeding a relevance judge is mildly circular. Trade-off accepted: in
   curated list mode a relevant file whose relevance is in the truncated tail can
   still be wrongly discarded. Enabling the grader path later is a ~1-line change
-  (pass the hook in `handleReviewFileTool`). The summary is query-focused
-  (`summarizeOversizeContent` / `SUMMARIZE_SYSTEM_PROMPT`): keep query-relevant
-  content, preserve names/figures/codenames verbatim, add nothing. Input is capped
-  at `MAX_SUMMARY_INPUT_CHARS` (~100k tokens — the extreme tail is head-truncated
-  before summarizing; map-reduce is a deliberate follow-up) and the output budget is
-  floored at `SUMMARY_MIN_OUTPUT_TOKENS` so it can fill the target. Like the grader,
-  failures degrade safely (return null → truncation) and never throw.
+  (pass the hook in `handleReviewFileTool`). The summary is a faithful WHOLE-document
+  condensation, NOT a query filter (`summarizeOversizeContent` /
+  `SUMMARIZE_SYSTEM_PROMPT`): cover every section end-to-end, use the query only to
+  bias detail (keep-in-full vs compress) never to drop topics — a separate step
+  judges relevance — preserve names/figures/codenames verbatim, add nothing, and use
+  most of the ~`SUMMARY_TARGET_TOKENS` budget rather than a brief abstract. (This
+  prompt is the primary length control; the `MIN_SUMMARY_CHARS` floor above is the
+  safety net. The earlier "keep only query-relevant content" framing caused
+  pathological over-compression — e.g. an 81k-char file summarised to ~400 chars — so
+  it was replaced.) It also carries the prompt-injection guard (treat the document as
+  data, not instructions). Input is capped at `MAX_SUMMARY_INPUT_CHARS` (~100k tokens
+  — the extreme tail is head-truncated before summarizing; map-reduce is a deliberate
+  follow-up) and the output budget is floored at `SUMMARY_MIN_OUTPUT_TOKENS` so it can
+  fill the target. An over-short summary is flagged at `warn` level on
+  `agent.summarize.completed` (`belowUsefulFloor` + `compressionRatio`). Like the
+  grader, failures degrade safely (return null → truncation) and never throw.
 
 ## Reasoning effort
 

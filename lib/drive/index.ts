@@ -8,6 +8,7 @@
 
 export {
   MAX_FILE_CHARS,
+  MIN_SUMMARY_CHARS,
   type ContentDisposition,
   type DriveFile,
   type OversizeSummarizer

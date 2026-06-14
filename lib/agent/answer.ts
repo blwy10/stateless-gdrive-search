@@ -17,17 +17,32 @@ export function partialAnswer(reason: string, mode: AgentRequest["mode"]) {
   };
 }
 
+/**
+ * Synthesis answers are instructed to begin with a `FORMAT: markdown|plain`
+ * directive line, but the model sometimes prepends a short lead-in sentence
+ * (and/or a `---` rule) before it. A start-anchored (`^FORMAT:`) match missed
+ * that and leaked the literal directive into the rendered answer. We therefore
+ * accept the directive at the start of any line, but only when it sits within
+ * this many leading characters, so a brief preamble is tolerated while an
+ * incidental `FORMAT:` line deep inside a genuine answer can't truncate it.
+ */
+const MAX_FORMAT_PREAMBLE_CHARS = 500;
+
 export function parseFinalAnswer(content: string | null, mode: AgentRequest["mode"]) {
   if (mode === "list") {
     return { answer: "", answerFormat: "plain" as const };
   }
 
   const raw = content?.trim() || "No answer returned.";
-  const match = raw.match(/^FORMAT:\s*(markdown|plain)\s*\n([\s\S]*)$/i);
-  if (match) {
+  // Match a standalone FORMAT directive line wherever it appears near the top —
+  // not only at the very start — and drop everything before it, mirroring how
+  // parseSources tolerates leading content. Requiring a newline/end after the
+  // format word keeps prose like "the FORMAT: markdown option" from matching.
+  const match = raw.match(/(?:^|\n)[ \t]*FORMAT:[ \t]*(markdown|plain)[ \t]*(?:\n([\s\S]*))?$/i);
+  if (match && raw.slice(0, match.index ?? 0).trim().length <= MAX_FORMAT_PREAMBLE_CHARS) {
     return {
       answerFormat: match[1].toLowerCase() === "markdown" ? ("markdown" as const) : ("plain" as const),
-      answer: match[2].trim()
+      answer: (match[2] ?? "").trim()
     };
   }
 

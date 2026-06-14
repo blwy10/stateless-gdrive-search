@@ -152,6 +152,9 @@ export async function handleReviewFileTool(
     // full DEBUG_LOG_TRANSCRIPT dump.
     reason: debugText(verdict.reason),
     entityCount: verdict.entities.length,
+    // Subject-awareness audit trail (see GradeVerdict.aboutSubject): surfaces the
+    // entity-conflation risk of a kept file without exposing content.
+    aboutSubject: verdict.aboutSubject,
     curating,
     reviewFileCallCount: state.reviewFileCallCount,
     keptFileCount: state.kept.size

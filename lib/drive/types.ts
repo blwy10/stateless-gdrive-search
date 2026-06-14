@@ -15,6 +15,17 @@ export type DriveFile = {
 export const MAX_FILE_CHARS = 32_000;
 
 /**
+ * Floor on an accepted oversize-file summary, as a fraction of {@link MAX_FILE_CHARS}
+ * (the budget the summarizer is told to roughly fill). A summary shorter than this
+ * is treated as pathological over-compression — a model that returned a few
+ * sentences for a large document — and {@link resolveFileContent} discards it in
+ * favour of hard truncation, which preserves more of the document than a near-empty
+ * "summary". This is a safety net only; the summarizer's own prompt is the primary
+ * length control. Tune alongside MAX_FILE_CHARS.
+ */
+export const MIN_SUMMARY_CHARS = MAX_FILE_CHARS / 4;
+
+/**
  * Optional hook injected into {@link openDriveFile} to condense a file whose
  * extracted text exceeds {@link MAX_FILE_CHARS} instead of hard-truncating it.
  * Receives the assembled {@link DriveFile} and the full (normalized) text and

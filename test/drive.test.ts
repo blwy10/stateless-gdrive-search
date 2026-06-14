@@ -4,6 +4,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   MAX_FILE_CHARS,
+  MIN_SUMMARY_CHARS,
   buildDriveSearchQuery,
   emptyExtractionNote,
   escapeDriveQuery,
@@ -151,14 +152,27 @@ describe("resolveFileContent", () => {
     expect(result.content.startsWith("x".repeat(MAX_FILE_CHARS))).toBe(true);
   });
 
-  it("uses the summarizer's output for oversize content (summarized)", async () => {
+  it("uses the summarizer's output for oversize content when it meets the floor (summarized)", async () => {
+    const summary = "S".repeat(MIN_SUMMARY_CHARS);
     const result = await resolveFileContent({
       normalized: oversize,
       file: driveFile(),
-      summarizeOversize: async ({ fullText }) => `summary of ${fullText.length} chars`
+      summarizeOversize: async () => summary
     });
     expect(result.disposition).toBe("summarized");
-    expect(result.content).toBe(`summary of ${oversize.length} chars`);
+    expect(result.content).toBe(summary);
+  });
+
+  it("falls back to truncation when the summary is implausibly short (over-compressed)", async () => {
+    // A summary below MIN_SUMMARY_CHARS is treated as pathological over-compression;
+    // truncation preserves more of the document, so it wins.
+    const result = await resolveFileContent({
+      normalized: oversize,
+      file: driveFile(),
+      summarizeOversize: async () => "x".repeat(MIN_SUMMARY_CHARS - 1)
+    });
+    expect(result.disposition).toBe("truncated");
+    expect(result.content).toContain(`[Truncated at ${MAX_FILE_CHARS} characters]`);
   });
 
   it("re-caps a summary that itself overshoots the budget", async () => {
