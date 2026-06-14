@@ -19,3 +19,6 @@ __pycache__/
 
 # Local-only helper scripts (not for the repo)
 merge-main-to-release.sh
+
+# Generated docs (not for the repo)
+system-prompts.md
