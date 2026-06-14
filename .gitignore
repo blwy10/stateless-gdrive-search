@@ -16,3 +16,6 @@ client_secret_*.json
 utils/.venv/
 utils/output/
 __pycache__/
+
+# Local-only helper scripts (not for the repo)
+merge-main-to-release.sh

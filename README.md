@@ -13,11 +13,22 @@ The agent has a small, fixed set of app tools:
   Multi-word queries match any term (not the whole phrase) to favour recall, and a
   search that makes no progress (a repeat, or no new files) returns a corrective
   note nudging the agent to vary its terms.
-- `open_file`: read a selected file's contents (synthesis and uncurated list mode).
-- `review_file`: curated file-list mode only — read a candidate file and judge its
-  relevance in an isolated grader call, keeping it only if relevant. Offered
-  instead of `open_file` when curating, so file contents never accumulate in the
-  agent's context.
+- `open_file`: read a selected file's contents (synthesis mode only). The
+  synthesis answer ends with a `SOURCES:` block citing the files it relied on, and
+  those cited files — not every file it opened — become the result list.
+- `review_file`: both file-list modes — read a candidate file and judge its
+  relevance in an isolated grader call, also reporting notable names/terms to
+  search next. Curated mode keeps a file only if relevant; uncurated returns every
+  match regardless. Offered instead of `open_file` in list modes, so file contents
+  never accumulate in the agent's context.
+
+Each query runs in one of three modes. The UI shows the mode's primary result
+alongside a collapsible **Files touched** disclosure listing every file the agent
+searched, opened, or reviewed this run (the result is always a subset of it):
+
+- **Synthesis** — a written answer plus the files it cited as **Sources**.
+- **List (curated)** — only the files the grader judged relevant.
+- **List (uncurated)** — every file matching the query.
 
 Durable application data is limited to encrypted Google Drive OAuth token material,
 optional encrypted per-user model API keys, and their metadata.

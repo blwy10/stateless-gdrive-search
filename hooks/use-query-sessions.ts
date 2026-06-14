@@ -22,7 +22,13 @@ type StreamEvent =
   | { type: "reviewing"; file: DriveFile }
   | { type: "kept"; file: DriveFile }
   | { type: "discarded"; file: DriveFile }
-  | { type: "final"; answer: string; answerFormat: "markdown" | "plain"; files: DriveFile[] }
+  | {
+      type: "final";
+      answer: string;
+      answerFormat: "markdown" | "plain";
+      files: DriveFile[];
+      touchedFiles: DriveFile[];
+    }
   | { type: "error"; message: string };
 
 export type QuerySession = {
@@ -35,7 +41,13 @@ export type QuerySession = {
   updatedAt: string;
   status: "draft" | "running" | "finished" | "error";
   events: string[];
+  // Primary result list: synthesis -> the files the answer cites; curated list ->
+  // examiner-kept files; uncurated list -> every match. A subset of touchedFiles.
   files: DriveFile[];
+  // Audit/disclosure list: every file the agent encountered this run (search
+  // candidates + opened/reviewed), across all modes. Streamed live via `file`
+  // events and finalized authoritatively by the `final` event.
+  touchedFiles: DriveFile[];
   // Curated list mode only: files the agent is reading and grading right now.
   // Each one resolves to either `files` (kept) or removal (discarded), and the
   // list is cleared when the run settles. Transient/UI-only, but kept on the
@@ -70,6 +82,10 @@ export function useQuerySessions() {
             ...session,
             curateList: session.curateList ?? false,
             answerFormat: session.answerFormat ?? ("plain" as const),
+            // Sessions persisted before the touched/sources split stored every
+            // found file in `files`; treat that as the touched set so the
+            // disclosure still renders for old runs.
+            touchedFiles: session.touchedFiles ?? session.files ?? [],
             reviewingFiles: [],
             ...(session.status === "running"
               ? {
@@ -108,6 +124,17 @@ export function useQuerySessions() {
   const uniqueFiles = useMemo(() => {
     const seen = new Set<string>();
     return (activeSession?.files ?? []).filter((file) => {
+      const key = `${file.connectionId}:${file.id}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }, [activeSession]);
+
+  // The audit/disclosure set: every file the agent touched this run, deduped.
+  const touchedFiles = useMemo(() => {
+    const seen = new Set<string>();
+    return (activeSession?.touchedFiles ?? []).filter((file) => {
       const key = `${file.connectionId}:${file.id}`;
       if (seen.has(key)) return false;
       seen.add(key);
@@ -164,6 +191,7 @@ export function useQuerySessions() {
       status: "draft",
       events: [],
       files: [],
+      touchedFiles: [],
       reviewingFiles: [],
       answer: "",
       answerFormat: "plain",
@@ -277,6 +305,7 @@ export function useQuerySessions() {
       status: "running",
       events: [],
       files: [],
+      touchedFiles: [],
       reviewingFiles: [],
       answer: "",
       answerFormat: "plain",
@@ -329,12 +358,21 @@ export function useQuerySessions() {
               )
             );
           } else if (event.type === "file") {
+            // A file the agent encountered. It always joins the "touched" audit
+            // list; in uncurated list mode it is also a result, so mirror it into
+            // `files` for live streaming. Synthesis sources and curated keeps
+            // arrive authoritatively via `final`/`kept`, so they are not mirrored.
             setSessions((current) =>
-              current.map((item) =>
-                item.id === session.id
-                  ? { ...item, files: [...item.files, event.file], updatedAt: new Date().toISOString() }
-                  : item
-              )
+              current.map((item) => {
+                if (item.id !== session.id) return item;
+                const isUncuratedList = item.mode === "list" && !item.curateList;
+                return {
+                  ...item,
+                  touchedFiles: [...item.touchedFiles, event.file],
+                  ...(isUncuratedList ? { files: [...item.files, event.file] } : {}),
+                  updatedAt: new Date().toISOString()
+                };
+              })
             );
           } else if (event.type === "reviewing") {
             // Curated mode: a provisional candidate the agent is still judging.
@@ -395,6 +433,7 @@ export function useQuerySessions() {
                       answer: event.answer,
                       answerFormat: event.answerFormat,
                       files: event.files,
+                      touchedFiles: event.touchedFiles,
                       reviewingFiles: [],
                       error: "",
                       updatedAt: new Date().toISOString()
@@ -452,6 +491,7 @@ export function useQuerySessions() {
     activeSessionId,
     activeSession,
     uniqueFiles,
+    touchedFiles,
     reviewingFiles,
     runningSessionCount,
     query,

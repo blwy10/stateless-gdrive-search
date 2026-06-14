@@ -8,6 +8,8 @@ import {
   handleSearchTool,
   normalizeGradeVerdict,
   parseFinalAnswer,
+  parseSources,
+  resolveSources,
   resolveUsageTokens,
   type AgentProgress,
   type AgentRunContext,
@@ -55,12 +57,13 @@ function makeContext(overrides: Partial<AgentRunContext> = {}): AgentRunContext 
 
 function makeState(overrides: Partial<AgentRunState> = {}): AgentRunState {
   return {
-    referencedFiles: [],
+    touchedFiles: [],
     openedFiles: [],
     reviewedFiles: [],
     keptFiles: [],
     searchedQueries: new Set<string>(),
     knownFileKeys: new Set<string>(),
+    touchedFileKeys: new Set<string>(),
     openedFileKeys: new Set<string>(),
     reviewedFileKeys: new Set<string>(),
     keptFileKeys: new Set<string>(),
@@ -173,6 +176,89 @@ describe("parseFinalAnswer", () => {
       answer: text,
       answerFormat: "plain"
     });
+  });
+});
+
+describe("parseSources", () => {
+  it("returns the body unchanged with no citations when there is no SOURCES block", () => {
+    expect(parseSources("# Answer\nsome prose")).toEqual({
+      body: "# Answer\nsome prose",
+      citations: []
+    });
+  });
+
+  it("strips a trailing SOURCES block and parses connectionId/fileId pairs", () => {
+    const { body, citations } = parseSources(
+      "The answer body.\n\nSOURCES:\nc1/f1\nc2/f2"
+    );
+    expect(body).toBe("The answer body.");
+    expect(citations).toEqual([
+      { connectionId: "c1", fileId: "f1" },
+      { connectionId: "c2", fileId: "f2" }
+    ]);
+  });
+
+  it("tolerates bullets and case, and dedupes repeated citations", () => {
+    const { body, citations } = parseSources(
+      "Body.\nsources:\n- c1/f1\n* c1/f1\n  c2/f2  "
+    );
+    expect(body).toBe("Body.");
+    expect(citations).toEqual([
+      { connectionId: "c1", fileId: "f1" },
+      { connectionId: "c2", fileId: "f2" }
+    ]);
+  });
+
+  it("ignores malformed citation lines (no slash, empty halves)", () => {
+    const { citations } = parseSources("Body.\nSOURCES:\nnot-a-pair\n/f1\nc1/\nc1/f1");
+    expect(citations).toEqual([{ connectionId: "c1", fileId: "f1" }]);
+  });
+
+  it("does not treat inline 'sources:' prose as a block", () => {
+    // "sources:" is followed by text on the same line, so it is not a block.
+    const answer = "We pulled from many sources: docs and sheets.";
+    expect(parseSources(answer)).toEqual({ body: answer, citations: [] });
+  });
+});
+
+describe("resolveSources", () => {
+  const touched = [file("c1", "f1", "Doc 1"), file("c1", "f2", "Doc 2"), file("c2", "f3", "Doc 3")];
+
+  it("resolves cited ids to full files, dropping ids the agent never saw", () => {
+    const resolved = resolveSources(
+      [
+        { connectionId: "c1", fileId: "f2" },
+        { connectionId: "c9", fileId: "ghost" } // never touched -> hallucination guard
+      ],
+      touched,
+      []
+    );
+    expect(resolved).toEqual([file("c1", "f2", "Doc 2")]);
+  });
+
+  it("dedupes resolved files", () => {
+    const resolved = resolveSources(
+      [
+        { connectionId: "c1", fileId: "f1" },
+        { connectionId: "c1", fileId: "f1" }
+      ],
+      touched,
+      []
+    );
+    expect(resolved).toEqual([file("c1", "f1", "Doc 1")]);
+  });
+
+  it("falls back to opened files when no citation resolves", () => {
+    const opened = [file("c1", "f1", "Doc 1")];
+    // Empty citations, or only-unknown citations, both fall back to opened.
+    expect(resolveSources([], touched, opened)).toEqual(opened);
+    expect(
+      resolveSources([{ connectionId: "zzz", fileId: "nope" }], touched, opened)
+    ).toEqual(opened);
+  });
+
+  it("returns an empty list when nothing resolves and nothing was opened", () => {
+    expect(resolveSources([], touched, [])).toEqual([]);
   });
 });
 
@@ -290,10 +376,10 @@ describe("handleOpenFileTool", () => {
     expect(payload.error).toBe(true);
     expect(payload.message).toContain("403");
     // The failed file is still counted and marked opened so the run won't retry
-    // it, but it must not be recorded as a usable source.
+    // it, but it must not be recorded as opened or touched.
     expect(runState.openFileCallCount).toBe(1);
     expect(runState.openedFiles).toHaveLength(0);
-    expect(runState.referencedFiles).toHaveLength(0);
+    expect(runState.touchedFiles).toHaveLength(0);
   });
 
   it("rejects an out-of-scope connectionId as an observation instead of throwing", async () => {
@@ -323,7 +409,7 @@ describe("handleOpenFileTool", () => {
     // The out-of-scope call must not consume budget or be recorded as opened.
     expect(runState.openFileCallCount).toBe(0);
     expect(runState.openedFiles).toHaveLength(0);
-    expect(runState.referencedFiles).toHaveLength(0);
+    expect(runState.touchedFiles).toHaveLength(0);
   });
 
   it("returns an error observation for malformed JSON arguments instead of throwing", async () => {
@@ -374,10 +460,10 @@ describe("handleOpenFileTool", () => {
     const payload = JSON.parse(result.content) as { content?: string };
     expect(payload.content).toBe("hello world");
     expect(runState.openedFiles).toHaveLength(1);
-    expect(runState.referencedFiles).toHaveLength(1);
+    expect(runState.touchedFiles).toHaveLength(1);
   });
 
-  it("always records an opened file as a result (open_file is non-curated only)", async () => {
+  it("records an opened file in the touched set and emits a file event", async () => {
     vi.mocked(openDriveFile).mockResolvedValue({
       file: file("c1", "f1", "Doc"),
       content: "hello world"
@@ -393,7 +479,7 @@ describe("handleOpenFileTool", () => {
     await handleOpenFileTool(context, runState, 0, openCall("call-3"));
 
     expect(runState.openedFiles).toHaveLength(1);
-    expect(runState.referencedFiles).toHaveLength(1);
+    expect(runState.touchedFiles).toHaveLength(1);
     expect(events.some((event) => event.type === "file")).toBe(true);
     expect(events.some((event) => event.type === "reviewing")).toBe(false);
   });
@@ -595,9 +681,33 @@ describe("handleSearchTool", () => {
     const payload = JSON.parse(result.content) as { files?: unknown[]; note?: string };
     expect(payload.files).toHaveLength(2);
     expect(payload.note).toBeUndefined();
-    expect(runState.referencedFiles).toHaveLength(2);
+    expect(runState.touchedFiles).toHaveLength(2);
     // New results reset the diminishing-returns clock to the current spend.
     expect(runState.tokensAtLastProgress).toBe(5_000);
+  });
+
+  it("in curated mode, search records touched files and emits them but is not progress", async () => {
+    vi.mocked(searchDriveFiles).mockReset();
+    vi.mocked(searchDriveFiles).mockResolvedValue([file("c1", "f1"), file("c1", "f2")]);
+    const runState = makeState({ tokensSpent: 5_000, tokensAtLastProgress: 0 });
+    const events: AgentProgress[] = [];
+    const context = curatedContext({
+      emit: (event) => {
+        events.push(event);
+      }
+    });
+
+    const result = await handleSearchTool(context, runState, 0, searchCall("s1", "alpha beta"));
+
+    const payload = JSON.parse(result.content) as { files?: unknown[] };
+    // Candidates are still returned to the model and tracked/streamed as touched
+    // for the audit disclosure...
+    expect(payload.files).toHaveLength(2);
+    expect(runState.touchedFiles).toHaveLength(2);
+    expect(events.filter((event) => event.type === "file")).toHaveLength(2);
+    // ...but a bare search hit is a candidate, not a result, in curated mode, so
+    // it must NOT reset the diminishing-returns clock (only an examiner keep does).
+    expect(runState.tokensAtLastProgress).toBe(0);
   });
 
   it("does NOT flag a search that overlaps already-seen files (cheap searches are not penalized)", async () => {

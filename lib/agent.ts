@@ -141,6 +141,10 @@ export type AgentOptions = {
 
 export type AgentProgress =
   | { type: "progress"; message: string }
+  // A file the agent encountered this run — a new search candidate, or one it
+  // opened/reviewed. Streams into the UI's "files touched" disclosure (all
+  // modes); in uncurated list mode it is also a result. Every emitted file is a
+  // member of the `touchedFiles` audit set on the `final` event.
   | { type: "file"; file: DriveFile }
   // Curated list mode only: a file the agent is reading and grading right now.
   // Provisional — it resolves to exactly one of `kept` or `discarded`.
@@ -151,7 +155,17 @@ export type AgentProgress =
   // Curated list mode only: a reviewed file the grader judged not relevant, so
   // the UI can drop it from the provisional "reviewing" state.
   | { type: "discarded"; file: DriveFile }
-  | { type: "final"; answer: string; answerFormat: "markdown" | "plain"; files: DriveFile[] }
+  // Terminal event. `files` is the primary result list (synthesis -> the files
+  // the answer cites; curated list -> examiner-kept; uncurated list -> every
+  // match); `touchedFiles` is the full audit set the agent encountered this run
+  // (a superset of `files`), surfaced behind the UI's disclosure.
+  | {
+      type: "final";
+      answer: string;
+      answerFormat: "markdown" | "plain";
+      files: DriveFile[];
+      touchedFiles: DriveFile[];
+    }
   | { type: "error"; message: string };
 
 const searchArgs = z.object({
@@ -238,14 +252,16 @@ function synthesisSystemPrompt(allowedDriveIds: string[]) {
   return `${basePrompt(allowedDriveIds)}
 
 Open files whose titles look relevant; what you read can suggest new searches.
-Return a concise synthesis answering the user's query, followed by the source files you relied on.
+Return a concise synthesis answering the user's query.
 Your final response must start with exactly one format line:
 FORMAT: markdown
 or
 FORMAT: plain
 Then put the answer body after that line.
 Use markdown only when headings, lists, links, or other markdown structure materially improve readability.
-Never return HTML or any format other than markdown or plain.`;
+Never return HTML or any format other than markdown or plain.
+After the answer body, cite the files you actually relied on as a trailing block: a line containing exactly SOURCES: on its own, then one line per file in the form connectionId/fileId, copying both ids verbatim from a search_drive or open_file result.
+List only files whose content you used; omit the SOURCES block entirely if you relied on none. Do not list or mention the source files anywhere else in the answer body.`;
 }
 
 function listSystemPrompt(
@@ -683,6 +699,73 @@ export function parseFinalAnswer(content: string | null, mode: AgentRequest["mod
   };
 }
 
+/** A source citation the synthesis model emits in its trailing `SOURCES:` block. */
+export type SourceCitation = { connectionId: string; fileId: string };
+
+/**
+ * Split a synthesis answer into its prose body and the structured source
+ * citations the model lists in a trailing `SOURCES:` block (it is instructed to
+ * end with one — see {@link synthesisSystemPrompt}). The block starts at a line
+ * that is just `SOURCES:` (case-insensitive, an optional `-`/`*` bullet
+ * tolerated, must be alone on its line so prose like "the sources: a, b" is not
+ * mistaken for it) and runs to the end of the text; each following non-empty
+ * line is a `connectionId/fileId` pair (leading bullet tolerated, split on the
+ * first `/` — Drive ids contain no slash). The block is stripped from the
+ * returned `body` so the UI renders structured source cards instead of a
+ * duplicated prose list. Unparseable lines are skipped and citations are deduped;
+ * with no block the body is returned unchanged and the citation list is empty.
+ * Only meaningful for synthesis (list modes have no answer body).
+ */
+export function parseSources(answer: string): { body: string; citations: SourceCitation[] } {
+  const match = answer.match(/(?:^|\n)[ \t]*(?:[-*]\s*)?SOURCES:[ \t]*\n?([\s\S]*)$/i);
+  if (!match) return { body: answer.trim(), citations: [] };
+  const body = answer.slice(0, match.index).trim();
+  const citations: SourceCitation[] = [];
+  const seen = new Set<string>();
+  for (const line of (match[1] ?? "").split("\n")) {
+    const entry = line.trim().replace(/^[-*]\s*/, "");
+    if (!entry) continue;
+    const slash = entry.indexOf("/");
+    if (slash <= 0 || slash >= entry.length - 1) continue;
+    const connectionId = entry.slice(0, slash).trim();
+    const fileId = entry.slice(slash + 1).trim();
+    if (!connectionId || !fileId) continue;
+    const dedupeKey = `${connectionId}:${fileId}`;
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+    citations.push({ connectionId, fileId });
+  }
+  return { body, citations };
+}
+
+/**
+ * Resolve a synthesis answer's source citations to full {@link DriveFile}s for
+ * display, looking each `connectionId/fileId` up among the files the agent
+ * actually encountered this run (`touched`). Citations the agent never saw are
+ * dropped — the hallucination guard, so a fabricated id can't show up as a
+ * "source". If nothing resolves (the model omitted the block, or only cited
+ * unknown ids) we fall back to the files it opened: the best available proxy for
+ * "relied on", so a synthesis that read files never shows a sourceless result.
+ * Returns a deduped list.
+ */
+export function resolveSources(
+  citations: SourceCitation[],
+  touched: DriveFile[],
+  opened: DriveFile[]
+): DriveFile[] {
+  const byKey = new Map(touched.map((file) => [fileKey(file), file] as const));
+  const resolved: DriveFile[] = [];
+  const seen = new Set<string>();
+  for (const citation of citations) {
+    const key = fileKey({ connectionId: citation.connectionId, id: citation.fileId });
+    const matched = byKey.get(key);
+    if (!matched || seen.has(key)) continue;
+    seen.add(key);
+    resolved.push(matched);
+  }
+  return resolved.length > 0 ? resolved : uniqueFiles(opened);
+}
+
 function isRetryableToolError(error: unknown) {
   if (!(error instanceof Error)) return false;
   return /\b(408|409|429|500|502|503|504)\b/.test(error.message);
@@ -786,7 +869,15 @@ export type AgentRunContext = {
  * budget/stop decisions and to assemble the final result.
  */
 export type AgentRunState = {
-  referencedFiles: DriveFile[];
+  /**
+   * Every file the agent encountered this run — search candidates plus any it
+   * opened or reviewed — across all modes. The audit/"touched" set surfaced in
+   * the UI's disclosure, and the superset the synthesis citation resolver
+   * ({@link resolveSources}) looks cited files up in. Deduped via
+   * {@link touchedFileKeys}; appended (and streamed as a `file` event) by
+   * {@link recordTouched}.
+   */
+  touchedFiles: DriveFile[];
   openedFiles: DriveFile[];
   /**
    * List modes: every file run through the examiner. Tracked for visibility/
@@ -800,6 +891,8 @@ export type AgentRunState = {
   keptFiles: DriveFile[];
   searchedQueries: Set<string>;
   knownFileKeys: Set<string>;
+  /** Dedupe set backing {@link touchedFiles} (the audit/disclosure set). */
+  touchedFileKeys: Set<string>;
   openedFileKeys: Set<string>;
   reviewedFileKeys: Set<string>;
   keptFileKeys: Set<string>;
@@ -842,6 +935,27 @@ export type AgentRunState = {
    */
   currentStep: number;
 };
+
+/**
+ * Record a file in the run's "touched" set — the audit/disclosure list shown in
+ * the UI and the lookup table for {@link resolveSources} — exactly once, and
+ * stream it as a `file` event. Idempotent via
+ * {@link AgentRunState.touchedFileKeys}: a file surfaced by several searches (or
+ * surfaced and later opened/reviewed) is tracked and emitted a single time.
+ * Touched is a superset of every per-mode result list (see the `file`/`final`
+ * events on {@link AgentProgress}).
+ */
+async function recordTouched(
+  state: AgentRunState,
+  file: DriveFile,
+  emit: AgentRunContext["emit"]
+) {
+  const key = fileKey(file);
+  if (state.touchedFileKeys.has(key)) return;
+  state.touchedFileKeys.add(key);
+  state.touchedFiles.push(file);
+  await emit({ type: "file", file });
+}
 
 /**
  * Handle a single `search_drive` tool call: enforce the search budget, run the
@@ -935,17 +1049,17 @@ export async function handleSearchTool(
   for (const file of files) {
     state.knownFileKeys.add(fileKey(file));
   }
-  // Non-curated runs (synthesis and uncurated list) return every file a search
-  // surfaces, so each newly-seen file is a result: record it (and only emit it
-  // once). Surfacing new files is "useful progress" that resets the
-  // diminishing-returns clock. Curated runs return only examiner-kept files, so
-  // search hits there are candidates, not results.
-  if (!input.curateList && newFiles.length > 0) {
-    state.referencedFiles.push(...newFiles);
+  // Record every newly-seen file in the run's "touched" set and stream it to the
+  // UI (all modes — touched is the audit/disclosure list). Surfacing a candidate
+  // counts as "useful progress" (resetting the diminishing-returns clock) only
+  // when surfaced files ARE the result: non-curated runs (synthesis/uncurated)
+  // return what searches surface, while curated returns only examiner-kept
+  // files, so a bare search hit there is a candidate, not progress.
+  if (newFiles.length > 0) {
     for (const file of newFiles) {
-      await emit({ type: "file", file });
+      await recordTouched(state, file, emit);
     }
-    recordUsefulProgress(state);
+    if (!input.curateList) recordUsefulProgress(state);
   }
   const note = combineNotes(
     searchResultNote(wasRepeatedQuery, files.length),
@@ -1073,13 +1187,15 @@ export async function handleOpenFileTool(
   });
   state.knownFileKeys.add(fileKey(opened.file));
   state.openedFiles.push(opened.file);
-  // open_file is offered only in synthesis (list modes examine via review_file
-  // instead), so an opened file is always a result to surface — and reading a new
-  // file is useful progress that resets the diminishing-returns clock.
-  state.referencedFiles.push(opened.file);
+  // open_file is offered only in synthesis (list modes examine via review_file).
+  // An opened file belongs to the run's touched set (recordTouched is idempotent,
+  // so a file already surfaced by a prior search is not double-tracked or
+  // re-emitted), and reading a new file is useful progress that resets the
+  // diminishing-returns clock. Whether it becomes a *result* is decided at the
+  // end by the model's citations (see resolveSources), not by opening alone.
   recordUsefulProgress(state);
   await emit({ type: "progress", message: `Opened ${formatFileProgressLabel(opened.file)}` });
-  await emit({ type: "file", file: opened.file });
+  await recordTouched(state, opened.file, emit);
   return {
     role: "tool",
     tool_call_id: toolCall.id,
@@ -1197,6 +1313,10 @@ export async function handleReviewFileTool(
   state.knownFileKeys.add(openedKey);
   state.reviewedFileKeys.add(openedKey);
   state.reviewedFiles.push(opened.file);
+  // A reviewed file is part of the touched set too. In practice it was already a
+  // search candidate (so this is a no-op), but recording it here keeps the
+  // invariant "everything the agent read is touched" even for any edge path.
+  await recordTouched(state, opened.file, emit);
   // The provisional `reviewing` -> `kept`/`discarded` event sequence is a curated
   // UI concept (it shows files being filtered live). Uncurated returns every match
   // regardless, so it only emits a neutral "Examining" progress line.
@@ -1479,12 +1599,13 @@ export async function runDriveAgent(
   }
 
   const state: AgentRunState = {
-    referencedFiles: [],
+    touchedFiles: [],
     openedFiles: [],
     reviewedFiles: [],
     keptFiles: [],
     searchedQueries: new Set<string>(),
     knownFileKeys: new Set<string>(),
+    touchedFileKeys: new Set<string>(),
     openedFileKeys: new Set<string>(),
     reviewedFileKeys: new Set<string>(),
     keptFileKeys: new Set<string>(),
@@ -1523,12 +1644,32 @@ export async function runDriveAgent(
   };
   const curating = isCuratingRequest(input);
   const listMode = input.mode === "list";
-  // In curated mode the result is exactly the set of files the grader kept, built
-  // up live as review_file runs. An empty kept set is a valid "nothing relevant"
-  // result, so there is no opened-files fallback. Uncurated/synthesis runs return
-  // every referenced file.
-  const finalFiles = () =>
-    curating ? uniqueFiles(state.keptFiles) : uniqueFiles(state.referencedFiles);
+  // Assemble the terminal payload from the parsed answer. Two file lists:
+  //  - `files` (primary result): synthesis -> the files the answer cites
+  //    (resolved from the SOURCES block via resolveSources, falling back to
+  //    opened files); curated list -> examiner-kept files (an empty set is a
+  //    valid "nothing relevant"); uncurated list -> every touched file (all
+  //    matches).
+  //  - `touchedFiles` (audit/disclosure): every file the agent encountered.
+  // For synthesis the SOURCES block is also stripped from the answer body so the
+  // UI shows structured source cards instead of a duplicated prose list.
+  const buildResult = (parsed: { answer: string; answerFormat: "markdown" | "plain" }) => {
+    let answer = parsed.answer;
+    let files: DriveFile[];
+    if (input.mode === "synthesis") {
+      const parsedSources = parseSources(answer);
+      answer = parsedSources.body;
+      files = resolveSources(parsedSources.citations, state.touchedFiles, state.openedFiles);
+    } else {
+      files = curating ? uniqueFiles(state.keptFiles) : uniqueFiles(state.touchedFiles);
+    }
+    return {
+      answer,
+      answerFormat: parsed.answerFormat,
+      files,
+      touchedFiles: uniqueFiles(state.touchedFiles)
+    };
+  };
   const systemPromptText = systemPrompt(input, selectedDriveIds);
   const userText = `Query: ${input.query}\nMode: ${input.mode}\nCurate list: ${input.curateList}`;
   const tools = buildAgentTools(context, state);
@@ -1609,11 +1750,11 @@ export async function runDriveAgent(
       forcedFinalAnswer = finalText !== null;
     }
 
-    const { answer, answerFormat } =
+    const { answer, answerFormat, files, touchedFiles } = buildResult(
       finalText !== null && finalText.trim()
         ? parseFinalAnswer(finalText, input.mode)
-        : partialAnswer(stopReason, input.mode);
-    const files = finalFiles();
+        : partialAnswer(stopReason, input.mode)
+    );
     await writeDebugLog({
       event: "agent.completed",
       requestId,
@@ -1624,7 +1765,7 @@ export async function runDriveAgent(
       searchCallCount: state.searchCallCount,
       openFileCallCount: state.openFileCallCount,
       reviewFileCallCount: state.reviewFileCallCount,
-      referencedFileCount: state.referencedFiles.length,
+      touchedFileCount: state.touchedFiles.length,
       keptFileCount: state.keptFiles.length,
       reviewedFileCount: state.reviewedFiles.length,
       returnedFileCount: files.length,
@@ -1634,7 +1775,7 @@ export async function runDriveAgent(
       answerFormat,
       answerLength: answer.length
     });
-    await emit({ type: "final", answer, answerFormat, files });
+    await emit({ type: "final", answer, answerFormat, files, touchedFiles });
   } catch (error) {
     // Never discard gathered work: a throw (model error after retries, an
     // unrepairable/hallucinated tool call, a timeout) finalizes with whatever the
@@ -1646,11 +1787,9 @@ export async function runDriveAgent(
       durationMs: Date.now() - startedAt,
       error: debugError(error)
     });
-    const { answer, answerFormat } = partialAnswer(
-      "The agent run ended early due to an error.",
-      input.mode
+    const { answer, answerFormat, files, touchedFiles } = buildResult(
+      partialAnswer("The agent run ended early due to an error.", input.mode)
     );
-    const files = finalFiles();
     await writeDebugLog({
       event: "agent.completed",
       requestId,
@@ -1659,7 +1798,7 @@ export async function runDriveAgent(
       searchCallCount: state.searchCallCount,
       openFileCallCount: state.openFileCallCount,
       reviewFileCallCount: state.reviewFileCallCount,
-      referencedFileCount: state.referencedFiles.length,
+      touchedFileCount: state.touchedFiles.length,
       keptFileCount: state.keptFiles.length,
       reviewedFileCount: state.reviewedFiles.length,
       returnedFileCount: files.length,
@@ -1667,6 +1806,6 @@ export async function runDriveAgent(
       answerFormat,
       answerLength: answer.length
     });
-    await emit({ type: "final", answer, answerFormat, files });
+    await emit({ type: "final", answer, answerFormat, files, touchedFiles });
   }
 }

@@ -5,7 +5,7 @@
 
 import { MarkdownContent } from "@/components/markdown";
 import { SettingsDialog, type ModelSettingsSummary } from "@/components/settings-dialog";
-import { useQuerySessions } from "@/hooks/use-query-sessions";
+import { useQuerySessions, type DriveFile } from "@/hooks/use-query-sessions";
 import { formatMimeType } from "@/lib/file-types";
 import { signIn, signOut } from "next-auth/react";
 import { useCallback, useState } from "react";
@@ -40,12 +40,14 @@ export function SearchApp({
     initialModelSettings
   );
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [touchedOpen, setTouchedOpen] = useState(false);
 
   const {
     sessions,
     activeSessionId,
     activeSession,
     uniqueFiles,
+    touchedFiles,
     reviewingFiles,
     runningSessionCount,
     query,
@@ -66,6 +68,15 @@ export function SearchApp({
   } = useQuerySessions();
 
   const hasConnections = connections.length > 0;
+
+  const isSynthesis = activeSession?.mode === "synthesis";
+  const isUncuratedList = activeSession?.mode === "list" && !activeSession.curateList;
+  // Synthesis shows the files the answer cites ("Sources"); list modes show the
+  // matched/kept files ("Files").
+  const primaryFilesLabel = isSynthesis ? "Sources" : "Files";
+  // The "files touched" audit set equals the result list in uncurated mode (there
+  // every match is a result), so only disclose it where it adds signal.
+  const showTouched = touchedFiles.length > 0 && !isUncuratedList;
 
   const statusState = activeSession?.status === "running"
     ? "running"
@@ -399,25 +410,40 @@ export function SearchApp({
               {uniqueFiles.length > 0 ? (
                 <section className="panel">
                   <div className="panel-header">
-                    <h2>Files</h2>
+                    <h2>{primaryFilesLabel}</h2>
+                    {isSynthesis ? (
+                      <p className="panel-subtitle">Files the answer cites.</p>
+                    ) : null}
                   </div>
                   <div className="panel-body">
-                    <ul className="file-list">
-                      {uniqueFiles.map((file) => (
-                        <li className="file-card" key={`${file.connectionId}:${file.id}`}>
-                          {file.webViewLink ? (
-                            <a href={file.webViewLink} target="_blank" rel="noreferrer">
-                              {file.name}
-                            </a>
-                          ) : (
-                            <strong>{file.name}</strong>
-                          )}
-                          <span className="muted">Drive account: {file.driveEmail}</span>
-                          <span className="muted">Type: {formatMimeType(file.mimeType)}</span>
-                        </li>
-                      ))}
-                    </ul>
+                    <FileList files={uniqueFiles} />
                   </div>
+                </section>
+              ) : null}
+
+              {showTouched ? (
+                <section className="panel">
+                  <div className="panel-header">
+                    <h2>Files touched</h2>
+                    <button
+                      className="progress-toggle"
+                      type="button"
+                      aria-expanded={touchedOpen}
+                      onClick={() => setTouchedOpen((open) => !open)}
+                    >
+                      {touchedOpen ? "Hide" : "Show"}
+                      <span className="muted">({touchedFiles.length})</span>
+                    </button>
+                  </div>
+                  {touchedOpen ? (
+                    <div className="panel-body">
+                      <p className="panel-subtitle">
+                        Every file the agent searched, opened, or reviewed this run. The{" "}
+                        {primaryFilesLabel.toLowerCase()} above are the subset it relied on.
+                      </p>
+                      <FileList files={touchedFiles} />
+                    </div>
+                  ) : null}
                 </section>
               ) : null}
 
@@ -488,6 +514,26 @@ function downloadAnswer(answer: string, format: "markdown" | "plain", query: str
   link.click();
   document.body.removeChild(link);
   URL.revokeObjectURL(url);
+}
+
+function FileList({ files }: { files: DriveFile[] }) {
+  return (
+    <ul className="file-list">
+      {files.map((file) => (
+        <li className="file-card" key={`${file.connectionId}:${file.id}`}>
+          {file.webViewLink ? (
+            <a href={file.webViewLink} target="_blank" rel="noreferrer">
+              {file.name}
+            </a>
+          ) : (
+            <strong>{file.name}</strong>
+          )}
+          <span className="muted">Drive account: {file.driveEmail}</span>
+          <span className="muted">Type: {formatMimeType(file.mimeType)}</span>
+        </li>
+      ))}
+    </ul>
+  );
 }
 
 function AnswerView({ answer, format }: { answer: string; format: "markdown" | "plain" }) {

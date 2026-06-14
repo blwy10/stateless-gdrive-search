@@ -10,7 +10,9 @@
   `encryptSecret`/`decryptSecret`, the SSRF guard
   (`validatePublicHttpsBaseUrl`/`isPrivateIpv4`/`isPrivateIpv6`/`isPrivateAddress`),
   `escapeDriveQuery`, `buildDriveSearchQuery` (the Drive `q` builder — see "Drive
-  search recall" below), `emptyExtractionNote`, `parseFinalAnswer`, `resolveRoleSettings`
+  search recall" below), `emptyExtractionNote`, `parseFinalAnswer`,
+  `parseSources`/`resolveSources` (the synthesis citation parser + resolver — see
+  "File display: results vs touched" below), `resolveRoleSettings`
   (the per-role main/grader model resolver in `lib/model-settings.ts`, covered by
   `test/model-settings.test.ts`),
   `normalizeGradeVerdict` (the examiner's verdict normaliser — trims and caps the
@@ -31,7 +33,10 @@
   `search_drive` notes (a productive search records progress and carries no `note`;
   a repeated query and a query that matches nothing each attach a corrective
   `note`, while a query that merely *overlaps* already-seen files is deliberately
-  NOT flagged — searches are cheap, see "Drive search recall" below) and the
+  NOT flagged — searches are cheap, see "Drive search recall" below), that a
+  search records every new hit into the run's *touched* set and streams it in all
+  modes (in curated that hit is a candidate, not progress, so it must NOT reset
+  the diminishing-returns clock — `tokensAtLastProgress` stays put) and the
   search backstop (it sets `stopSearchingReason`, not `windDownReason`, so reading
   continues), and the
   `review_file` flow via `handleReviewFileTool` for both list modes (curated: keep
@@ -190,9 +195,41 @@
   recorded on `agent.tool.review_file.completed`.
 
   The set of kept files (`AgentRunState.keptFiles`) is the authoritative curated
-  result — there is no end-of-run marker, and no opened-files fallback: with the
-  examiner judging every file explicitly, an empty kept set is a valid "nothing
-  relevant" result.
+  *primary* result — there is no end-of-run marker, and no opened-files fallback:
+  with the examiner judging every file explicitly, an empty kept set is a valid
+  "nothing relevant" result. (Curated runs still accumulate a *touched* set for the
+  audit disclosure — see the next section.)
+
+## File display: results vs touched
+
+  The agent surfaces two file lists on the terminal `final` event (and the UI
+  renders them as two panels): a **primary result list** (`files`) and an **audit
+  "touched" list** (`touchedFiles`), where `touchedFiles` ⊇ `files` always.
+
+  - `touchedFiles` is every file the agent *encountered* this run — search
+    candidates plus anything it opened/reviewed — tracked uniformly across all
+    modes by `recordTouched` (which dedupes via `state.touchedFileKeys` and emits
+    one `file` event per file). It is the disclosure ("Files touched") the UI
+    hides behind a toggle. `state.touchedFiles` replaced the old, misnamed
+    `referencedFiles` and is now populated in curated mode too.
+  - `files` is the per-mode **result** — the thing the user actually wants:
+    - **synthesis** → the files the answer *cites*. The model ends its answer with
+      a trailing `SOURCES:` block of `connectionId/fileId` lines (see
+      `synthesisSystemPrompt`); `parseSources` strips that block from the rendered
+      answer (so the prose isn't duplicated) and `resolveSources` looks each
+      citation up in `touchedFiles` — dropping ids the agent never saw (the
+      hallucination guard) and falling back to `state.openedFiles` when nothing
+      resolves, so a synthesis that read files never shows a sourceless result.
+    - **curated list** → `keptFiles` (examiner-kept; see above).
+    - **uncurated list** → every touched file (all matches; here result == touched,
+      so the UI auto-hides the redundant disclosure).
+
+  `buildResult` (in `runDriveAgent`) assembles both lists for the `final` event in
+  both the success and error/partial branches. Live streaming: `file` events feed
+  the touched list in all modes; the hook also mirrors them into the primary list
+  *only* in uncurated mode (where they are results), while curated keeps stream via
+  `kept` and synthesis sources resolve only at `final`. Opening a file in synthesis
+  is therefore no longer what makes it a result — the model's citation is.
 
 ## Budget: diminishing returns, not caps
 
