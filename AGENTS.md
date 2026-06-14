@@ -10,11 +10,14 @@
   `encryptSecret`/`decryptSecret`, the SSRF guard
   (`validatePublicHttpsBaseUrl`/`isPrivateIpv4`/`isPrivateIpv6`/`isPrivateAddress`),
   `escapeDriveQuery`, `buildDriveSearchQuery` (the Drive `q` builder — see "Drive
-  search recall" below), `emptyExtractionNote`, `parseFinalAnswer`,
+  search recall" below), `emptyExtractionNote`, `resolveFileContent` (the
+  per-file content-cap resolver in `lib/drive.ts` — full/empty/truncated/summarized
+  disposition, with a fake summarizer hook; see "Oversize files" below),
+  `parseFinalAnswer`,
   `parseSources`/`resolveSources` (the synthesis citation parser + resolver — see
   "File display: results vs touched" below), `resolveRoleSettings`
-  (the per-role main/grader model resolver in `lib/model-settings.ts`, covered by
-  `test/model-settings.test.ts`) and `coerceReasoningEffort` (the
+  (the per-role main/grader/summarizer model resolver in `lib/model-settings.ts`,
+  covered by `test/model-settings.test.ts`) and `coerceReasoningEffort` (the
   reasoning-effort normaliser for STORED values — trims/lower-cases to one of
   `none|minimal|low|medium|high`, else defaults to `"none"` = the explicit
   provider default; never null; same file/test — see "Reasoning effort" below),
@@ -63,7 +66,13 @@
   events; plus dedupe of already-examined files, the out-of-scope guard, the
   open-failure path, that the file's content is never returned into the main loop,
   that `entities` ARE returned, and that a diminishing-returns `note` attaches once
-  spend has stalled past the soft limit). The handlers still take the
+  spend has stalled past the soft limit). It also covers the oversize-file path
+  (see "Oversize files"): `summarizeOversizeContent` (success returns the trimmed
+  summary + folds usage; an empty result or a thrown model call returns
+  `{ summary: null }` so the caller truncates, never aborts), and that
+  `handleOpenFileTool` passes the `summarizeOversize` hook to `openDriveFile`
+  (so an oversize synthesis read is condensed) while `handleReviewFileTool` does
+  NOT (list mode keeps truncation). The handlers still take the
   OpenAI-style `ToolCall` shape; the AI SDK tools in `buildAgentTools` are thin
   adapters over them, so testing the handlers directly still exercises the real
   run-resilience behaviour. Add new tests here when you touch these functions.
@@ -325,16 +334,19 @@
   summed on top — that would double-count. The estimate path is the only place a
   fudge (`TOKEN_ESTIMATE_MULTIPLIER`, default 1) applies; real provider numbers are
   used as-is, and the context-window guard tracks raw `inputTokens` only. Raw usage
-  is logged on `agent.model.completed` / `agent.grade.completed` for tuning.
+  is logged on `agent.model.completed` / `agent.grade.completed` /
+  `agent.summarize.completed` for tuning.
 
   There is intentionally **no** `open_file`/`review_file` count budget anymore —
   reading is governed by diminishing returns + the context/cost backstops. Honesty
   checks that are baked in (see the design thread): a deterministic backstop always
   remains (token usage may be unreported); the DR signal lags, so thresholds are
-  generous and reset on progress; synthesis has no per-file value signal until a
-  future summariser, so its "useful progress" is just reading a new file (DR there
-  leans on `maxContextInputTokens` + the model's own judgement); and the knob moves
-  from "a cap" to "a slope threshold", so tune it from real runs.
+  generous and reset on progress; synthesis has no per-file *relevance* signal until
+  a future synthesis-side examiner (distinct from the content-condensing
+  `summarizer` role, which has no verdict), so its "useful progress" is just reading
+  a new file (DR there leans on `maxContextInputTokens` + the model's own
+  judgement); and the knob moves from "a cap" to "a slope threshold", so tune it
+  from real runs.
 
   Multi-provider settings: `lib/model-settings.ts` carries a `provider`
   (`openai` | `anthropic` | `openai-compatible`) alongside the now-optional
@@ -343,48 +355,83 @@
   nullable `base_url` are added idempotently by `db/schema.sql`). `baseUrl` is only
   required — and only SSRF-validated — for `openai-compatible`.
 
-  Two model roles (main vs grader): the agent resolves two independent models per
-  run. The **main** model drives the loop + synthesis (`generateText` and
-  `forceSynthesis`); the **grader** is a separate, cheaper model used only by the
-  examiner (`gradeFileRelevance`'s `generateObject`). `getEffectiveModelSettings`
-  returns an `{ main, grader }` bundle; `runDriveAgent` resolves each with
-  `resolveModel` and the `gradeFile` closure uses the grader one (its `agent.grade.*`
-  log events now carry the grader's model/provider). Each role is configured
-  independently: env defaults `AI_*` (main) and `GRADER_AI_*` (grader, key + model
-  required) are BOTH required — there is no fallback between roles — and per-user
-  overrides are independent per role (override one, the other, both, or neither;
-  each unset role falls back to its OWN env default, never the other role). The
-  pure `resolveRoleSettings(columns, envDefault)` picks custom-vs-env for a single
-  role (a role is overridden only when its `model` AND api key are both stored) and
-  is unit-tested in `test/model-settings.test.ts`. In `user_model_settings` a role
-  is "present" iff its `model` + `api_key_ciphertext` are non-null, so the main
-  config columns are now nullable and parallel `grader_*` columns hold the grader
-  override; the role-scoped DELETE clears one role and drops the row once neither
-  role is set.
+  Three model roles (main vs grader vs summarizer): the agent resolves three
+  independent models per run. The **main** model drives the loop + synthesis
+  (`generateText` and `forceSynthesis`); the **grader** is a separate, cheaper model
+  used only by the examiner (`gradeFileRelevance`'s `generateObject`); the
+  **summarizer** condenses an oversize file into the synthesis budget
+  (`summarizeOversizeContent`'s `generateText`) — see "Oversize files" below.
+  `getEffectiveModelSettings` returns an `{ main, grader, summarizer }` bundle;
+  `runDriveAgent` resolves each with `resolveModel` and injects the grader via the
+  `gradeFile` closure and the summarizer via the `summarizeOversize` closure (each
+  folds its own token usage into `state.tokensSpent`; `agent.grade.*` /
+  `agent.summarize.*` log events carry that role's model/provider). Each role is
+  configured independently: env defaults `AI_*` (main), `GRADER_AI_*` (grader), and
+  `SUMMARIZER_AI_*` (summarizer) — each key + model required — are ALL required;
+  there is no fallback between roles. Per-user overrides are independent per role
+  (override any subset; each unset role falls back to its OWN env default, never
+  another role's). The pure `resolveRoleSettings(columns, envDefault)` picks
+  custom-vs-env for a single role (a role is overridden only when its `model` AND
+  api key are both stored) and is unit-tested in `test/model-settings.test.ts`. In
+  `user_model_settings` a role is "present" iff its `model` + `api_key_ciphertext`
+  are non-null, so the main config columns are nullable and parallel `grader_*` /
+  `summarizer_*` columns hold those overrides; the role-scoped DELETE clears one
+  role and drops the row once no role is set.
+
+## Oversize files: summarize instead of truncate
+
+  The single per-file content cap is `MAX_FILE_CHARS` (32k chars ≈ 8k tokens),
+  applied in `lib/drive.ts` by `resolveFileContent` — the one place the cap lives,
+  shared by both read paths. A file under the cap returns as-is; an empty
+  extraction returns `emptyExtractionNote`; over the cap the default is a hard
+  truncation (the `[Truncated at …]` marker). `openDriveFile` takes an optional
+  `summarizeOversize` hook (type `OversizeSummarizer`): when present AND the content
+  is over the cap, the hook condenses the full text and `resolveFileContent` returns
+  that (disposition `"summarized"`, re-capped defensively if the model overshoots)
+  instead of truncating; if the hook returns null/blank it falls back to truncation.
+  `lib/drive` itself imports no model — the hook is a plain injected function, so the
+  utils scripts and tests still call `openDriveFile` (no hook → truncation) unchanged.
+
+  ONLY the synthesis read path passes the hook (`handleOpenFileTool`); list-mode
+  `review_file` deliberately does NOT (maintainer decision, 2026-06): synthesis
+  content is the answer's evidence, so condensing the whole file beats dropping its
+  tail; the grader path is the highest-volume/dominant-cost path and a query-focused
+  summary feeding a relevance judge is mildly circular. Trade-off accepted: in
+  curated list mode a relevant file whose relevance is in the truncated tail can
+  still be wrongly discarded. Enabling the grader path later is a ~1-line change
+  (pass the hook in `handleReviewFileTool`). The summary is query-focused
+  (`summarizeOversizeContent` / `SUMMARIZE_SYSTEM_PROMPT`): keep query-relevant
+  content, preserve names/figures/codenames verbatim, add nothing. Input is capped
+  at `MAX_SUMMARY_INPUT_CHARS` (~100k tokens — the extreme tail is head-truncated
+  before summarizing; map-reduce is a deliberate follow-up) and the output budget is
+  floored at `SUMMARY_MIN_OUTPUT_TOKENS` so it can fill the target. Like the grader,
+  failures degrade safely (return null → truncation) and never throw.
 
 ## Reasoning effort
 
-  Each role (main + grader) carries a `reasoningEffort`
+  Each role (main + grader + summarizer) carries a `reasoningEffort`
   (`none|minimal|low|medium|high`; `"none"` is the EXPLICIT provider default — the
   option is omitted — never an implicit "unset") on `EffectiveModelSettings`,
   always set (never null), applied per-provider by `resolveModel` (see "LLM
-  layer"). The env vars `AI_REASONING_EFFORT` / `GRADER_AI_REASONING_EFFORT` are
-  REQUIRED and strictly validated — `requireReasoningEffortEnv` throws at startup
-  on an unrecognized value (env config is explicit; see "Environment variables").
+  layer"). The env vars `AI_REASONING_EFFORT` / `GRADER_AI_REASONING_EFFORT` /
+  `SUMMARIZER_AI_REASONING_EFFORT` are REQUIRED and strictly validated —
+  `requireReasoningEffortEnv` throws at startup on an unrecognized value (env
+  config is explicit; see "Environment variables").
   Stored per-user overrides instead use the lenient `coerceReasoningEffort` (a
   legacy/stray DB value degrades to `"none"`, since it comes from our own
   enum-constrained UI). Per-user overrides live in the nullable `reasoning_effort`
-  / `grader_reasoning_effort` columns (plaintext — not a secret) and flow through
-  the same settings API/UI as the other model fields.
+  / `grader_reasoning_effort` / `summarizer_reasoning_effort` columns (plaintext —
+  not a secret) and flow through the same settings API/UI as the other model fields.
   Design rule: effort is an *attribute* of a role's override, not an override on
   its own — a role only counts as "custom" when its `model` + api key are both
   stored (`resolveRoleSettings`), so effort rides along with a custom model;
   a role left on its env default takes effort from its env var. Lowering the
   grader's effort is the cheapest cost lever for the high-volume examiner. The
   resolved effort is in the `agent.started` log (a coarse enum, not PII, so logged
-  plainly). It applies to all three model calls — the main loop, `forceSynthesis`,
-  and the examiner's `generateObject` (the grader is the dominant token cost in
-  list modes, so its effort matters most).
+  plainly) for all three roles. It applies to every model call — the main loop,
+  `forceSynthesis`, the examiner's `generateObject`, and the summarizer's
+  `generateText` (the grader is the dominant token cost in list modes, so its
+  effort matters most; the summarizer runs only on oversize synthesis reads).
 
   Per-provider mapping (`resolveModel` in `lib/model-provider.ts`). The OpenAI and
   OpenAI-compatible providers take the effort string verbatim; Anthropic has no
@@ -430,15 +477,21 @@
   Required (throw if unset): `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`,
   `DATABASE_URL`, `TOKEN_ENCRYPTION_KEY`, `NEXTAUTH_URL`, `AI_API_KEY`,
   `AI_PROVIDER`, `AI_MODEL`, `AI_REASONING_EFFORT`, `GRADER_AI_API_KEY`,
-  `GRADER_AI_PROVIDER`, `GRADER_AI_MODEL`, `GRADER_AI_REASONING_EFFORT`.
-  (`NEXTAUTH_SECRET` is also required, enforced by next-auth itself, not `env.ts`.)
+  `GRADER_AI_PROVIDER`, `GRADER_AI_MODEL`, `GRADER_AI_REASONING_EFFORT`,
+  `SUMMARIZER_AI_API_KEY`, `SUMMARIZER_AI_PROVIDER`, `SUMMARIZER_AI_MODEL`,
+  `SUMMARIZER_AI_REASONING_EFFORT`. (`NEXTAUTH_SECRET` is also required, enforced
+  by next-auth itself, not `env.ts`.) The four `SUMMARIZER_AI_*` behaviour vars
+  were made required by maintainer decision (2026-06) — same "no fallback between
+  roles" stance as the grader; a summarizer *call* failing falls back to plain
+  truncation at run time, but the *config* is still required.
 
   Allowed exceptions — genuinely optional, where "unset" is a true no-op (a feature
   off / not applicable), NOT a behaviour-picking default: `AI_BASE_URL` /
-  `GRADER_AI_BASE_URL` (only meaningful for `openai-compatible`; native providers
-  have no endpoint), `DATABASE_SSL` (no TLS when unset), the `DEBUG_*` flags (off,
-  and force-off in production), and the `AGENT_*` rate-limit knobs (operational
-  safety caps with sane values). `NODE_ENV` is set by the platform, not us.
+  `GRADER_AI_BASE_URL` / `SUMMARIZER_AI_BASE_URL` (only meaningful for
+  `openai-compatible`; native providers have no endpoint), `DATABASE_SSL` (no TLS
+  when unset), the `DEBUG_*` flags (off, and force-off in production), and the
+  `AGENT_*` rate-limit knobs (operational safety caps with sane values).
+  `NODE_ENV` is set by the platform, not us.
 
   When adding a new env var — MANDATORY: do NOT decide compulsory-vs-optional on
   your own. ASK THE MAINTAINER, per variable, whether it should be compulsory

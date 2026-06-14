@@ -13,7 +13,7 @@ import {
 } from "ai";
 import { z } from "zod";
 import { listDriveConnections, type DriveConnectionSummary } from "@/lib/drive-connections";
-import { openDriveFile, searchDriveFiles, type DriveFile } from "@/lib/drive";
+import { MAX_FILE_CHARS, openDriveFile, searchDriveFiles, type DriveFile } from "@/lib/drive";
 import { formatMimeType } from "@/lib/file-types";
 import { getEffectiveModelSettings, type ModelProvider } from "@/lib/model-settings";
 import { resolveModel, type ResolvedModel } from "@/lib/model-provider";
@@ -609,6 +609,131 @@ export async function gradeFileRelevance(
   }
 }
 
+/**
+ * Upper bound on the text fed to the summarizer in one shot. The full file can be
+ * far larger than any context window (the sampling study found a p99 ~500k tokens),
+ * so cap the INPUT at ~100k tokens (4 chars/token) — comfortably inside a modern
+ * window alongside the prompt and the ~8k-token output. Files beyond this are
+ * head-truncated before summarizing (so the extreme tail becomes a "summary of the
+ * first ~100k tokens"); full map-reduce chunking is a deliberate follow-up.
+ */
+const MAX_SUMMARY_INPUT_CHARS = 400_000;
+
+/**
+ * Floor on the summarizer call's output budget so it can actually fill the
+ * MAX_FILE_CHARS target (~8k tokens at 4 chars/token). Applied as a max() with the
+ * resolved value, which only matters for Anthropic-with-thinking (where resolve
+ * already sets budget + margin); every other provider has no maxOutputTokens, so
+ * this becomes the explicit cap for the call.
+ */
+const SUMMARY_MIN_OUTPUT_TOKENS = 8192;
+
+/** Approx token target for the summary, derived from the char cap (4 chars/token). */
+const SUMMARY_TARGET_TOKENS = Math.floor(MAX_FILE_CHARS / 4);
+
+const SUMMARIZE_SYSTEM_PROMPT = `You compress one long document for a research agent so it fits a strict size budget without losing what matters for the user's query.
+Produce a faithful, query-focused condensation of the document:
+- Keep everything relevant to the query; drop boilerplate, navigation chrome, and repetition.
+- Preserve specific facts verbatim — names, dates, numbers, figures, quotes, identifiers, codenames, and domain terms. Never paraphrase, round, or invent these.
+- Keep the document's own section order where it aids understanding.
+- Add nothing that is not in the document: no interpretation, commentary, or outside knowledge.
+- Do not mention that the document was long, truncated, or summarized; output only the condensation itself.
+Keep the result within roughly ${SUMMARY_TARGET_TOKENS} tokens.`;
+
+/**
+ * Build the single user prompt for condensing one oversize file. A fresh, minimal
+ * context — the query plus this one (input-capped) document — mirroring the
+ * examiner so the call stays isolated and bounded.
+ */
+function buildSummarizePrompt(query: string, file: DriveFile, content: string) {
+  return `Query: ${query}
+
+File name: ${file.name}
+File type: ${formatMimeType(file.mimeType)}
+
+Document:
+${content}`;
+}
+
+/**
+ * Condense an oversize file's full text into the synthesis budget using an
+ * isolated, single-shot model call (`generateText`, no tools, its own minimal
+ * prompt). Used only by the synthesis read path (open_file), as openDriveFile's
+ * summarizeOversize hook, so a file that would otherwise be hard-truncated still
+ * surfaces its whole substance to synthesis. The input is capped at
+ * {@link MAX_SUMMARY_INPUT_CHARS}; the output budget is floored so the summary can
+ * reach the {@link MAX_FILE_CHARS} target (drive.ts re-caps defensively).
+ *
+ * On any failure — the request erroring out after retries, or an empty/blank
+ * result — returns `{ summary: null }` so the caller falls back to hard truncation
+ * rather than aborting the run (truncation is the safe, pre-existing behaviour).
+ * Logs under `agent.summarize.*`, distinct from the main loop and the examiner.
+ *
+ * Returns the summary together with the call's token usage so the caller can fold
+ * it into the run-wide token total that drives the diminishing-returns budget.
+ */
+export async function summarizeOversizeContent(
+  resolved: ResolvedModel,
+  logSettings: { model: string; provider: ModelProvider },
+  query: string,
+  file: DriveFile,
+  fullText: string,
+  requestId: string,
+  step: number
+): Promise<{ summary: string | null; usageTokens: number }> {
+  const fileKeyHash = hashForDebug(fileKey(file));
+  const input = fullText.slice(0, MAX_SUMMARY_INPUT_CHARS);
+  const inputTruncated = fullText.length > MAX_SUMMARY_INPUT_CHARS;
+  try {
+    const { text, usage } = await generateText({
+      model: resolved.model,
+      providerOptions: resolved.providerOptions,
+      ...(resolved.temperature !== undefined ? { temperature: resolved.temperature } : {}),
+      // Always set an output cap so the summary can reach the ~8k-token target,
+      // overriding small provider defaults (see SUMMARY_MIN_OUTPUT_TOKENS).
+      maxOutputTokens: Math.max(resolved.maxOutputTokens ?? 0, SUMMARY_MIN_OUTPUT_TOKENS),
+      maxRetries: MODEL_REQUEST_MAX_RETRIES,
+      system: SUMMARIZE_SYSTEM_PROMPT,
+      prompt: buildSummarizePrompt(query, file, input)
+    });
+    const summary = text.trim() ? text.trim() : null;
+    // The file content dominates the summarizer's input, so it's a good estimate
+    // basis when the provider reports no usage. Real usage preferred.
+    const usageTokens = resolveUsageTokens(usage, `${input}${summary ?? ""}`);
+    await writeDebugLog({
+      event: "agent.summarize.completed",
+      requestId,
+      step,
+      model: logSettings.model,
+      provider: logSettings.provider,
+      fileKeyHash,
+      rawContentLength: fullText.length,
+      summaryInputLength: input.length,
+      inputTruncated,
+      summaryLength: summary?.length ?? 0,
+      summarized: summary !== null,
+      usageTokens,
+      totalTokens: usage?.totalTokens ?? null,
+      reasoningTokens: usage?.reasoningTokens ?? null
+    });
+    return { summary, usageTokens };
+  } catch (error) {
+    await writeDebugLog({
+      event: "agent.summarize.failed",
+      level: "warn",
+      requestId,
+      step,
+      model: logSettings.model,
+      provider: logSettings.provider,
+      fileKeyHash,
+      rawContentLength: fullText.length,
+      error: debugError(error)
+    });
+    // Fall back to hard truncation (the pre-existing behaviour) rather than abort.
+    return { summary: null, usageTokens: 0 };
+  }
+}
+
 function uniqueFiles(files: DriveFile[]) {
   const seen = new Set<string>();
   return files.filter((file) => {
@@ -910,6 +1035,15 @@ export type AgentRunContext = {
    * forwarded for debug-log correlation.
    */
   gradeFile: (file: DriveFile, content: string, step: number) => Promise<GradeVerdict>;
+  /**
+   * Synthesis only: condense a file whose extracted text exceeds MAX_FILE_CHARS
+   * into the synthesis budget (returns null to fall back to hard truncation).
+   * Wired into open_file's openDriveFile call as its summarizeOversize hook;
+   * review_file omits it (list mode keeps truncation). Injected like gradeFile so
+   * it is an isolated model call in production but stubbable in tests; folds its
+   * token usage into the run total. `step` is forwarded for log correlation.
+   */
+  summarizeOversize: (file: DriveFile, fullText: string, step: number) => Promise<string | null>;
 };
 
 /**
@@ -1139,7 +1273,7 @@ export async function handleOpenFileTool(
   step: number,
   toolCall: ToolCall
 ): Promise<ToolResultMessage> {
-  const { requestId, budget, selectedDriveIds, ownerSub, emit } = context;
+  const { requestId, budget, selectedDriveIds, ownerSub, emit, summarizeOversize } = context;
   const parsed = await parseToolArgs(context, step, toolCall, openArgs);
   if (!parsed.ok) return parsed.observation;
   const args = parsed.args;
@@ -1204,7 +1338,11 @@ export async function handleOpenFileTool(
           ownerSub,
           connectionId: args.connectionId,
           fileId: args.fileId,
-          debugRequestId: requestId
+          debugRequestId: requestId,
+          // Synthesis reads pull content straight into context, so condense an
+          // oversize file instead of dropping its tail (list-mode review_file
+          // omits this hook and keeps truncation). Returns null -> truncation.
+          summarizeOversize: ({ file, fullText }) => summarizeOversize(file, fullText, step)
         }),
       budget.maxToolRetries
     );
@@ -1596,6 +1734,7 @@ export async function runDriveAgent(
   const modelSettings = await getEffectiveModelSettings(ownerSub);
   const resolvedMain = resolveModel(modelSettings.main);
   const resolvedGrader = resolveModel(modelSettings.grader);
+  const resolvedSummarizer = resolveModel(modelSettings.summarizer);
   const logSettings = {
     model: modelSettings.main.model,
     provider: modelSettings.main.provider,
@@ -1605,6 +1744,11 @@ export async function runDriveAgent(
     model: modelSettings.grader.model,
     provider: modelSettings.grader.provider,
     source: modelSettings.grader.source
+  };
+  const summarizerLogSettings = {
+    model: modelSettings.summarizer.model,
+    provider: modelSettings.summarizer.provider,
+    source: modelSettings.summarizer.source
   };
   await writeDebugLog({
     event: "agent.started",
@@ -1623,6 +1767,10 @@ export async function runDriveAgent(
     graderProvider: modelSettings.grader.provider,
     graderModel: modelSettings.grader.model,
     graderReasoningEffort: modelSettings.grader.reasoningEffort,
+    summarizerModelSettingsSource: modelSettings.summarizer.source,
+    summarizerProvider: modelSettings.summarizer.provider,
+    summarizerModel: modelSettings.summarizer.model,
+    summarizerReasoningEffort: modelSettings.summarizer.reasoningEffort,
     budget
   });
 
@@ -1698,6 +1846,22 @@ export async function runDriveAgent(
       );
       state.tokensSpent += usageTokens;
       return verdict;
+    },
+    // Fold the isolated summarizer's token usage into the run-wide total (one
+    // call per oversize file opened during synthesis), then hand the summary (or
+    // null = fall back to truncation) to openDriveFile's hook.
+    summarizeOversize: async (file, fullText, step) => {
+      const { summary, usageTokens } = await summarizeOversizeContent(
+        resolvedSummarizer,
+        summarizerLogSettings,
+        input.query,
+        file,
+        fullText,
+        requestId,
+        step
+      );
+      state.tokensSpent += usageTokens;
+      return summary;
     }
   };
   const curating = isCuratingRequest(input);

@@ -22,9 +22,10 @@ export type RoleSettingsSummary = {
 export type ModelSettingsSummary = {
   main: RoleSettingsSummary;
   grader: RoleSettingsSummary;
+  summarizer: RoleSettingsSummary;
 };
 
-type ModelRole = "main" | "grader";
+type ModelRole = "main" | "grader" | "summarizer";
 
 const PROVIDER_OPTIONS: { value: ModelProvider; label: string; hint: string }[] = [
   {
@@ -76,6 +77,10 @@ const ROLE_META: Record<ModelRole, { title: string; help: string }> = {
   grader: {
     title: "Grader model",
     help: "A separate, cheaper model that only judges per-file relevance."
+  },
+  summarizer: {
+    title: "Summarizer model",
+    help: "A separate model that condenses an oversize file into the synthesis budget instead of hard-truncating it."
   }
 };
 
@@ -130,8 +135,8 @@ export function SettingsDialog({
         </div>
         <div className="panel-body form-grid">
           <div className="settings-note">
-            API keys are write-only. After saving, a key cannot be viewed here again. The main and
-            grader models are configured independently.
+            API keys are write-only. After saving, a key cannot be viewed here again. The main,
+            grader, and summarizer models are configured independently.
           </div>
           <RoleSettingsForm
             key="main"
@@ -143,6 +148,12 @@ export function SettingsDialog({
             key="grader"
             role="grader"
             summary={modelSettings?.grader ?? null}
+            onSettingsChange={onSettingsChange}
+          />
+          <RoleSettingsForm
+            key="summarizer"
+            role="summarizer"
+            summary={modelSettings?.summarizer ?? null}
             onSettingsChange={onSettingsChange}
           />
         </div>

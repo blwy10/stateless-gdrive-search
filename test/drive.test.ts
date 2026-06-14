@@ -1,8 +1,26 @@
 // Copyright (c) 2026 Benjamin Lau
 // SPDX-License-Identifier: MIT
 
-import { describe, expect, it } from "vitest";
-import { buildDriveSearchQuery, emptyExtractionNote, escapeDriveQuery } from "@/lib/drive";
+import { describe, expect, it, vi } from "vitest";
+import {
+  MAX_FILE_CHARS,
+  buildDriveSearchQuery,
+  emptyExtractionNote,
+  escapeDriveQuery,
+  resolveFileContent,
+  type DriveFile
+} from "@/lib/drive";
+
+function driveFile(overrides: Partial<DriveFile> = {}): DriveFile {
+  return {
+    connectionId: "c1",
+    driveEmail: "c1@example.com",
+    id: "f1",
+    name: "Doc.txt",
+    mimeType: "text/plain",
+    ...overrides
+  };
+}
 
 describe("escapeDriveQuery", () => {
   it("leaves ordinary text untouched", () => {
@@ -104,5 +122,84 @@ describe("emptyExtractionNote", () => {
 
   it("omits the link clause when there is no webViewLink", () => {
     expect(emptyExtractionNote({ name: "Empty.txt" })).not.toContain("Open it in Drive");
+  });
+});
+
+describe("resolveFileContent", () => {
+  const oversize = "x".repeat(MAX_FILE_CHARS + 500);
+
+  it("returns content unchanged when within the cap (full)", async () => {
+    const result = await resolveFileContent({ normalized: "hello", file: driveFile() });
+    expect(result.disposition).toBe("full");
+    expect(result.content).toBe("hello");
+  });
+
+  it("returns an empty-extraction note for empty content (empty)", async () => {
+    const result = await resolveFileContent({
+      normalized: "",
+      file: driveFile({ name: "Scan.pdf" })
+    });
+    expect(result.disposition).toBe("empty");
+    expect(result.content).toContain("No readable text");
+    expect(result.content).toContain("Scan.pdf");
+  });
+
+  it("hard-truncates oversize content when no summarizer hook is given (truncated)", async () => {
+    const result = await resolveFileContent({ normalized: oversize, file: driveFile() });
+    expect(result.disposition).toBe("truncated");
+    expect(result.content).toContain(`[Truncated at ${MAX_FILE_CHARS} characters]`);
+    expect(result.content.startsWith("x".repeat(MAX_FILE_CHARS))).toBe(true);
+  });
+
+  it("uses the summarizer's output for oversize content (summarized)", async () => {
+    const result = await resolveFileContent({
+      normalized: oversize,
+      file: driveFile(),
+      summarizeOversize: async ({ fullText }) => `summary of ${fullText.length} chars`
+    });
+    expect(result.disposition).toBe("summarized");
+    expect(result.content).toBe(`summary of ${oversize.length} chars`);
+  });
+
+  it("re-caps a summary that itself overshoots the budget", async () => {
+    const overshoot = "y".repeat(MAX_FILE_CHARS + 1000);
+    const result = await resolveFileContent({
+      normalized: oversize,
+      file: driveFile(),
+      summarizeOversize: async () => overshoot
+    });
+    expect(result.disposition).toBe("summarized");
+    expect(result.content).toContain(`[Summary truncated at ${MAX_FILE_CHARS} characters]`);
+    expect(result.content.startsWith("y".repeat(MAX_FILE_CHARS))).toBe(true);
+  });
+
+  it("falls back to truncation when the summarizer returns null", async () => {
+    const result = await resolveFileContent({
+      normalized: oversize,
+      file: driveFile(),
+      summarizeOversize: async () => null
+    });
+    expect(result.disposition).toBe("truncated");
+    expect(result.content).toContain(`[Truncated at ${MAX_FILE_CHARS} characters]`);
+  });
+
+  it("falls back to truncation when the summarizer returns blank text", async () => {
+    const result = await resolveFileContent({
+      normalized: oversize,
+      file: driveFile(),
+      summarizeOversize: async () => "   "
+    });
+    expect(result.disposition).toBe("truncated");
+  });
+
+  it("never invokes the summarizer for content within the cap", async () => {
+    const hook = vi.fn(async () => "should not run");
+    const result = await resolveFileContent({
+      normalized: "small",
+      file: driveFile(),
+      summarizeOversize: hook
+    });
+    expect(hook).not.toHaveBeenCalled();
+    expect(result.disposition).toBe("full");
   });
 });

@@ -12,6 +12,7 @@ import {
   parseSources,
   resolveSources,
   resolveUsageTokens,
+  summarizeOversizeContent,
   systemPrompt,
   type AgentProgress,
   type AgentRunContext,
@@ -20,11 +21,27 @@ import {
 } from "@/lib/agent";
 import { openDriveFile, searchDriveFiles } from "@/lib/drive";
 import type { DriveFile } from "@/lib/drive";
+import type { ResolvedModel } from "@/lib/model-provider";
+import { generateText } from "ai";
 import type { DriveConnectionSummary } from "@/lib/drive-connections";
 
-vi.mock("@/lib/drive", () => ({
+// Partial mock: stub only the two network functions, keep the real exports
+// (MAX_FILE_CHARS, resolveFileContent, emptyExtractionNote, …) so agent.ts loads.
+vi.mock("@/lib/drive", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/drive")>()),
   openDriveFile: vi.fn(),
   searchDriveFiles: vi.fn()
+}));
+
+// The handler/pure-helper tests never call the model; only summarizeOversizeContent
+// does. Mock the AI SDK so that call is controllable (the other runtime exports are
+// harmless stubs — buildAgentTools/runDriveAgent aren't exercised here).
+vi.mock("ai", () => ({
+  generateText: vi.fn(),
+  generateObject: vi.fn(),
+  tool: (config: unknown) => config,
+  jsonSchema: (schema: unknown) => schema,
+  stepCountIs: () => false
 }));
 
 function file(connectionId: string, id: string, name = id): DriveFile {
@@ -54,6 +71,7 @@ function makeContext(overrides: Partial<AgentRunContext> = {}): AgentRunContext 
     requestId: "req-test",
     emit: () => {},
     gradeFile: async () => ({ relevant: true, reason: "stub", entities: [] }),
+    summarizeOversize: async () => null,
     ...overrides
   };
 }
@@ -486,6 +504,30 @@ describe("handleOpenFileTool", () => {
     expect(events.some((event) => event.type === "file")).toBe(true);
     expect(events.some((event) => event.type === "reviewing")).toBe(false);
   });
+
+  it("passes a summarizeOversize hook to openDriveFile that routes to the context closure", async () => {
+    // Synthesis reads condense oversize files; assert the hook is wired through to
+    // openDriveFile and forwards (file, fullText, step) to the run's closure.
+    vi.mocked(openDriveFile).mockResolvedValue({
+      file: file("c1", "f1", "Doc"),
+      content: "hello world"
+    });
+    const summarize = vi.fn(async () => "condensed");
+    const runState = makeState();
+
+    await handleOpenFileTool(
+      makeContext({ summarizeOversize: summarize }),
+      runState,
+      7,
+      openCall("call-hook")
+    );
+
+    const passed = vi.mocked(openDriveFile).mock.calls[0][0];
+    expect(typeof passed.summarizeOversize).toBe("function");
+    const f = file("c1", "f1", "Doc");
+    await passed.summarizeOversize?.({ file: f, fullText: "huge" });
+    expect(summarize).toHaveBeenCalledWith(f, "huge", 7);
+  });
 });
 
 describe("handleReviewFileTool", () => {
@@ -537,6 +579,16 @@ describe("handleReviewFileTool", () => {
     expect(events.some((event) => event.type === "reviewing")).toBe(true);
     expect(events.some((event) => event.type === "kept")).toBe(true);
     expect(events.some((event) => event.type === "discarded")).toBe(false);
+  });
+
+  it("does NOT pass a summarizeOversize hook to openDriveFile (list mode keeps truncation)", async () => {
+    // Synthesis-only scope: review_file must not condense oversize files, so the
+    // file content the grader sees is truncated, not summarized.
+    const { runState, context } = setup({ relevant: true, reason: "x", entities: [] });
+
+    await handleReviewFileTool(context, runState, 0, reviewCall("r-no-hook"));
+
+    expect(vi.mocked(openDriveFile).mock.calls[0][0].summarizeOversize).toBeUndefined();
   });
 
   it("discards a file the grader judges irrelevant", async () => {
@@ -649,6 +701,72 @@ describe("handleReviewFileTool", () => {
 
     const payload = JSON.parse(result.content) as { note?: string };
     expect(payload.note).toContain("Returns are diminishing");
+  });
+});
+
+describe("summarizeOversizeContent", () => {
+  const resolved: ResolvedModel = {
+    model: {} as never,
+    providerOptions: {},
+    temperature: 0.2,
+    maxOutputTokens: undefined
+  };
+  const logSettings = { model: "sum-model", provider: "openai" as const };
+
+  beforeEach(() => {
+    vi.mocked(generateText).mockReset();
+  });
+
+  it("returns the trimmed summary and folds in the call's token usage", async () => {
+    vi.mocked(generateText).mockResolvedValue({
+      text: "  condensed  ",
+      usage: { totalTokens: 123 }
+    } as never);
+
+    const result = await summarizeOversizeContent(
+      resolved,
+      logSettings,
+      "q",
+      file("c1", "f1"),
+      "long document text",
+      "req",
+      0
+    );
+
+    expect(result.summary).toBe("condensed");
+    expect(result.usageTokens).toBe(123);
+  });
+
+  it("returns null (so the caller truncates) when the model yields blank text", async () => {
+    vi.mocked(generateText).mockResolvedValue({ text: "   ", usage: { totalTokens: 5 } } as never);
+
+    const result = await summarizeOversizeContent(
+      resolved,
+      logSettings,
+      "q",
+      file("c1", "f1"),
+      "long document text",
+      "req",
+      0
+    );
+
+    expect(result.summary).toBeNull();
+  });
+
+  it("returns null and never throws when the model call fails", async () => {
+    vi.mocked(generateText).mockRejectedValue(new Error("boom"));
+
+    const result = await summarizeOversizeContent(
+      resolved,
+      logSettings,
+      "q",
+      file("c1", "f1"),
+      "long document text",
+      "req",
+      0
+    );
+
+    expect(result).toEqual({ summary: null, usageTokens: 0 });
   });
 });
 

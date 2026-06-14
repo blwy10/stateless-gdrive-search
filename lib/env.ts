@@ -43,5 +43,17 @@ export const env = {
   graderAiModel: () => required("GRADER_AI_MODEL"),
   // Required reasoning effort for the grader role (see aiReasoningEffort).
   graderAiReasoningEffort: () => required("GRADER_AI_REASONING_EFFORT"),
+  // Summarizer role: a separate model used only to condense an oversize file
+  // (one that would otherwise be hard-truncated at MAX_FILE_CHARS) into the
+  // synthesis budget — see summarizeOversizeContent in lib/agent.ts. Like the
+  // grader there is no fallback to another role: all four behaviour vars are
+  // required (maintainer decision — recorded in AGENTS.md). Endpoint optional
+  // except for openai-compatible.
+  summarizerAiApiKey: () => required("SUMMARIZER_AI_API_KEY"),
+  summarizerAiProvider: () => required("SUMMARIZER_AI_PROVIDER"),
+  summarizerAiBaseUrl: (): string | null => process.env.SUMMARIZER_AI_BASE_URL || null,
+  summarizerAiModel: () => required("SUMMARIZER_AI_MODEL"),
+  // Required reasoning effort for the summarizer role (see aiReasoningEffort).
+  summarizerAiReasoningEffort: () => required("SUMMARIZER_AI_REASONING_EFFORT"),
   nextAuthUrl: () => required("NEXTAUTH_URL")
 };

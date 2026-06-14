@@ -11,13 +11,15 @@ export const MODEL_PROVIDERS = ["openai", "anthropic", "openai-compatible"] as c
 export type ModelProvider = (typeof MODEL_PROVIDERS)[number];
 
 /**
- * The two independent model roles. `main` runs the agent loop and writes the
+ * The three independent model roles. `main` runs the agent loop and writes the
  * synthesis answer; `grader` is a separate, cheaper model that only judges
- * per-file relevance (see gradeFileRelevance in lib/agent.ts). Each role is
- * configured independently at the env level (both required — there is no fallback
- * between roles) and may be overridden per-user independently.
+ * per-file relevance (see gradeFileRelevance in lib/agent.ts); `summarizer` is a
+ * separate model that condenses an oversize file into the synthesis budget rather
+ * than hard-truncating it (see summarizeOversizeContent in lib/agent.ts). Each
+ * role is configured independently at the env level (all required — there is no
+ * fallback between roles) and may be overridden per-user independently.
  */
-export const MODEL_ROLES = ["main", "grader"] as const;
+export const MODEL_ROLES = ["main", "grader", "summarizer"] as const;
 export type ModelRole = (typeof MODEL_ROLES)[number];
 
 /**
@@ -92,6 +94,7 @@ export type RoleSettingsSummary = {
 export type ModelSettingsSummary = {
   main: RoleSettingsSummary;
   grader: RoleSettingsSummary;
+  summarizer: RoleSettingsSummary;
 };
 
 export type EffectiveModelSettings = {
@@ -112,10 +115,11 @@ export type EffectiveModelSettings = {
   source: "default" | "custom";
 };
 
-/** Effective settings for both roles, resolved once per agent run. */
+/** Effective settings for all roles, resolved once per agent run. */
 export type EffectiveModelSettingsBundle = {
   main: EffectiveModelSettings;
   grader: EffectiveModelSettings;
+  summarizer: EffectiveModelSettings;
 };
 
 const RoleSettingsInput = z
@@ -137,15 +141,16 @@ const RoleSettingsInput = z
 
 export type RoleSettingsInput = z.infer<typeof RoleSettingsInput>;
 
-// A save may target either role independently (or both); at least one must be
+// A save may target any role independently (or several); at least one must be
 // present so an empty request is rejected rather than silently doing nothing.
 const ModelSettingsInput = z
   .object({
     main: RoleSettingsInput.optional(),
-    grader: RoleSettingsInput.optional()
+    grader: RoleSettingsInput.optional(),
+    summarizer: RoleSettingsInput.optional()
   })
-  .refine((value) => Boolean(value.main || value.grader), {
-    message: "Provide settings for at least one role (main or grader)"
+  .refine((value) => Boolean(value.main || value.grader || value.summarizer), {
+    message: "Provide settings for at least one role (main, grader, or summarizer)"
   });
 
 export type ModelSettingsInput = z.infer<typeof ModelSettingsInput>;
@@ -161,6 +166,11 @@ type ModelSettingsRow = {
   grader_model: string | null;
   grader_provider: string | null;
   grader_reasoning_effort: string | null;
+  summarizer_api_key_ciphertext: string | null;
+  summarizer_base_url: string | null;
+  summarizer_model: string | null;
+  summarizer_provider: string | null;
+  summarizer_reasoning_effort: string | null;
   updated_at: Date;
 };
 
@@ -179,7 +189,7 @@ export function parseModelSettingsInput(value: unknown) {
 
 /** Map the `role` query param used by the per-role DELETE to a known target. */
 export function parseModelRole(value: string | null | undefined): ModelRole | "all" {
-  return value === "main" || value === "grader" ? value : "all";
+  return value === "main" || value === "grader" || value === "summarizer" ? value : "all";
 }
 
 function mainColumns(row: ModelSettingsRow | null): RoleColumns {
@@ -202,6 +212,16 @@ function graderColumns(row: ModelSettingsRow | null): RoleColumns {
   };
 }
 
+function summarizerColumns(row: ModelSettingsRow | null): RoleColumns {
+  return {
+    apiKeyCiphertext: row?.summarizer_api_key_ciphertext ?? null,
+    baseUrl: row?.summarizer_base_url ?? null,
+    model: row?.summarizer_model ?? null,
+    provider: row?.summarizer_provider ?? null,
+    reasoningEffort: row?.summarizer_reasoning_effort ?? null
+  };
+}
+
 function envSettings(role: ModelRole): EffectiveModelSettings {
   if (role === "grader") {
     return {
@@ -212,6 +232,19 @@ function envSettings(role: ModelRole): EffectiveModelSettings {
       reasoningEffort: requireReasoningEffortEnv(
         env.graderAiReasoningEffort(),
         "GRADER_AI_REASONING_EFFORT"
+      ),
+      source: "default"
+    };
+  }
+  if (role === "summarizer") {
+    return {
+      provider: coerceModelProvider(env.summarizerAiProvider()),
+      apiKey: env.summarizerAiApiKey(),
+      baseUrl: env.summarizerAiBaseUrl(),
+      model: env.summarizerAiModel(),
+      reasoningEffort: requireReasoningEffortEnv(
+        env.summarizerAiReasoningEffort(),
+        "SUMMARIZER_AI_REASONING_EFFORT"
       ),
       source: "default"
     };
@@ -298,12 +331,17 @@ function roleSummary(columns: RoleColumns, updatedAt: string): RoleSettingsSumma
 export async function getModelSettingsSummary(ownerSub: string): Promise<ModelSettingsSummary> {
   const row = await getModelSettingsRow(ownerSub);
   if (!row) {
-    return { main: emptyRoleSummary(), grader: emptyRoleSummary() };
+    return {
+      main: emptyRoleSummary(),
+      grader: emptyRoleSummary(),
+      summarizer: emptyRoleSummary()
+    };
   }
   const updatedAt = row.updated_at.toISOString();
   return {
     main: roleSummary(mainColumns(row), updatedAt),
-    grader: roleSummary(graderColumns(row), updatedAt)
+    grader: roleSummary(graderColumns(row), updatedAt),
+    summarizer: roleSummary(summarizerColumns(row), updatedAt)
   };
 }
 
@@ -312,9 +350,10 @@ export async function getEffectiveModelSettings(
 ): Promise<EffectiveModelSettingsBundle> {
   const envMain = envSettings("main");
   const envGrader = envSettings("grader");
+  const envSummarizer = envSettings("summarizer");
   const row = await getModelSettingsRow(ownerSub);
   if (!row) {
-    return { main: envMain, grader: envGrader };
+    return { main: envMain, grader: envGrader, summarizer: envSummarizer };
   }
 
   const decrypt = (columns: RoleColumns) => ({
@@ -327,9 +366,11 @@ export async function getEffectiveModelSettings(
 
   const main = resolveRoleSettings(decrypt(mainColumns(row)), envMain);
   const grader = resolveRoleSettings(decrypt(graderColumns(row)), envGrader);
+  const summarizer = resolveRoleSettings(decrypt(summarizerColumns(row)), envSummarizer);
   return {
     main: await withValidatedBaseUrl(main),
-    grader: await withValidatedBaseUrl(grader)
+    grader: await withValidatedBaseUrl(grader),
+    summarizer: await withValidatedBaseUrl(summarizer)
   };
 }
 
@@ -365,15 +406,17 @@ export async function upsertModelSettings(ownerSub: string, input: ModelSettings
   const existing = await getModelSettingsRow(ownerSub);
   const main = await resolveRoleUpsert(input.main, mainColumns(existing));
   const grader = await resolveRoleUpsert(input.grader, graderColumns(existing));
+  const summarizer = await resolveRoleUpsert(input.summarizer, summarizerColumns(existing));
 
   await getPool().query(
     `insert into user_model_settings (
        owner_sub,
        api_key_ciphertext, base_url, model, provider, reasoning_effort,
        grader_api_key_ciphertext, grader_base_url, grader_model, grader_provider, grader_reasoning_effort,
+       summarizer_api_key_ciphertext, summarizer_base_url, summarizer_model, summarizer_provider, summarizer_reasoning_effort,
        updated_at
      )
-     values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now())
+     values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, now())
      on conflict (owner_sub)
      do update set
        api_key_ciphertext = excluded.api_key_ciphertext,
@@ -386,6 +429,11 @@ export async function upsertModelSettings(ownerSub: string, input: ModelSettings
        grader_model = excluded.grader_model,
        grader_provider = excluded.grader_provider,
        grader_reasoning_effort = excluded.grader_reasoning_effort,
+       summarizer_api_key_ciphertext = excluded.summarizer_api_key_ciphertext,
+       summarizer_base_url = excluded.summarizer_base_url,
+       summarizer_model = excluded.summarizer_model,
+       summarizer_provider = excluded.summarizer_provider,
+       summarizer_reasoning_effort = excluded.summarizer_reasoning_effort,
        updated_at = now()`,
     [
       ownerSub,
@@ -398,7 +446,12 @@ export async function upsertModelSettings(ownerSub: string, input: ModelSettings
       grader.baseUrl,
       grader.model,
       grader.provider,
-      grader.reasoningEffort
+      grader.reasoningEffort,
+      summarizer.apiKeyCiphertext,
+      summarizer.baseUrl,
+      summarizer.model,
+      summarizer.provider,
+      summarizer.reasoningEffort
     ]
   );
 }
@@ -420,6 +473,18 @@ export async function deleteModelSettings(ownerSub: string, role: ModelRole | "a
        where owner_sub = $1`,
       [ownerSub]
     );
+  } else if (role === "summarizer") {
+    await getPool().query(
+      `update user_model_settings
+         set summarizer_api_key_ciphertext = null,
+             summarizer_base_url = null,
+             summarizer_model = null,
+             summarizer_provider = null,
+             summarizer_reasoning_effort = null,
+             updated_at = now()
+       where owner_sub = $1`,
+      [ownerSub]
+    );
   } else {
     await getPool().query(
       `update user_model_settings
@@ -433,11 +498,12 @@ export async function deleteModelSettings(ownerSub: string, role: ModelRole | "a
       [ownerSub]
     );
   }
-  // Drop the row entirely once neither role overrides anything, so an absent row
-  // keeps meaning "both roles use their env defaults".
+  // Drop the row entirely once no role overrides anything, so an absent row keeps
+  // meaning "every role uses its env default".
   await getPool().query(
     `delete from user_model_settings
-      where owner_sub = $1 and model is null and grader_model is null`,
+      where owner_sub = $1
+        and model is null and grader_model is null and summarizer_model is null`,
     [ownerSub]
   );
 }
@@ -446,6 +512,7 @@ async function getModelSettingsRow(ownerSub: string): Promise<ModelSettingsRow |
   const result = await getPool().query(
     `select api_key_ciphertext, base_url, model, provider, reasoning_effort,
             grader_api_key_ciphertext, grader_base_url, grader_model, grader_provider, grader_reasoning_effort,
+            summarizer_api_key_ciphertext, summarizer_base_url, summarizer_model, summarizer_provider, summarizer_reasoning_effort,
             updated_at
      from user_model_settings
      where owner_sub = $1`,

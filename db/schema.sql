@@ -27,10 +27,10 @@ create unique index if not exists drive_connections_owner_email_idx
 create table if not exists user_model_settings (
   owner_sub text primary key,
   -- Per-role model overrides (main = agent + synthesis, grader = the cheaper
-  -- relevance examiner). A role is "present" iff its model and api_key_ciphertext
-  -- are both non-null; otherwise it falls back to that role's env default. The
-  -- two roles are independent — a user may override one, the other, both, or
-  -- neither.
+  -- relevance examiner, summarizer = condenses an oversize file into the synthesis
+  -- budget instead of hard-truncating it). A role is "present" iff its model and
+  -- api_key_ciphertext are both non-null; otherwise it falls back to that role's
+  -- env default. The roles are independent — a user may override any subset.
   api_key_ciphertext text,
   base_url text,
   model text,
@@ -41,6 +41,11 @@ create table if not exists user_model_settings (
   grader_model text,
   grader_provider text,
   grader_reasoning_effort text,
+  summarizer_api_key_ciphertext text,
+  summarizer_base_url text,
+  summarizer_model text,
+  summarizer_provider text,
+  summarizer_reasoning_effort text,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
@@ -88,3 +93,21 @@ alter table user_model_settings
 
 alter table user_model_settings
   add column if not exists grader_reasoning_effort text;
+
+-- Separate summarizer-role columns (condenses an oversize file into the synthesis
+-- budget instead of hard-truncating it). Nullable: the summarizer uses its env
+-- default when unset.
+alter table user_model_settings
+  add column if not exists summarizer_api_key_ciphertext text;
+
+alter table user_model_settings
+  add column if not exists summarizer_base_url text;
+
+alter table user_model_settings
+  add column if not exists summarizer_model text;
+
+alter table user_model_settings
+  add column if not exists summarizer_provider text;
+
+alter table user_model_settings
+  add column if not exists summarizer_reasoning_effort text;

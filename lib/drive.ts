@@ -23,7 +23,28 @@ export type DriveFile = {
   size?: string;
 };
 
-const MAX_FILE_CHARS = 32_000;
+export const MAX_FILE_CHARS = 32_000;
+
+/**
+ * Optional hook injected into {@link openDriveFile} to condense a file whose
+ * extracted text exceeds {@link MAX_FILE_CHARS} instead of hard-truncating it.
+ * Receives the assembled {@link DriveFile} and the full (normalized) text and
+ * returns a summary, or null to fall back to truncation (the hook owns its own
+ * failure handling — see summarizeOversizeContent in lib/agent.ts). Kept as a
+ * plain function so lib/drive stays free of any model/provider dependency and is
+ * still usable (with truncation) by callers that pass no hook (tests, utils).
+ */
+export type OversizeSummarizer = (args: {
+  file: DriveFile;
+  fullText: string;
+}) => Promise<string | null>;
+
+/**
+ * How {@link resolveFileContent} produced the returned text. `full` (within the
+ * cap), `empty` (nothing extractable), `truncated` (hard cut at the cap), or
+ * `summarized` (an {@link OversizeSummarizer} condensed it into the cap).
+ */
+export type ContentDisposition = "full" | "empty" | "truncated" | "summarized";
 
 /**
  * Per-request timeout for outbound Google Drive calls. Without it, a hung
@@ -455,10 +476,55 @@ async function extractXlsxText(buffer: Buffer) {
   return chunks.join("\n\n");
 }
 
-function trimContent(content: string) {
-  const normalized = content.replace(/\u0000/g, "").trim();
+/** Strip NUL bytes and surrounding whitespace from extracted text. */
+function normalizeFileContent(content: string) {
+  return content.replace(/\u0000/g, "").trim();
+}
+
+/** Hard-cut already-normalized text at the cap with an explicit marker. */
+function truncateToMaxChars(normalized: string) {
   if (normalized.length <= MAX_FILE_CHARS) return normalized;
   return `${normalized.slice(0, MAX_FILE_CHARS)}\n\n[Truncated at ${MAX_FILE_CHARS} characters]`;
+}
+
+/**
+ * Decide the text a file read returns, given its already-normalized extracted
+ * content. The single place the {@link MAX_FILE_CHARS} cap is applied, so both
+ * read paths (synthesis open_file, list review_file) share it:
+ *  - empty            -> an {@link emptyExtractionNote} so the gap is explicit;
+ *  - within the cap    -> the content unchanged;
+ *  - over the cap with a {@link OversizeSummarizer} hook -> the summary
+ *    (defensively re-capped if the model overshoots), falling back to a hard
+ *    truncation when the hook returns null/blank;
+ *  - over the cap with no hook -> a hard truncation (today's behaviour).
+ * Pure aside from the injected hook (no Drive/network), so the disposition logic
+ * is unit-testable with a fake summarizer.
+ */
+export async function resolveFileContent(args: {
+  normalized: string;
+  file: DriveFile;
+  summarizeOversize?: OversizeSummarizer;
+}): Promise<{ content: string; disposition: ContentDisposition }> {
+  const { normalized, file, summarizeOversize } = args;
+  if (normalized.length === 0) {
+    return { content: emptyExtractionNote(file), disposition: "empty" };
+  }
+  if (normalized.length <= MAX_FILE_CHARS) {
+    return { content: normalized, disposition: "full" };
+  }
+  if (summarizeOversize) {
+    const summary = (await summarizeOversize({ file, fullText: normalized }))?.trim();
+    if (summary) {
+      // Defensive re-cap: a summarizer that overshoots the budget must not blow
+      // the downstream context guard. Marker distinguishes this from raw truncation.
+      const content =
+        summary.length > MAX_FILE_CHARS
+          ? `${summary.slice(0, MAX_FILE_CHARS)}\n\n[Summary truncated at ${MAX_FILE_CHARS} characters]`
+          : summary;
+      return { content, disposition: "summarized" };
+    }
+  }
+  return { content: truncateToMaxChars(normalized), disposition: "truncated" };
 }
 
 function googleAppsTypeName(mimeType: string) {
@@ -490,6 +556,12 @@ export async function openDriveFile(input: {
   connectionId: string;
   fileId: string;
   debugRequestId?: string;
+  /**
+   * Optional: condense the file instead of hard-truncating it when its extracted
+   * text exceeds {@link MAX_FILE_CHARS}. Passed only by the synthesis read path
+   * (open_file); list-mode review_file omits it and keeps truncation.
+   */
+  summarizeOversize?: OversizeSummarizer;
 }): Promise<{ file: DriveFile; content: string }> {
   const startedAt = Date.now();
   await writeDebugLog({
@@ -567,9 +639,17 @@ export async function openDriveFile(input: {
       content = (await downloadBuffer(connection, input.fileId, input.debugRequestId)).toString("utf8");
   }
 
-  const trimmedContent = trimContent(content);
-  const emptyExtraction = trimmedContent.length === 0;
-  const finalContent = emptyExtraction ? emptyExtractionNote(metadata) : trimmedContent;
+  const file: DriveFile = {
+    ...metadata,
+    connectionId: connection.id,
+    driveEmail: connection.driveEmail
+  };
+  const normalized = normalizeFileContent(content);
+  const { content: finalContent, disposition } = await resolveFileContent({
+    normalized,
+    file,
+    summarizeOversize: input.summarizeOversize
+  });
   await writeDebugLog({
     event: "drive.open.completed",
     requestId: input.debugRequestId,
@@ -579,15 +659,11 @@ export async function openDriveFile(input: {
     mimeType: metadata.mimeType,
     rawContentLength: content.length,
     returnedContentLength: finalContent.length,
-    emptyExtraction
+    // Disposition makes the oversize path auditable: "summarized" vs "truncated"
+    // tells you whether the summarizer ran or we fell back to a hard cut.
+    contentDisposition: disposition,
+    emptyExtraction: disposition === "empty"
   });
 
-  return {
-    file: {
-      ...metadata,
-      connectionId: connection.id,
-      driveEmail: connection.driveEmail
-    },
-    content: finalContent
-  };
+  return { file, content: finalContent };
 }

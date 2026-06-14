@@ -15,7 +15,10 @@ The agent has a small, fixed set of app tools:
   note nudging the agent to vary its terms.
 - `open_file`: read a selected file's contents (synthesis mode only). The
   synthesis answer ends with a `SOURCES:` block citing the files it relied on, and
-  those cited files — not every file it opened — become the result list.
+  those cited files — not every file it opened — become the result list. A file
+  whose extracted text exceeds the per-file budget is condensed by a separate
+  **summarizer** model (query-focused, names/figures preserved) rather than
+  hard-truncated, so its whole substance reaches the answer.
 - `review_file`: both file-list modes — read a candidate file and judge its
   relevance in an isolated grader call, also reporting notable names/terms to
   search next. Curated mode keeps a file only if relevant; uncurated returns every
@@ -72,6 +75,15 @@ GRADER_AI_MODEL=...
 # GRADER_AI_REASONING_EFFORT is REQUIRED (see AI_REASONING_EFFORT); lowering it
 # (e.g. "low") is often the cheapest cost lever for the high-volume grader.
 GRADER_AI_REASONING_EFFORT=none
+# Summarizer model (required). A separate model used only to condense an oversize
+# file into the synthesis budget instead of hard-truncating it; no fallback to
+# another role, so all four must be set. Prefer a large-context model.
+SUMMARIZER_AI_API_KEY=...
+SUMMARIZER_AI_PROVIDER=openai
+# SUMMARIZER_AI_BASE_URL is optional (required for openai-compatible).
+SUMMARIZER_AI_MODEL=...
+# SUMMARIZER_AI_REASONING_EFFORT is REQUIRED (see AI_REASONING_EFFORT).
+SUMMARIZER_AI_REASONING_EFFORT=none
 DEBUG_LOGS=0
 DEBUG_LOG_CONTENT=0
 ```
@@ -106,14 +118,18 @@ thinking is carried across turns by the SDK, so multi-turn tool calls keep their
 chain-of-thought. User-supplied endpoints are SSRF-validated and pinned to public
 IPs at connect time.
 
-The app uses **two independent models**. The **main** model runs the agent loop
+The app uses **three independent models**. The **main** model runs the agent loop
 and writes the synthesis answer; the **grader** is a separate, cheaper model used
-only to judge per-file relevance, which has much lower requirements. Each role has
-its own provider, key, endpoint, model, and reasoning effort: set the operator
-defaults via the `AI_*` (main) and `GRADER_AI_*` (grader) env vars — both are
-required, with no fallback between roles — and override them per-user and
-per-role in **Settings**. Reasoning effort travels with a role's custom override;
-a role left on its env default takes the effort from its env var.
+only to judge per-file relevance; the **summarizer** condenses an oversize file
+into the synthesis budget (synthesis path only) instead of hard-truncating it, so
+the answer can draw on the whole file rather than just its first ~8k tokens. The
+grader and summarizer have much lower requirements than the main model (though a
+large context window helps the summarizer). Each role has its own provider, key,
+endpoint, model, and reasoning effort: set the operator defaults via the `AI_*`
+(main), `GRADER_AI_*` (grader), and `SUMMARIZER_AI_*` (summarizer) env vars — all
+required, with no fallback between roles — and override them per-user and per-role
+in **Settings**. Reasoning effort travels with a role's custom override; a role
+left on its env default takes the effort from its env var.
 
 Optional per-user abuse protection on `/api/agent` (in-memory, keyed by the
 authenticated user). These have sensible defaults and only need to be set to
