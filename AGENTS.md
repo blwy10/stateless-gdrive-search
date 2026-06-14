@@ -19,6 +19,14 @@ docs (environment, deployment, OAuth, debug logs) live in the [`README`](README.
   then record the decision in [`docs/configuration.md`](docs/configuration.md).
   Never use `process.env.X || "default"` for a behaviour-selecting var. (Full
   policy + the required/optional inventory: [`docs/configuration.md`](docs/configuration.md).)
+- Database schema lives in [`db/schema.sql`](db/schema.sql) and must stay
+  **idempotent** (`create ... if not exists`, `add column if not exists`, `alter
+  column ... drop not null`/`set default`) — there is no versioned-migration tool.
+  It is applied by `npm run db:migrate` (`scripts/migrate.mjs`, a small `pg`
+  script): automatically before `npm run dev` (npm's `predev` hook) and on every
+  Railway deploy (the `railway.json` pre-deploy command). CI applies it twice
+  against an ephemeral Postgres to catch broken or non-idempotent SQL. No manual
+  `psql` step.
 
 ## Tests
 

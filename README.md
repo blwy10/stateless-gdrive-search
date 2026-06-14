@@ -145,10 +145,11 @@ The limiter is process-local. It fully protects a single-instance deployment; if
 you scale to multiple replicas, move this state to a shared store (e.g. Redis)
 so the limits are enforced globally.
 
-Create the database table:
+Set up the database schema. `db/schema.sql` is idempotent, so this is safe to
+run repeatedly:
 
 ```bash
-psql "$DATABASE_URL" -f db/schema.sql
+npm run db:migrate
 ```
 
 Run locally:
@@ -157,6 +158,10 @@ Run locally:
 npm install
 npm run dev
 ```
+
+`npm run dev` applies the schema first automatically (via npm's `predev` hook),
+so a reachable database must be configured before it starts. Production runs the
+same `npm run db:migrate` on every deploy — see [Deployment](#deployment).
 
 ## Tests
 
@@ -186,6 +191,13 @@ The official project hosting target is Railway. Railway should track the remote
 ```bash
 npm run start:standalone
 ```
+
+Database schema changes are applied automatically on every deploy: `railway.json`
+sets a [pre-deploy command](https://docs.railway.com/deployments/pre-deploy-command)
+of `npm run db:migrate`, which runs the idempotent `db/schema.sql` after the build
+and before the new version starts serving. If it fails, the deployment is aborted
+and the previous version keeps running, so a bad migration never reaches traffic.
+No manual `psql` step is needed.
 
 Railway also needs a PostgreSQL service connected through `DATABASE_URL`, plus
 the environment variables listed above. Railway's managed Postgres is reached
