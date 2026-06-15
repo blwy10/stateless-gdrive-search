@@ -27,6 +27,7 @@
   position: relative;
   width: min(560px, 100%);
   max-height: calc(100vh - 96px);
+  max-height: calc(100dvh - 96px);
   overflow: auto;
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -123,6 +124,7 @@
 .provider-details dd {
   min-width: 0;
   color: var(--text);
+  overflow-wrap: break-word;
   overflow-wrap: anywhere;
 }
 

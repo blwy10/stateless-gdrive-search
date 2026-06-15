@@ -91,3 +91,39 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run build
+
+  migrate:
+    name: Migrate
+    runs-on: ubuntu-latest
+    # Apply db/schema.sql to an ephemeral Postgres so broken or non-idempotent
+    # SQL fails here, in CI, rather than in the Railway pre-deploy command (which
+    # would otherwise block the deploy). DATABASE_SSL is unset, so the migrate
+    # script connects without TLS — matching this service container.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: ci
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: ci
+        ports:
+          - 5432:5432
+        # Hold the job until Postgres is accepting connections.
+        options: >-
+          --health-cmd "pg_isready -U ci"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://ci:ci@localhost:5432/ci
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      # Run twice: the first apply creates the schema; the second proves the
+      # schema is idempotent (re-running must be a clean no-op).
+      - run: npm run db:migrate
+      - run: npm run db:migrate

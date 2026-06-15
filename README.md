@@ -84,6 +84,17 @@ SUMMARIZER_AI_PROVIDER=openai
 SUMMARIZER_AI_MODEL=...
 # SUMMARIZER_AI_REASONING_EFFORT is REQUIRED (see AI_REASONING_EFFORT).
 SUMMARIZER_AI_REASONING_EFFORT=none
+# Ranker model (required). A separate model used only to re-order a curated list's
+# kept files by relevance after the run; no fallback to another role, so all four
+# must be set. Its input is compact (per-file relevance notes, no content), so a
+# cheap instruction-following model is ideal.
+RANKER_AI_API_KEY=...
+RANKER_AI_PROVIDER=openai
+# RANKER_AI_BASE_URL is optional (required for openai-compatible).
+RANKER_AI_MODEL=...
+# RANKER_AI_REASONING_EFFORT is REQUIRED (see AI_REASONING_EFFORT); "low" is a good
+# default for listwise ordering.
+RANKER_AI_REASONING_EFFORT=none
 DEBUG_LOGS=0
 DEBUG_LOG_CONTENT=0
 ```
@@ -92,7 +103,7 @@ DEBUG_LOG_CONTENT=0
 > commented-out ones) is required and validated at startup; there are no in-code
 > fallback values for model/provider/reasoning-effort config. The only optional
 > vars are the `*_BASE_URL` endpoints, `DATABASE_SSL`, and the `DEBUG_*` / `AGENT_*`
-> knobs, where "unset" is a true no-op. See "Environment variables" in `AGENTS.md`.
+> knobs, where "unset" is a true no-op. See [`docs/configuration.md`](docs/configuration.md) for the full policy.
 
 ### Model provider
 
@@ -118,18 +129,20 @@ thinking is carried across turns by the SDK, so multi-turn tool calls keep their
 chain-of-thought. User-supplied endpoints are SSRF-validated and pinned to public
 IPs at connect time.
 
-The app uses **three independent models**. The **main** model runs the agent loop
+The app uses **four independent models**. The **main** model runs the agent loop
 and writes the synthesis answer; the **grader** is a separate, cheaper model used
 only to judge per-file relevance; the **summarizer** condenses an oversize file
 into the synthesis budget (synthesis path only) instead of hard-truncating it, so
-the answer can draw on the whole file rather than just its first ~8k tokens. The
-grader and summarizer have much lower requirements than the main model (though a
-large context window helps the summarizer). Each role has its own provider, key,
-endpoint, model, and reasoning effort: set the operator defaults via the `AI_*`
-(main), `GRADER_AI_*` (grader), and `SUMMARIZER_AI_*` (summarizer) env vars — all
-required, with no fallback between roles — and override them per-user and per-role
-in **Settings**. Reasoning effort travels with a role's custom override; a role
-left on its env default takes the effort from its env var.
+the answer can draw on the whole file rather than just its first ~8k tokens; the
+**ranker** re-orders a curated file list's kept results by relevance in one final
+pass (curated list mode only). The grader, summarizer, and ranker have much lower
+requirements than the main model (though a large context window helps the
+summarizer). Each role has its own provider, key, endpoint, model, and reasoning
+effort: set the operator defaults via the `AI_*` (main), `GRADER_AI_*` (grader),
+`SUMMARIZER_AI_*` (summarizer), and `RANKER_AI_*` (ranker) env vars — all required,
+with no fallback between roles — and override them per-user and per-role in
+**Settings**. Reasoning effort travels with a role's custom override; a role left
+on its env default takes the effort from its env var.
 
 Optional per-user abuse protection on `/api/agent` (in-memory, keyed by the
 authenticated user). These have sensible defaults and only need to be set to
@@ -145,10 +158,11 @@ The limiter is process-local. It fully protects a single-instance deployment; if
 you scale to multiple replicas, move this state to a shared store (e.g. Redis)
 so the limits are enforced globally.
 
-Create the database table:
+Set up the database schema. `db/schema.sql` is idempotent, so this is safe to
+run repeatedly:
 
 ```bash
-psql "$DATABASE_URL" -f db/schema.sql
+npm run db:migrate
 ```
 
 Run locally:
@@ -157,6 +171,10 @@ Run locally:
 npm install
 npm run dev
 ```
+
+`npm run dev` applies the schema first automatically (via npm's `predev` hook),
+so a reachable database must be configured before it starts. Production runs the
+same `npm run db:migrate` on every deploy — see [Deployment](#deployment).
 
 ## Tests
 
@@ -186,6 +204,13 @@ The official project hosting target is Railway. Railway should track the remote
 ```bash
 npm run start:standalone
 ```
+
+Database schema changes are applied automatically on every deploy: `railway.json`
+sets a [pre-deploy command](https://docs.railway.com/deployments/pre-deploy-command)
+of `npm run db:migrate`, which runs the idempotent `db/schema.sql` after the build
+and before the new version starts serving. If it fails, the deployment is aborted
+and the previous version keeps running, so a bad migration never reaches traffic.
+No manual `psql` step is needed.
 
 Railway also needs a PostgreSQL service connected through `DATABASE_URL`, plus
 the environment variables listed above. Railway's managed Postgres is reached

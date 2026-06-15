@@ -9,8 +9,8 @@ function required(name: string): string {
   return value;
 }
 
-// Project rule — explicit env, no silent defaults (see "Environment variables" in
-// AGENTS.md): config that picks model/provider behaviour is `required(...)`, never
+// Project rule — explicit env, no silent defaults (see the env-var policy in
+// docs/configuration.md): config that picks model/provider behaviour is `required(...)`, never
 // `process.env.X || "<default>"`. Genuinely-optional features (base URL, SSL,
 // debug, rate-limit knobs) may return null/off when unset, since that is a true
 // no-op and not a hidden behaviour-picking default.
@@ -34,7 +34,7 @@ export const env = {
   // lib/model-settings (an unrecognized value throws at startup).
   aiReasoningEffort: () => required("AI_REASONING_EFFORT"),
   // Grader role: a separate, cheaper model used only to judge per-file relevance
-  // (see gradeFileRelevance in lib/agent.ts). There is no fallback to the main
+  // (see gradeFileRelevance in lib/agent/examiner.ts). There is no fallback to the main
   // model — both roles must be configured. Endpoint is optional except for
   // openai-compatible.
   graderAiApiKey: () => required("GRADER_AI_API_KEY"),
@@ -45,9 +45,9 @@ export const env = {
   graderAiReasoningEffort: () => required("GRADER_AI_REASONING_EFFORT"),
   // Summarizer role: a separate model used only to condense an oversize file
   // (one that would otherwise be hard-truncated at MAX_FILE_CHARS) into the
-  // synthesis budget — see summarizeOversizeContent in lib/agent.ts. Like the
+  // synthesis budget — see summarizeOversizeContent in lib/agent/summarizer.ts. Like the
   // grader there is no fallback to another role: all four behaviour vars are
-  // required (maintainer decision — recorded in AGENTS.md). Endpoint optional
+  // required (maintainer decision — recorded in docs/configuration.md). Endpoint optional
   // except for openai-compatible.
   summarizerAiApiKey: () => required("SUMMARIZER_AI_API_KEY"),
   summarizerAiProvider: () => required("SUMMARIZER_AI_PROVIDER"),
@@ -55,5 +55,16 @@ export const env = {
   summarizerAiModel: () => required("SUMMARIZER_AI_MODEL"),
   // Required reasoning effort for the summarizer role (see aiReasoningEffort).
   summarizerAiReasoningEffort: () => required("SUMMARIZER_AI_REASONING_EFFORT"),
+  // Ranker role: a separate model used only to re-order a curated list's kept
+  // files by relevance in one terminal call — see rankKeptFiles in
+  // lib/agent/ranker.ts. Like the grader/summarizer there is no fallback to
+  // another role: all four behaviour vars are required. Endpoint optional except
+  // for openai-compatible.
+  rankerAiApiKey: () => required("RANKER_AI_API_KEY"),
+  rankerAiProvider: () => required("RANKER_AI_PROVIDER"),
+  rankerAiBaseUrl: (): string | null => process.env.RANKER_AI_BASE_URL || null,
+  rankerAiModel: () => required("RANKER_AI_MODEL"),
+  // Required reasoning effort for the ranker role (see aiReasoningEffort).
+  rankerAiReasoningEffort: () => required("RANKER_AI_REASONING_EFFORT"),
   nextAuthUrl: () => required("NEXTAUTH_URL")
 };

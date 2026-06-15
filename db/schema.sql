@@ -28,7 +28,8 @@ create table if not exists user_model_settings (
   owner_sub text primary key,
   -- Per-role model overrides (main = agent + synthesis, grader = the cheaper
   -- relevance examiner, summarizer = condenses an oversize file into the synthesis
-  -- budget instead of hard-truncating it). A role is "present" iff its model and
+  -- budget instead of hard-truncating it, ranker = re-orders a curated list's kept
+  -- files by relevance in one terminal call). A role is "present" iff its model and
   -- api_key_ciphertext are both non-null; otherwise it falls back to that role's
   -- env default. The roles are independent — a user may override any subset.
   api_key_ciphertext text,
@@ -46,6 +47,11 @@ create table if not exists user_model_settings (
   summarizer_model text,
   summarizer_provider text,
   summarizer_reasoning_effort text,
+  ranker_api_key_ciphertext text,
+  ranker_base_url text,
+  ranker_model text,
+  ranker_provider text,
+  ranker_reasoning_effort text,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
@@ -111,3 +117,20 @@ alter table user_model_settings
 
 alter table user_model_settings
   add column if not exists summarizer_reasoning_effort text;
+
+-- Separate ranker-role columns (re-orders a curated list's kept files by relevance
+-- in one terminal call). Nullable: the ranker uses its env default when unset.
+alter table user_model_settings
+  add column if not exists ranker_api_key_ciphertext text;
+
+alter table user_model_settings
+  add column if not exists ranker_base_url text;
+
+alter table user_model_settings
+  add column if not exists ranker_model text;
+
+alter table user_model_settings
+  add column if not exists ranker_provider text;
+
+alter table user_model_settings
+  add column if not exists ranker_reasoning_effort text;

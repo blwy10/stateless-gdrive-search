@@ -19,6 +19,18 @@ import { ssrfSafeDispatcher } from "@/lib/ssrf";
 const MODEL_REQUEST_TIMEOUT_MS = 60_000;
 
 /**
+ * Longer per-request timeout for the summarizer role only. Unlike the main/grader
+ * calls (small outputs, comfortably under the default), the summarizer generates a
+ * single large output (~8k tokens) that at typical provider throughput legitimately
+ * runs ~50s+ — so the default 60s leaves almost no margin and serverless
+ * tail-latency variance can abort a healthy summary into a truncation fallback
+ * (observed in a `.debug` trace: a ~7k-token summary at ~150 tok/s timed out at 60s
+ * while a sibling finished at ~48s). This is headroom for a slow-but-healthy call,
+ * not a target — it is still a backstop against a genuinely hung request. Tune here.
+ */
+export const SUMMARIZER_REQUEST_TIMEOUT_MS = 180_000;
+
+/**
  * Anthropic API floor for an extended-thinking budget. Below this the API rejects
  * the request, so it doubles as the "thinking off" threshold: a mapped budget of
  * 0 (reasoning effort unset) stays under it and disables thinking entirely. That
@@ -42,7 +54,7 @@ const ANTHROPIC_ANSWER_TOKEN_MARGIN = 8192;
  * token budget. `"none"` (the explicit provider default) returns 0, which keeps
  * thinking OFF (see {@link ANTHROPIC_MIN_THINKING_BUDGET_TOKENS}).
  *
- * CRITICAL DESIGN DECISION (full rationale: AGENTS.md → "Reasoning effort"):
+ * CRITICAL DESIGN DECISION (full rationale: docs/llm-and-agent-loop.md → "Reasoning effort"):
  * Anthropic exposes two reasoning controls — `thinking.budgetTokens` (this integer
  * budget, supported across thinking-capable models 3.7 → 4.x) and a newer `effort`
  * enum (`low|medium|high|xhigh|max`, Opus 4.5+ only). We deliberately use the
@@ -74,8 +86,9 @@ type GlobalFetch = typeof globalThis.fetch;
 
 /**
  * Build a fetch wrapper for outbound model calls that:
- *  1. bounds each individual HTTP request with {@link MODEL_REQUEST_TIMEOUT_MS}
- *     (combined with any caller-supplied signal),
+ *  1. bounds each individual HTTP request with `timeoutMs` (the per-role ceiling —
+ *     default {@link MODEL_REQUEST_TIMEOUT_MS}, summarizer
+ *     {@link SUMMARIZER_REQUEST_TIMEOUT_MS}), combined with any caller-supplied signal,
  *  2. refuses redirects — a validated host can still answer with a 302 to an
  *     internal/metadata address (e.g. 169.254.169.254), and
  *  3. for user-supplied ("custom") endpoints, validates the resolved IP at
@@ -86,9 +99,9 @@ type GlobalFetch = typeof globalThis.fetch;
  * legitimately resolve to an internal host). This mirrors the SSRF posture the
  * old hand-rolled `callModel` had before the SDK migration.
  */
-function createModelFetch(applySsrfGuard: boolean): GlobalFetch {
+function createModelFetch(applySsrfGuard: boolean, timeoutMs: number): GlobalFetch {
   return async (input, init) => {
-    const timeoutSignal = AbortSignal.timeout(MODEL_REQUEST_TIMEOUT_MS);
+    const timeoutSignal = AbortSignal.timeout(timeoutMs);
     const signal = init?.signal
       ? AbortSignal.any([init.signal, timeoutSignal])
       : timeoutSignal;
@@ -140,9 +153,17 @@ export type ResolvedModel = {
  *                          surfaced automatically by the provider when present.
  *                          Effort -> `reasoning_effort` via the `openaiCompatible`
  *                          provider-options key.
+ *
+ * `requestTimeoutMs` is the per-HTTP-request ceiling for this model's calls
+ * (default {@link MODEL_REQUEST_TIMEOUT_MS}). The summarizer passes
+ * {@link SUMMARIZER_REQUEST_TIMEOUT_MS} because its single large output legitimately
+ * runs longer than the small main/grader calls.
  */
-export function resolveModel(settings: EffectiveModelSettings): ResolvedModel {
-  const fetchImpl = createModelFetch(settings.source === "custom");
+export function resolveModel(
+  settings: EffectiveModelSettings,
+  requestTimeoutMs: number = MODEL_REQUEST_TIMEOUT_MS
+): ResolvedModel {
+  const fetchImpl = createModelFetch(settings.source === "custom", requestTimeoutMs);
 
   if (settings.provider === "anthropic") {
     const anthropic = createAnthropic({
@@ -176,6 +197,14 @@ export function resolveModel(settings: EffectiveModelSettings): ResolvedModel {
       name: "custom",
       baseURL: settings.baseUrl,
       apiKey: settings.apiKey,
+      // Ask for usage on streaming responses. The main agent loop uses
+      // `streamText`, and this provider only sends OpenAI's
+      // `stream_options.include_usage` when this flag is set — without it the
+      // stream returns null token usage, which silently blinds the token budget
+      // guards (diminishing returns, cost seatbelt, context-window). Harmless for
+      // the examiner/summarizer/ranker, which use generateText/generateObject and
+      // get usage from the (non-streamed) response body regardless.
+      includeUsage: true,
       fetch: fetchImpl
     });
     return {
