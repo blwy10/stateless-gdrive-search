@@ -29,6 +29,15 @@ export function ResultsView({
 
   // The live "thinking" stream.
   const reasoning = activeSession?.reasoning ?? "";
+  const status = activeSession?.status;
+  // Mirror the Progress drawer: expand the thinking while a run is active and
+  // collapse it once the answer is complete. Only runs on a status change, so a
+  // manual re-expand sticks; left untouched on error so the last thoughts stay
+  // visible for debugging.
+  useEffect(() => {
+    if (status === "running") setThinkingOpen(true);
+    else if (status === "finished") setThinkingOpen(false);
+  }, [status]);
   const thinkingRef = useRef<HTMLDivElement>(null);
   // On (re)open, jump to the latest reasoning.
   useEffect(() => {
