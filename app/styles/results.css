@@ -143,6 +143,7 @@
 .file-card a {
   font-weight: 700;
   color: var(--accent-strong);
+  overflow-wrap: break-word;
   overflow-wrap: anywhere;
 }
 

@@ -64,11 +64,11 @@ export function QueryForm({
                 checked={mode === "synthesis"}
                 onChange={() => onUpdateMode("synthesis")}
               />
-              Synthesis
+              <span>Synthesis</span>
             </label>
             <label className="radio-card">
               <input type="radio" checked={mode === "list"} onChange={() => onUpdateMode("list")} />
-              File list
+              <span>File list</span>
             </label>
           </div>
         </div>
