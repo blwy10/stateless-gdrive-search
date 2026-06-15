@@ -14,6 +14,7 @@ import {
 } from "../tool-runtime";
 import { recordUsefulProgress } from "../budget";
 import { fileKey, formatFileProgressLabel } from "../files";
+import { wrapUntrustedContent } from "../untrusted";
 
 /**
  * Handle a single `open_file` tool call (synthesis only): enforce drive scope,
@@ -171,12 +172,16 @@ export async function handleOpenFileTool(
   recordUsefulProgress(state);
   await emit({ type: "progress", message: `Opened ${formatFileProgressLabel(opened.file)}` });
   await recordTouched(state, opened.file, emit);
+  // open_file is the only path that pulls raw file content into the MAIN loop's
+  // context, so fence it as untrusted data with a per-call nonce (see
+  // wrapUntrustedContent) — the structural half of the "treat file content as
+  // data, not instructions" guard in basePrompt.
   return {
     role: "tool",
     tool_call_id: toolCall.id,
     content: safeJson({
       file: opened.file,
-      content: opened.content
+      content: wrapUntrustedContent(opened.content)
     })
   };
 }

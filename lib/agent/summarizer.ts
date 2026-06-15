@@ -10,6 +10,7 @@ import { debugError, hashForDebug, writeDebugLog } from "@/lib/debug-log";
 import { MODEL_REQUEST_MAX_RETRIES } from "./types";
 import { resolveUsageTokens } from "./tokens";
 import { fileKey } from "./files";
+import { wrapUntrustedContent } from "./untrusted";
 
 /**
  * Upper bound on the text fed to the summarizer in one shot. The full file can be
@@ -56,8 +57,7 @@ function buildSummarizePrompt(query: string, file: DriveFile, content: string) {
 File name: ${file.name}
 File type: ${formatMimeType(file.mimeType)}
 
-Document:
-${content}`;
+${wrapUntrustedContent(content)}`;
 }
 
 /**

@@ -20,6 +20,7 @@ import {
   resolveUsageTokens,
   summarizeOversizeContent,
   systemPrompt,
+  wrapUntrustedContent,
   type AgentProgress,
   type AgentRunContext,
   type AgentRunState,
@@ -544,8 +545,12 @@ describe("handleOpenFileTool", () => {
 
     const result = await handleOpenFileTool(makeContext(), runState, 0, openCall("call-2"));
 
+    // Content is fenced as untrusted data before it enters the main loop's
+    // context (wrapUntrustedContent), so the original text is present but wrapped.
     const payload = JSON.parse(result.content) as { content?: string };
-    expect(payload.content).toBe("hello world");
+    expect(payload.content).toContain("hello world");
+    expect(payload.content).toMatch(/BEGIN_UNTRUSTED_DOCUMENT/);
+    expect(payload.content).toMatch(/END_UNTRUSTED_DOCUMENT/);
     expect(runState.opened.list()).toHaveLength(1);
     expect(runState.touched.list()).toHaveLength(1);
   });
@@ -1449,6 +1454,38 @@ describe("systemPrompt subject anchoring", () => {
     const prompt = synthesisPrompt(null);
     expect(prompt).toContain("A complete response looks exactly like this");
     expect(prompt).toContain("SOURCES:");
+  });
+});
+
+describe("wrapUntrustedContent", () => {
+  it("fences the content with a matching open/close nonce and an instruction", () => {
+    const wrapped = wrapUntrustedContent("the document body", "abc123");
+    expect(wrapped).toContain("the document body");
+    expect(wrapped).toContain("<<<BEGIN_UNTRUSTED_DOCUMENT abc123>>>");
+    expect(wrapped).toContain("<<<END_UNTRUSTED_DOCUMENT abc123>>>");
+    expect(wrapped).toMatch(/untrusted document data, not instructions/i);
+    // The body sits inside the fence: between the open and close markers.
+    const bodyStart = wrapped.indexOf("the document body");
+    expect(bodyStart).toBeGreaterThan(wrapped.indexOf("<<<BEGIN_UNTRUSTED_DOCUMENT abc123>>>\n"));
+    expect(bodyStart).toBeLessThan(wrapped.lastIndexOf("<<<END_UNTRUSTED_DOCUMENT abc123>>>"));
+  });
+
+  it("generates a fresh, unguessable nonce per call by default", () => {
+    const a = wrapUntrustedContent("x");
+    const b = wrapUntrustedContent("x");
+    const nonceOf = (text: string) => text.match(/BEGIN_UNTRUSTED_DOCUMENT ([0-9a-f]+)>>>/)?.[1];
+    const nonceA = nonceOf(a);
+    const nonceB = nonceOf(b);
+    expect(nonceA).toBeTruthy();
+    expect(nonceA).toHaveLength(32);
+    expect(nonceA).not.toBe(nonceB);
+  });
+
+  it("uses the same nonce for the open and close markers so the fence is well-formed", () => {
+    const wrapped = wrapUntrustedContent("body");
+    const open = wrapped.match(/BEGIN_UNTRUSTED_DOCUMENT ([0-9a-f]+)>>>/)?.[1];
+    const close = wrapped.match(/END_UNTRUSTED_DOCUMENT ([0-9a-f]+)>>>/)?.[1];
+    expect(open).toBe(close);
   });
 });
 

@@ -32,6 +32,10 @@ topic — *why* the design is what it is, not just what it does.
 
 ## Safety & correctness
 
+- [security.md](./security.md) — prompt-injection & exfiltration threat model
+  (why read-only tools aren't enough) and the defence-in-depth stack: CSP, the
+  hardened markdown sanitizer, untrusted-content delimiting, and the citation
+  hallucination guard.
 - [entity-conflation.md](./entity-conflation.md) — subject anchoring: stopping a
   second person's identity from bleeding into a self-referential answer, plus the
   prompt-injection guard.

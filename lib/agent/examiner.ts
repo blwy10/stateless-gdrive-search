@@ -11,6 +11,7 @@ import { debugError, debugText, hashForDebug, writeDebugLog } from "@/lib/debug-
 import { MODEL_REQUEST_MAX_RETRIES } from "./types";
 import { resolveUsageTokens } from "./tokens";
 import { fileKey } from "./files";
+import { wrapUntrustedContent } from "./untrusted";
 
 /**
  * The values for {@link GradeVerdict.aboutSubject}: whether a document is
@@ -143,8 +144,7 @@ function buildGradePrompt(query: string, file: DriveFile, content: string) {
 File name: ${file.name}
 File type: ${formatMimeType(file.mimeType)}
 
-Content:
-${content}`;
+${wrapUntrustedContent(content)}`;
 }
 
 /**

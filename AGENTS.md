@@ -86,6 +86,7 @@ what it is, not just what it does:
 | Search recall, berry-picking, diminishing-returns budget | [`docs/retrieval-and-budget.md`](docs/retrieval-and-budget.md) |
 | Results vs "touched" lists, `SOURCES` citations | [`docs/results-and-citations.md`](docs/results-and-citations.md) |
 | Folder navigation (`list_folder`, expand-only) | [`docs/folder-navigation.md`](docs/folder-navigation.md) |
+| Prompt injection & exfiltration: CSP, markdown sanitizer, content delimiting | [`docs/security.md`](docs/security.md) |
 | Subject anchoring / entity conflation, prompt-injection guard | [`docs/entity-conflation.md`](docs/entity-conflation.md) |
 | Oversize-file summarisation | [`docs/oversize-files.md`](docs/oversize-files.md) |
 | Surfacing Google Drive error reasons | [`docs/drive-errors.md`](docs/drive-errors.md) |

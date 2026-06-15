@@ -63,5 +63,8 @@ below files genuinely about the owner. Remaining follow-up: acting on
 
 Prompt-injection note (related): every content-ingesting prompt — `basePrompt`
 (main agent), `gradeSystemPrompt` (examiner), and `SUMMARIZE_SYSTEM_PROMPT`
-(summarizer) — now tells the model to treat file contents as untrusted data, not
-instructions. This is defence-in-depth, not a guarantee.
+(summarizer) — tells the model to treat file contents as untrusted data, not
+instructions, and each path also fences the raw content with a per-call random
+nonce (`wrapUntrustedContent`). This is defence-in-depth, not a guarantee — the
+full threat model (including the browser-side exfiltration channels closed by the
+CSP and the hardened markdown sanitizer) lives in [`security.md`](./security.md).
