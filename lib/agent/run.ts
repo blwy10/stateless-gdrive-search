@@ -26,7 +26,7 @@ import {
   type AgentRequest
 } from "./types";
 import { evaluateTokenBudget, resolveAgentBudget } from "./budget";
-import { resolveUsageTokens } from "./tokens";
+import { estimateMessagesChars, resolveUsageTokens } from "./tokens";
 import { describeSubjectIdentity, systemPrompt } from "./prompts";
 import { gradeFileRelevance } from "./examiner";
 import { summarizeOversizeContent } from "./summarizer";
@@ -204,11 +204,16 @@ function buildRunContext(
  *  (B) per-step fallback — for providers that report reasoning only at the end of a
  *      step rather than as deltas, `onStepFinish` emits the step's full
  *      `reasoningText` once (only when no deltas streamed for that step).
- * Streaming is display-only; the loop control (prepareStep gating, token
- * accounting, step logging) is unchanged. Awaiting the result promises consumes the
- * stream end-to-end (running tools + firing the callbacks); a stream-stopping error
- * is captured via `onError` and rethrown so the caller's catch can still finalize
- * with whatever `state` gathered (matching the old generateText throw path).
+ * Streaming is display-only for the reasoning text; the loop control (prepareStep
+ * gating, step logging) is unchanged. Token accounting does depend on usage being
+ * reported on the stream: openai-compatible providers must be built with
+ * `includeUsage` (see resolveModel) or `step.usage` comes back null. When usage is
+ * absent we fold a char-based estimate of input + output instead, and emit a
+ * one-shot `agent.usage.missing` canary if a whole run reported none. Awaiting the
+ * result promises consumes the stream end-to-end (running tools + firing the
+ * callbacks); a stream-stopping error is captured via `onError` and rethrown so the
+ * caller's catch can still finalize with whatever `state` gathered (matching the
+ * old generateText throw path).
  */
 async function runMainModelLoop(params: {
   resolved: ResolvedModel;
@@ -237,6 +242,14 @@ async function runMainModelLoop(params: {
     boundaryPending = false;
     return emit({ type: "reasoning", delta });
   };
+
+  // No-usage estimate + canary bookkeeping (Layers 2 & 3 of the budget-guard fix).
+  // `lastStepInputChars`: input size of the step prepareStep just set up, folded
+  // into the token estimate by onStepFinish when the provider reports no usage.
+  // `mainModelSteps` / `…WithUsage`: drive the once-per-run canary after the stream.
+  let lastStepInputChars = 0;
+  let mainModelSteps = 0;
+  let mainModelStepsWithUsage = 0;
 
   let streamError: unknown = null;
   const result = streamText({
@@ -268,8 +281,13 @@ async function runMainModelLoop(params: {
     // context-window limit) drops every tool so the model must finish; a search
     // backstop drops only search_drive, leaving the read tool so the model can
     // finish with the files it already found.
-    prepareStep: ({ stepNumber }) => {
+    prepareStep: ({ stepNumber, messages }) => {
       state.currentStep = stepNumber;
+      // Record the INPUT size of the step about to run (the fixed system prompt
+      // plus the messages the SDK will send — accumulated tool results/file
+      // content) so onStepFinish can fold a realistic estimate into the token
+      // total when the provider reports no usage (see resolveUsageTokens).
+      lastStepInputChars = systemPromptText.length + estimateMessagesChars(messages);
       evaluateTokenBudget(state, budget);
       if (state.windDownReason) return { activeTools: [] };
       if (state.stopSearchingReason) {
@@ -293,14 +311,24 @@ async function runMainModelLoop(params: {
       streamedReasoningThisStep = false;
 
       // Fold each main-loop step's tokens into the run total (drives the
-      // diminishing-returns budget and cost seatbelt), estimating from the
-      // visible text + reasoning when a provider reports no usage. The
-      // context-window guard tracks raw input tokens only (never an estimate or
-      // fudge) and simply doesn't fire when the provider omits them — the step
-      // backstop carries the run then (see AgentBudget docs).
+      // diminishing-returns budget and cost seatbelt). Real provider usage is
+      // preferred; when the provider reports none we estimate from this step's
+      // INPUT (captured in prepareStep — the dominant cost) plus the visible
+      // output text + reasoning. The context-window guard still tracks raw input
+      // tokens only (never an estimate or fudge) and simply doesn't fire when the
+      // provider omits them — the step backstop carries the run then.
+      mainModelSteps += 1;
+      if (
+        typeof step.usage?.totalTokens === "number" ||
+        typeof step.usage?.inputTokens === "number" ||
+        typeof step.usage?.outputTokens === "number"
+      ) {
+        mainModelStepsWithUsage += 1;
+      }
       state.tokensSpent += resolveUsageTokens(
         step.usage,
-        `${step.text ?? ""}${step.reasoningText ?? ""}`
+        `${step.text ?? ""}${step.reasoningText ?? ""}`,
+        lastStepInputChars
       );
       if (typeof step.usage?.inputTokens === "number") {
         state.lastInputTokens = step.usage.inputTokens;
@@ -318,6 +346,26 @@ async function runMainModelLoop(params: {
     result.response
   ]);
   if (streamError) throw streamError;
+
+  // Canary: if EVERY main-model step reported no token usage, the token budget
+  // guards (diminishing returns, cost seatbelt, context-window) ran on the
+  // char-based estimate alone and `lastInputTokens` never advanced — i.e. the
+  // seatbelts are soft. This is the silent-failure mode the streamText migration
+  // can hit when an openai-compatible provider isn't built with `includeUsage`.
+  // Surface it ONCE per run so a future usage regression shows up in `.debug`
+  // instead of quietly disabling the guards.
+  if (mainModelSteps > 0 && mainModelStepsWithUsage === 0) {
+    await writeDebugLog({
+      level: "warn",
+      event: "agent.usage.missing",
+      requestId,
+      provider: logSettings.provider,
+      model: logSettings.model,
+      steps: mainModelSteps,
+      estimatedTokensSpent: state.tokensSpent
+    });
+  }
+
   return { text, finishReason, steps, response };
 }
 

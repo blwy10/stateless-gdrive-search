@@ -14,7 +14,7 @@ export {
 } from "./types";
 export { defaultAgentBudgets, resolveAgentBudget } from "./budget";
 export { describeSubjectIdentity, systemPrompt } from "./prompts";
-export { resolveUsageTokens } from "./tokens";
+export { estimateMessagesChars, resolveUsageTokens } from "./tokens";
 export { wrapUntrustedContent } from "./untrusted";
 export { gradeFileRelevance, normalizeGradeVerdict, type GradeVerdict } from "./examiner";
 export { summarizeOversizeContent } from "./summarizer";

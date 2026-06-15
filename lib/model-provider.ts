@@ -197,6 +197,14 @@ export function resolveModel(
       name: "custom",
       baseURL: settings.baseUrl,
       apiKey: settings.apiKey,
+      // Ask for usage on streaming responses. The main agent loop uses
+      // `streamText`, and this provider only sends OpenAI's
+      // `stream_options.include_usage` when this flag is set — without it the
+      // stream returns null token usage, which silently blinds the token budget
+      // guards (diminishing returns, cost seatbelt, context-window). Harmless for
+      // the examiner/summarizer/ranker, which use generateText/generateObject and
+      // get usage from the (non-streamed) response body regardless.
+      includeUsage: true,
       fetch: fetchImpl
     });
     return {
