@@ -5,6 +5,7 @@ import { fileKey, type DriveFile, type QuerySession } from "./types";
 
 export type StreamEvent =
   | { type: "progress"; message: string }
+  | { type: "reasoning"; delta: string }
   | { type: "file"; file: DriveFile }
   | { type: "reviewing"; file: DriveFile }
   | { type: "kept"; file: DriveFile }
@@ -29,6 +30,7 @@ export type AgentQueryRequest = {
  * Apply one streamed agent event to a session, returning the updated session.
  * Pure (no React state) so the live-update logic is in one place and testable:
  *  - progress  -> append a progress line;
+ *  - reasoning -> append a chunk to the live "thinking" stream;
  *  - file      -> add to the touched set, and (uncurated list only) the results;
  *  - reviewing -> add a provisional curated candidate;
  *  - kept      -> promote a candidate into the results;
@@ -41,6 +43,10 @@ export function applyStreamEvent(session: QuerySession, event: StreamEvent): Que
   switch (event.type) {
     case "progress":
       return { ...session, events: [...session.events, event.message], updatedAt };
+    case "reasoning":
+      // Accumulate the live "thinking" stream. Display-only; kept in memory for the
+      // active run and stripped before persistence (see saveStoredSessions).
+      return { ...session, reasoning: session.reasoning + event.delta, updatedAt };
     case "file": {
       // A file the agent encountered. It always joins the "touched" audit list; in
       // uncurated list mode it is also a result, so mirror it into `files` for live

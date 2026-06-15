@@ -62,6 +62,13 @@ another.
      link `href`s to `http`/`https`/`mailto`. Links already open with
      `rel="noreferrer noopener"`. This is defence-in-depth behind the CSP: even if
      the CSP were ever misconfigured, no image element reaches the DOM.
+   - **Streamed reasoning is rendered as plain text** (`components/search/results-view.tsx`):
+     the live "thinking" stream (see
+     [llm-and-agent-loop.md](./llm-and-agent-loop.md#streaming-reasoning-thinking)) is
+     also untrusted model output derived from file content, so it is rendered as text
+     (`white-space: pre-wrap`), **never** through the markdown renderer — it therefore
+     cannot emit an `<img>`/link element and reopen the channel the answer sanitizer
+     closes. (The CSP backstops this regardless.)
 
 3. **Untrusted-content delimiting ("spotlighting").** Every path that feeds raw
    file content to a model wraps it with `wrapUntrustedContent`

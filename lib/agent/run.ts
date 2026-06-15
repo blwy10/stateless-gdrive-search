@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Benjamin Lau
 // SPDX-License-Identifier: MIT
 
-import { generateText, stepCountIs, type ModelMessage, type ToolSet } from "ai";
+import { generateText, stepCountIs, streamText, type ModelMessage, type ToolSet } from "ai";
 import type { DriveFile } from "@/lib/drive";
 import { listDriveConnections, type DriveConnectionSummary } from "@/lib/drive-connections";
 import {
@@ -194,8 +194,23 @@ function buildRunContext(
  * emit and the run-resilience invariant live inside the tool handlers (see
  * buildAgentTools); `state` is mutated in place so a throw can still finalize
  * with whatever was gathered.
+ *
+ * Uses `streamText` (not `generateText`) so the MAIN model's reasoning can be
+ * forwarded to the client live as it is produced. Two complementary paths cover
+ * the range of providers:
+ *  (A) streaming — each `reasoning-delta` chunk is emitted as a `reasoning` event
+ *      via `onChunk` (OpenAI reasoning summaries, Anthropic thinking, and Fireworks
+ *      `reasoning_content` all surface here);
+ *  (B) per-step fallback — for providers that report reasoning only at the end of a
+ *      step rather than as deltas, `onStepFinish` emits the step's full
+ *      `reasoningText` once (only when no deltas streamed for that step).
+ * Streaming is display-only; the loop control (prepareStep gating, token
+ * accounting, step logging) is unchanged. Awaiting the result promises consumes the
+ * stream end-to-end (running tools + firing the callbacks); a stream-stopping error
+ * is captured via `onError` and rethrown so the caller's catch can still finalize
+ * with whatever `state` gathered (matching the old generateText throw path).
  */
-function runMainModelLoop(params: {
+async function runMainModelLoop(params: {
   resolved: ResolvedModel;
   logSettings: LogSettings;
   systemPromptText: string;
@@ -205,10 +220,26 @@ function runMainModelLoop(params: {
   state: AgentRunState;
   requestId: string;
   listMode: boolean;
+  emit: (event: AgentProgress) => void | Promise<void>;
 }) {
-  const { resolved, logSettings, systemPromptText, userText, tools, budget, state, requestId, listMode } =
+  const { resolved, logSettings, systemPromptText, userText, tools, budget, state, requestId, listMode, emit } =
     params;
-  return generateText({
+
+  // Reasoning-stream bookkeeping. `boundaryPending` inserts a blank line between
+  // consecutive steps' reasoning blocks so multi-step thinking stays readable;
+  // `streamedReasoningThisStep` lets onStepFinish decide whether the per-step
+  // fallback (B) is needed (only when no deltas streamed for that step).
+  let boundaryPending = false;
+  let streamedReasoningThisStep = false;
+  const emitReasoning = (text: string): void | Promise<void> => {
+    if (!text) return;
+    const delta = boundaryPending ? `\n\n${text}` : text;
+    boundaryPending = false;
+    return emit({ type: "reasoning", delta });
+  };
+
+  let streamError: unknown = null;
+  const result = streamText({
     model: resolved.model,
     providerOptions: resolved.providerOptions,
     ...(resolved.temperature !== undefined ? { temperature: resolved.temperature } : {}),
@@ -221,6 +252,16 @@ function runMainModelLoop(params: {
     // maxToolSteps is only the loop-insurance backstop; diminishing returns and
     // the token guards (evaluated in prepareStep) are the normal stop.
     stopWhen: stepCountIs(budget.maxToolSteps),
+    // (A) Forward each reasoning delta to the client as the model produces it.
+    onChunk: ({ chunk }) => {
+      if (chunk.type !== "reasoning-delta") return;
+      streamedReasoningThisStep = true;
+      return emitReasoning(chunk.text);
+    },
+    // Capture a stream-stopping error so it can be rethrown after consuming.
+    onError: ({ error }) => {
+      streamError = error;
+    },
     // Before each step: record the step index (so possibly-parallel tool executes
     // attribute their logs), evaluate the token-based budget guards, then gate
     // tools. A hard wind-down (diminishing-returns limit, cost seatbelt, or
@@ -242,6 +283,15 @@ function runMainModelLoop(params: {
       return undefined;
     },
     onStepFinish: (step) => {
+      // (B) Fallback: if this step produced reasoning but the provider didn't
+      // stream it as deltas, surface the full reasoningText once. Then arm a
+      // boundary so the next step's reasoning block is visually separated, and
+      // reset the per-step flag.
+      const reasoningText = step.reasoningText ?? "";
+      if (reasoningText && !streamedReasoningThisStep) void emitReasoning(reasoningText);
+      if (streamedReasoningThisStep || reasoningText) boundaryPending = true;
+      streamedReasoningThisStep = false;
+
       // Fold each main-loop step's tokens into the run total (drives the
       // diminishing-returns budget and cost seatbelt), estimating from the
       // visible text + reasoning when a provider reports no usage. The
@@ -258,6 +308,17 @@ function runMainModelLoop(params: {
       return logModelStep(requestId, logSettings, step);
     }
   });
+
+  // Awaiting these consumes the stream end-to-end (driving tool execution and the
+  // callbacks above) and yields the same shape the caller used under generateText.
+  const [text, finishReason, steps, response] = await Promise.all([
+    result.text,
+    result.finishReason,
+    result.steps,
+    result.response
+  ]);
+  if (streamError) throw streamError;
+  return { text, finishReason, steps, response };
 }
 
 /**
@@ -453,7 +514,8 @@ export async function runDriveAgent(
       budget,
       state,
       requestId,
-      listMode: input.mode === "list"
+      listMode: input.mode === "list",
+      emit
     });
 
     // List mode answers are always empty (results come from state). For synthesis,

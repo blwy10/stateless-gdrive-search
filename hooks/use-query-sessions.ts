@@ -39,9 +39,13 @@ export function useQuerySessions() {
     setHasLoadedSessions(true);
   }, []);
 
+  // Persist on change, debounced. Live reasoning deltas update `sessions` very
+  // frequently during a run; debouncing coalesces those into one write so we don't
+  // hammer localStorage on every token. The trailing timer flushes the final state.
   useEffect(() => {
     if (!hasLoadedSessions) return;
-    saveStoredSessions(sessions);
+    const handle = window.setTimeout(() => saveStoredSessions(sessions), 300);
+    return () => window.clearTimeout(handle);
   }, [hasLoadedSessions, sessions]);
 
   const activeSession = useMemo(
@@ -104,6 +108,7 @@ export function useQuerySessions() {
       files: [],
       touchedFiles: [],
       reviewingFiles: [],
+      reasoning: "",
       answer: "",
       answerFormat: "plain",
       error: ""
@@ -236,6 +241,7 @@ export function useQuerySessions() {
       files: [],
       touchedFiles: [],
       reviewingFiles: [],
+      reasoning: "",
       answer: "",
       answerFormat: "plain",
       error: ""

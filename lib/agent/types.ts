@@ -119,6 +119,13 @@ export type AgentOptions = {
 
 export type AgentProgress =
   | { type: "progress"; message: string }
+  // A chunk of the MAIN agent's streamed reasoning ("thinking"), forwarded live as
+  // the model produces it (AI SDK `reasoning-delta`) or — for providers that don't
+  // stream reasoning incrementally — once per step as a fallback. Display only: it
+  // never re-enters the model context and carries no result semantics. It is
+  // untrusted model output derived from file content, so the UI renders it as PLAIN
+  // TEXT, never markdown/HTML (see docs/security.md).
+  | { type: "reasoning"; delta: string }
   // A file the agent encountered this run — a new search candidate, or one it
   // opened/reviewed. Streams into the UI's "files touched" disclosure (all
   // modes); in uncurated list mode it is also a result. Every emitted file is a

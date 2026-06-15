@@ -21,6 +21,9 @@ export function loadStoredSessions(): QuerySession[] | null {
       ...session,
       curateList: session.curateList ?? false,
       answerFormat: session.answerFormat ?? ("plain" as const),
+      // Reasoning is never persisted (see saveStoredSessions); default it for
+      // sessions saved before the field existed.
+      reasoning: session.reasoning ?? "",
       // Sessions persisted before the touched/sources split stored every found
       // file in `files`; treat that as the touched set so the disclosure still
       // renders for old runs.
@@ -41,5 +44,9 @@ export function loadStoredSessions(): QuerySession[] | null {
 
 /** Persist the query sessions to localStorage. */
 export function saveStoredSessions(sessions: QuerySession[]): void {
-  window.localStorage.setItem(STORAGE_KEY, JSON.stringify(sessions));
+  // Drop the live "thinking" stream before persisting: it is ephemeral, can be
+  // large, and is not useful to restore across reloads. Stripping it before
+  // stringify also keeps these (high-frequency, during streaming) writes small.
+  const persistable = sessions.map((session) => ({ ...session, reasoning: "" }));
+  window.localStorage.setItem(STORAGE_KEY, JSON.stringify(persistable));
 }

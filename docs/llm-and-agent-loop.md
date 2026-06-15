@@ -37,17 +37,23 @@ user-supplied ("custom") endpoints — pins the connection to public IPs via
 `ssrfSafeDispatcher`. The operator default endpoint is trusted and skips the
 dispatcher.
 
-`runDriveAgent` calls `generateText` with the tool set from `buildAgentTools`,
-`stopWhen: stepCountIs(budget.maxToolSteps)` (a loop-insurance *backstop*, not
-the normal stop — see [retrieval-and-budget.md](./retrieval-and-budget.md)), a
-`prepareStep`, and an `onStepFinish`.
+`runDriveAgent` (via `runMainModelLoop`) calls `streamText` with the tool set from
+`buildAgentTools`, `stopWhen: stepCountIs(budget.maxToolSteps)` (a loop-insurance
+*backstop*, not the normal stop — see [retrieval-and-budget.md](./retrieval-and-budget.md)),
+a `prepareStep`, an `onChunk`, an `onError`, and an `onStepFinish`. `streamText`
+(rather than `generateText`) is what lets the main model's reasoning stream to the
+client live — see [Streaming reasoning](#streaming-reasoning-thinking) below; awaiting
+the result promises (`text`/`finishReason`/`steps`/`response`) consumes the stream
+end-to-end, driving tool execution and the callbacks.
 `prepareStep` records the current step, calls `evaluateTokenBudget`, then gates
 tools: a `windDownReason` (diminishing-returns hard limit, cost seatbelt, or
 context-window limit) drops *every* tool so the model must finish; a
 `stopSearchingReason` (the search-call backstop) drops only `search_drive` and
 keeps the read tool (`review_file` in list modes, `open_file` in synthesis) so
 the model can finish with what it found. `onStepFinish` folds the step's tokens
-into `state.tokensSpent`, tracks `state.lastInputTokens`, then logs. The SDK
+into `state.tokensSpent`, tracks `state.lastInputTokens`, emits the step's reasoning
+as a fallback when the provider didn't stream it (see
+[Streaming reasoning](#streaming-reasoning-thinking)), then logs. The SDK
 drives the whole loop — appending each assistant turn (with reasoning) and the
 tool results, re-prompting, and round-tripping reasoning across steps
 automatically — so there is no hand-rolled message bookkeeping or
@@ -61,10 +67,12 @@ arguments (`parseToolArgs`), and the SDK tools use a pass-through `inputSchema`
 (`looseToolSchema`) so malformed/extra fields never raise the SDK's
 `InvalidToolInputError`; the handler returns an observation and the model retries,
 preserving "bad args → retry, never abort" across every provider (including
-non-strict ones). As a final backstop, the whole `generateText` call is wrapped in
-try/catch: because `AgentRunState` is mutated in place, a throw (model error after
+non-strict ones). As a final backstop, the whole `streamText` consumption is wrapped
+in try/catch: because `AgentRunState` is mutated in place, a throw (model error after
 retries, a hallucinated/unrepairable tool call, a timeout) still finalizes with
-whatever was gathered instead of discarding the run. `generateText` is given
+whatever was gathered instead of discarding the run. A stream-stopping error is
+captured via `streamText`'s `onError` and rethrown once the stream is consumed, so it
+routes through that same catch. The call is given
 `maxRetries: MODEL_REQUEST_MAX_RETRIES`, so the SDK retries transient model
 failures (network, timeout, 5xx, 429) and never retries 4xx.
 
@@ -79,6 +87,42 @@ whatever the provider) and carried across turns by the SDK's `response.messages`
 round-trip — exactly the multi-turn / interleaved-thinking case the old
 hand-rolled `assistantTurnMessage` solved by hand. Different providers expose full
 vs summarized reasoning; that is fine, the structure is the same.
+
+### Streaming reasoning ("thinking")
+
+The main loop uses `streamText` so the model's reasoning can be surfaced to the user
+live, the way agentic UIs show their "thinking". It rides the same SSE stream as the
+other progress events (a new `{ type: "reasoning", delta }` `AgentProgress` variant)
+and renders in a collapsible **Thinking** panel, separate from the answer and the
+progress/files lists.
+
+Two complementary paths cover the range of providers, because not all stream
+reasoning incrementally:
+- **(A) deltas** — `onChunk` forwards each `reasoning-delta` chunk the instant the
+  model produces it.
+- **(B) per-step fallback** — if a step produced reasoning but *no* deltas arrived
+  for it (some `openai-compatible` endpoints report `reasoning_content` only at the
+  end of a step), `onStepFinish` emits that step's full `reasoningText` once. A
+  per-step flag (`streamedReasoningThisStep`) ensures (A) and (B) never double-emit;
+  a `boundaryPending` flag inserts a blank line between consecutive steps' blocks.
+
+What actually appears depends on the model + reasoning effort, and the feature
+degrades gracefully (no panel) when there is nothing: OpenAI streams reasoning
+*summaries*, and only for reasoning models; Anthropic streams real thinking but only
+when a reasoning effort is set (thinking is OFF at `none` — see
+[Reasoning effort](#reasoning-effort)); Fireworks streams raw `reasoning_content` for
+reasoning models.
+
+Scope and safety: only the **main** loop streams (the grader/summarizer/ranker are
+isolated `generateObject`/`generateText` calls, deliberately silent). Streaming is
+**display-only** — reasoning never re-enters the model context and has no result
+semantics; token accounting is unchanged (the same `reasoningText` was always counted
+in `onStepFinish`). Because reasoning is untrusted model output derived from file
+content, the UI renders it as **plain text**, never markdown/HTML, so it cannot
+reintroduce the image-exfiltration channel the answer sanitizer closes (see
+[security.md](./security.md)). It is transient: accumulated on the client session in
+memory but stripped before localStorage persistence, and that write is debounced so
+high-frequency deltas don't hammer storage.
 
 ### Examiner & list modes
 
@@ -135,7 +179,8 @@ required — and only SSRF-validated — for `openai-compatible`.
 
 The agent resolves four
 independent models per run. The **main** model drives the loop + synthesis
-(`generateText` and `forceSynthesis`); the **grader** is a separate, cheaper model
+(`streamText` for the loop and `generateText` for `forceSynthesis`); the **grader**
+is a separate, cheaper model
 used only by the examiner (`gradeFileRelevance`'s `generateObject`); the
 **summarizer** condenses an oversize file into the synthesis budget
 (`summarizeOversizeContent`'s `generateText`) — see

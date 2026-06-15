@@ -3,7 +3,7 @@
 
 "use client";
 
-import { useState, type Dispatch, type SetStateAction } from "react";
+import { useEffect, useRef, useState, type Dispatch, type SetStateAction } from "react";
 import { formatMimeType } from "@/lib/file-types";
 import type { DriveFile, QuerySession } from "@/hooks/use-query-sessions";
 import { downloadAnswer } from "./format";
@@ -25,6 +25,24 @@ export function ResultsView({
   setProgressOpen: Dispatch<SetStateAction<boolean>>;
 }) {
   const [touchedOpen, setTouchedOpen] = useState(false);
+  const [thinkingOpen, setThinkingOpen] = useState(true);
+
+  // The live "thinking" stream.
+  const reasoning = activeSession?.reasoning ?? "";
+  const thinkingRef = useRef<HTMLDivElement>(null);
+  // On (re)open, jump to the latest reasoning.
+  useEffect(() => {
+    const el = thinkingRef.current;
+    if (thinkingOpen && el) el.scrollTop = el.scrollHeight;
+  }, [thinkingOpen]);
+  // On new reasoning, follow the bottom ONLY if the user is already near it, so
+  // scrolling up to re-read earlier thoughts isn't yanked back down on every delta.
+  useEffect(() => {
+    const el = thinkingRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    if (distanceFromBottom < 40) el.scrollTop = el.scrollHeight;
+  }, [reasoning]);
 
   const isSynthesis = activeSession?.mode === "synthesis";
   const isUncuratedList = activeSession?.mode === "list" && !activeSession.curateList;
@@ -58,6 +76,32 @@ export function ResultsView({
                   {event}
                 </div>
               ))}
+            </div>
+          ) : null}
+        </section>
+      ) : null}
+
+      {reasoning ? (
+        <section className="panel thinking-panel">
+          <div className="panel-header">
+            <h2>Thinking</h2>
+            <button
+              className="progress-toggle"
+              type="button"
+              aria-expanded={thinkingOpen}
+              onClick={() => setThinkingOpen((open) => !open)}
+            >
+              {thinkingOpen ? "Hide" : "Show"}
+            </button>
+          </div>
+          {thinkingOpen ? (
+            <div className="panel-body">
+              <p className="panel-subtitle">
+                Live reasoning from the agent. Shown as plain text and not used as a result.
+              </p>
+              <div className="thinking-stream" ref={thinkingRef} aria-live="polite">
+                {reasoning}
+              </div>
             </div>
           ) : null}
         </section>

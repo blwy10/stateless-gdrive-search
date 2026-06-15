@@ -124,6 +124,23 @@
   border-radius: 0 6px 6px 0;
 }
 
+/* The live "thinking" stream: plain-text reasoning rendered verbatim (never
+ * markdown/HTML — it is untrusted model output), scrollable and pre-wrapped. */
+.thinking-stream {
+  margin-top: 10px;
+  max-height: 260px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fbfcfb;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
 .file-list {
   display: grid;
   gap: 10px;

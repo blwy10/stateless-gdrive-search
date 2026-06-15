@@ -34,6 +34,11 @@ export type QuerySession = {
   // list is cleared when the run settles. Transient/UI-only, but kept on the
   // session so the UI renders from a single source of truth.
   reviewingFiles: DriveFile[];
+  // The agent's live "thinking" stream, accumulated from `reasoning` events during
+  // a run. Display-only and ephemeral: kept in memory while viewing a run but
+  // stripped before persistence (see saveStoredSessions) since it can be large and
+  // is not useful to restore across reloads.
+  reasoning: string;
   answer: string;
   answerFormat: "markdown" | "plain";
   error: string;
