@@ -32,6 +32,19 @@ export function envSettings(role: ModelRole): EffectiveModelSettings {
       source: "default"
     };
   }
+  if (role === "ranker") {
+    return {
+      provider: coerceModelProvider(env.rankerAiProvider()),
+      apiKey: env.rankerAiApiKey(),
+      baseUrl: env.rankerAiBaseUrl(),
+      model: env.rankerAiModel(),
+      reasoningEffort: requireReasoningEffortEnv(
+        env.rankerAiReasoningEffort(),
+        "RANKER_AI_REASONING_EFFORT"
+      ),
+      source: "default"
+    };
+  }
   return {
     provider: coerceModelProvider(env.aiProvider()),
     apiKey: env.aiApiKey(),

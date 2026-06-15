@@ -24,6 +24,7 @@ export type ModelSettingsSummary = {
   main: RoleSettingsSummary;
   grader: RoleSettingsSummary;
   summarizer: RoleSettingsSummary;
+  ranker: RoleSettingsSummary;
 };
 
 export type EffectiveModelSettings = {
@@ -49,6 +50,7 @@ export type EffectiveModelSettingsBundle = {
   main: EffectiveModelSettings;
   grader: EffectiveModelSettings;
   summarizer: EffectiveModelSettings;
+  ranker: EffectiveModelSettings;
 };
 
 const RoleSettingsInput = z
@@ -76,10 +78,11 @@ const ModelSettingsInput = z
   .object({
     main: RoleSettingsInput.optional(),
     grader: RoleSettingsInput.optional(),
-    summarizer: RoleSettingsInput.optional()
+    summarizer: RoleSettingsInput.optional(),
+    ranker: RoleSettingsInput.optional()
   })
-  .refine((value) => Boolean(value.main || value.grader || value.summarizer), {
-    message: "Provide settings for at least one role (main, grader, or summarizer)"
+  .refine((value) => Boolean(value.main || value.grader || value.summarizer || value.ranker), {
+    message: "Provide settings for at least one role (main, grader, summarizer, or ranker)"
   });
 
 export type ModelSettingsInput = z.infer<typeof ModelSettingsInput>;
@@ -100,6 +103,11 @@ export type ModelSettingsRow = {
   summarizer_model: string | null;
   summarizer_provider: string | null;
   summarizer_reasoning_effort: string | null;
+  ranker_api_key_ciphertext: string | null;
+  ranker_base_url: string | null;
+  ranker_model: string | null;
+  ranker_provider: string | null;
+  ranker_reasoning_effort: string | null;
   updated_at: Date;
 };
 
@@ -118,5 +126,7 @@ export function parseModelSettingsInput(value: unknown) {
 
 /** Map the `role` query param used by the per-role DELETE to a known target. */
 export function parseModelRole(value: string | null | undefined): ModelRole | "all" {
-  return value === "main" || value === "grader" || value === "summarizer" ? value : "all";
+  return value === "main" || value === "grader" || value === "summarizer" || value === "ranker"
+    ? value
+    : "all";
 }

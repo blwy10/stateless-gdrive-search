@@ -195,6 +195,9 @@ export async function handleReviewFileTool(
   if (curating) {
     if (verdict.relevant) {
       if (state.kept.add(opened.file)) {
+        // Retain the verdict so the terminal reranker can order the kept set on
+        // the already-computed reason/entities/aboutSubject (see lib/agent/ranker.ts).
+        state.keptVerdicts.set(openedKey, verdict);
         recordUsefulProgress(state);
       }
       await emit({ type: "progress", message: `Kept ${formatFileProgressLabel(opened.file)}` });

@@ -131,58 +131,64 @@ per-user overrides live in `user_model_settings` (the `provider` column and
 nullable `base_url` are added idempotently by `db/schema.sql`). `baseUrl` is only
 required — and only SSRF-validated — for `openai-compatible`.
 
-## Three model roles (main vs grader vs summarizer)
+## Four model roles (main vs grader vs summarizer vs ranker)
 
-The agent resolves three
+The agent resolves four
 independent models per run. The **main** model drives the loop + synthesis
 (`generateText` and `forceSynthesis`); the **grader** is a separate, cheaper model
 used only by the examiner (`gradeFileRelevance`'s `generateObject`); the
 **summarizer** condenses an oversize file into the synthesis budget
 (`summarizeOversizeContent`'s `generateText`) — see
-[oversize-files.md](./oversize-files.md).
-`getEffectiveModelSettings` returns an `{ main, grader, summarizer }` bundle;
-`runDriveAgent` resolves each with `resolveModel` and injects the grader via the
-`gradeFile` closure and the summarizer via the `summarizeOversize` closure (each
-folds its own token usage into `state.tokensSpent`; `agent.grade.*` /
-`agent.summarize.*` log events carry that role's model/provider). Each role is
-configured independently: env defaults `AI_*` (main), `GRADER_AI_*` (grader), and
-`SUMMARIZER_AI_*` (summarizer) — each key + model required — are ALL required;
-there is no fallback between roles. Per-user overrides are independent per role
-(override any subset; each unset role falls back to its OWN env default, never
-another role's). The pure `resolveRoleSettings(columns, envDefault)` picks
-custom-vs-env for a single role (a role is overridden only when its `model` AND
-api key are both stored) and is unit-tested in `test/model-settings.test.ts`. In
-`user_model_settings` a role is "present" iff its `model` + `api_key_ciphertext`
-are non-null, so the main config columns are nullable and parallel `grader_*` /
-`summarizer_*` columns hold those overrides; the role-scoped DELETE clears one
-role and drops the row once no role is set.
+[oversize-files.md](./oversize-files.md); the **ranker** re-orders a curated
+list's kept files by relevance in one terminal call (`rankKeptFiles`'s
+`generateObject`) — see [results-and-citations.md](./results-and-citations.md).
+`getEffectiveModelSettings` returns an `{ main, grader, summarizer, ranker }`
+bundle; `runDriveAgent` resolves each with `resolveModel`, injects the grader via
+the `gradeFile` closure and the summarizer via the `summarizeOversize` closure,
+and calls the ranker directly at finalization (`rerankCuratedKept`, success path
+only). Each non-main call folds its own token usage into `state.tokensSpent`;
+`agent.grade.*` / `agent.summarize.*` / `agent.rank.*` log events carry that
+role's model/provider. Each role is configured independently: env defaults `AI_*`
+(main), `GRADER_AI_*` (grader), `SUMMARIZER_AI_*` (summarizer), and `RANKER_AI_*`
+(ranker) — each key + model required — are ALL required; there is no fallback
+between roles. Per-user overrides are independent per role (override any subset;
+each unset role falls back to its OWN env default, never another role's). The pure
+`resolveRoleSettings(columns, envDefault)` picks custom-vs-env for a single role
+(a role is overridden only when its `model` AND api key are both stored) and is
+unit-tested in `test/model-settings.test.ts`. In `user_model_settings` a role is
+"present" iff its `model` + `api_key_ciphertext` are non-null, so the main config
+columns are nullable and parallel `grader_*` / `summarizer_*` / `ranker_*` columns
+hold those overrides; the role-scoped DELETE clears one role and drops the row
+once no role is set.
 
 ## Reasoning effort
 
-Each role (main + grader + summarizer) carries a `reasoningEffort`
+Each role (main + grader + summarizer + ranker) carries a `reasoningEffort`
 (`none|minimal|low|medium|high`; `"none"` is the EXPLICIT provider default — the
 option is omitted — never an implicit "unset") on `EffectiveModelSettings`,
 always set (never null), applied per-provider by `resolveModel` (see
 [the agent loop](#the-agent-loop-vercel-ai-sdk) above). The env vars
 `AI_REASONING_EFFORT` / `GRADER_AI_REASONING_EFFORT` /
-`SUMMARIZER_AI_REASONING_EFFORT` are REQUIRED and strictly validated —
-`requireReasoningEffortEnv` throws at startup on an unrecognized value (env
-config is explicit; see [configuration.md](./configuration.md)).
+`SUMMARIZER_AI_REASONING_EFFORT` / `RANKER_AI_REASONING_EFFORT` are REQUIRED and
+strictly validated — `requireReasoningEffortEnv` throws at startup on an
+unrecognized value (env config is explicit; see [configuration.md](./configuration.md)).
 Stored per-user overrides instead use the lenient `coerceReasoningEffort` (a
 legacy/stray DB value degrades to `"none"`, since it comes from our own
 enum-constrained UI). Per-user overrides live in the nullable `reasoning_effort`
-/ `grader_reasoning_effort` / `summarizer_reasoning_effort` columns (plaintext —
-not a secret) and flow through the same settings API/UI as the other model fields.
+/ `grader_reasoning_effort` / `summarizer_reasoning_effort` / `ranker_reasoning_effort`
+columns (plaintext — not a secret) and flow through the same settings API/UI as
+the other model fields.
 Design rule: effort is an *attribute* of a role's override, not an override on
 its own — a role only counts as "custom" when its `model` + api key are both
 stored (`resolveRoleSettings`), so effort rides along with a custom model;
 a role left on its env default takes effort from its env var. Lowering the
 grader's effort is the cheapest cost lever for the high-volume examiner. The
 resolved effort is in the `agent.started` log (a coarse enum, not PII, so logged
-plainly) for all three roles. It applies to every model call — the main loop,
-`forceSynthesis`, the examiner's `generateObject`, and the summarizer's
-`generateText` (the grader is the dominant token cost in list modes, so its
-effort matters most; the summarizer runs only on oversize synthesis reads).
+plainly) for all four roles. It applies to every model call — the main loop,
+`forceSynthesis`, the examiner's `generateObject`, the summarizer's
+`generateText`, and the ranker's `generateObject` (the grader is the dominant
+token cost in list modes, so its effort matters most; the summarizer runs only on
+oversize synthesis reads, and the ranker once per curated run).
 
 Per-provider mapping (`resolveModel` in `lib/model-provider.ts`). The OpenAI and
 OpenAI-compatible providers take the effort string verbatim; Anthropic has no

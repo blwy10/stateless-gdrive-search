@@ -25,9 +25,42 @@ renders them as two panels): a **primary result list** (`files`) and an **audit
     hallucination guard) and falling back to `state.openedFiles` when nothing
     resolves, so a synthesis that read files never shows a sourceless result.
   - **curated list** → `keptFiles` (examiner-kept; see
-    [llm-and-agent-loop.md](./llm-and-agent-loop.md)).
+    [llm-and-agent-loop.md](./llm-and-agent-loop.md)), **re-ordered by relevance**
+    (see "Curated reranking" below).
   - **uncurated list** → every touched file (all matches; here result == touched,
     so the UI auto-hides the redundant disclosure).
+
+## Curated reranking
+
+Curated list mode does one extra, terminal model call to *order* the kept set by
+relevance — kept files were chosen by a per-file boolean examiner, which says
+nothing about which matches are strongest. After the main loop finishes (success
+path only), `rerankCuratedKept` (in `lib/agent/run.ts`) runs the **ranker** role
+(`rankKeptFiles` in `lib/agent/ranker.ts`) when curating and more than one file
+was kept; other modes and the error/partial path keep the order they gathered.
+
+- **Input is verdict-only, never content.** The ranker sees, per kept file, its
+  title + type + the examiner's one-line `reason` + `entities` + `aboutSubject` —
+  the verdicts retained on `state.keptVerdicts` (the examiner already computed
+  them; they were otherwise only logged and returned to the model). The `reason`
+  is query-conditioned, so it's a better and far cheaper ranking signal than the
+  file's text.
+- **Order-only, never membership.** The model returns 1-based document numbers in
+  best→worst order; `applyRanking` turns that into a guaranteed *permutation* of
+  the kept set — it dedupes, drops out-of-range/non-integer positions, and appends
+  any omitted files in their original order. So a garbage or empty order (the
+  ranker-failed fallback) degrades to the existing keep-order and never drops a
+  file. The "empty kept = nothing relevant" invariant is preserved.
+- **`aboutSubject` demotion.** When a subject identity is known *and* the query is
+  about that person, the ranker prefers files about the subject over files about
+  another person as a tie-breaker (the long-standing entity-conflation follow-up,
+  see [entity-conflation.md](./entity-conflation.md)) — soft, never a filter.
+- **Streaming vs. final order.** Curated streams `kept` events live in keep-order;
+  the terminal `final` event carries the reranked order, and the UI rebuilds from
+  `final.files` (authoritative), so results visibly settle into ranked order on
+  completion — the same "resolves only at `final`" shape synthesis sources use.
+- The ranker is its own model role (independently configurable, no fallback). Its
+  token usage is folded into the run total; it logs under `agent.rank.*`.
 
 `buildResult` (in `runDriveAgent`) assembles both lists for the `final` event in
 both the success and error/partial branches. Live streaming: `file` events feed

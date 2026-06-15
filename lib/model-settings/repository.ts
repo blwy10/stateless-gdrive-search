@@ -46,20 +46,32 @@ function summarizerColumns(row: ModelSettingsRow | null): RoleColumns {
   };
 }
 
+function rankerColumns(row: ModelSettingsRow | null): RoleColumns {
+  return {
+    apiKeyCiphertext: row?.ranker_api_key_ciphertext ?? null,
+    baseUrl: row?.ranker_base_url ?? null,
+    model: row?.ranker_model ?? null,
+    provider: row?.ranker_provider ?? null,
+    reasoningEffort: row?.ranker_reasoning_effort ?? null
+  };
+}
+
 export async function getModelSettingsSummary(ownerSub: string): Promise<ModelSettingsSummary> {
   const row = await getModelSettingsRow(ownerSub);
   if (!row) {
     return {
       main: emptyRoleSummary(),
       grader: emptyRoleSummary(),
-      summarizer: emptyRoleSummary()
+      summarizer: emptyRoleSummary(),
+      ranker: emptyRoleSummary()
     };
   }
   const updatedAt = row.updated_at.toISOString();
   return {
     main: roleSummary(mainColumns(row), updatedAt),
     grader: roleSummary(graderColumns(row), updatedAt),
-    summarizer: roleSummary(summarizerColumns(row), updatedAt)
+    summarizer: roleSummary(summarizerColumns(row), updatedAt),
+    ranker: roleSummary(rankerColumns(row), updatedAt)
   };
 }
 
@@ -69,9 +81,10 @@ export async function getEffectiveModelSettings(
   const envMain = envSettings("main");
   const envGrader = envSettings("grader");
   const envSummarizer = envSettings("summarizer");
+  const envRanker = envSettings("ranker");
   const row = await getModelSettingsRow(ownerSub);
   if (!row) {
-    return { main: envMain, grader: envGrader, summarizer: envSummarizer };
+    return { main: envMain, grader: envGrader, summarizer: envSummarizer, ranker: envRanker };
   }
 
   const decrypt = (columns: RoleColumns) => ({
@@ -85,10 +98,12 @@ export async function getEffectiveModelSettings(
   const main = resolveRoleSettings(decrypt(mainColumns(row)), envMain);
   const grader = resolveRoleSettings(decrypt(graderColumns(row)), envGrader);
   const summarizer = resolveRoleSettings(decrypt(summarizerColumns(row)), envSummarizer);
+  const ranker = resolveRoleSettings(decrypt(rankerColumns(row)), envRanker);
   return {
     main: await withValidatedBaseUrl(main),
     grader: await withValidatedBaseUrl(grader),
-    summarizer: await withValidatedBaseUrl(summarizer)
+    summarizer: await withValidatedBaseUrl(summarizer),
+    ranker: await withValidatedBaseUrl(ranker)
   };
 }
 
@@ -125,6 +140,7 @@ export async function upsertModelSettings(ownerSub: string, input: ModelSettings
   const main = await resolveRoleUpsert(input.main, mainColumns(existing));
   const grader = await resolveRoleUpsert(input.grader, graderColumns(existing));
   const summarizer = await resolveRoleUpsert(input.summarizer, summarizerColumns(existing));
+  const ranker = await resolveRoleUpsert(input.ranker, rankerColumns(existing));
 
   await getPool().query(
     `insert into user_model_settings (
@@ -132,9 +148,10 @@ export async function upsertModelSettings(ownerSub: string, input: ModelSettings
        api_key_ciphertext, base_url, model, provider, reasoning_effort,
        grader_api_key_ciphertext, grader_base_url, grader_model, grader_provider, grader_reasoning_effort,
        summarizer_api_key_ciphertext, summarizer_base_url, summarizer_model, summarizer_provider, summarizer_reasoning_effort,
+       ranker_api_key_ciphertext, ranker_base_url, ranker_model, ranker_provider, ranker_reasoning_effort,
        updated_at
      )
-     values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, now())
+     values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, now())
      on conflict (owner_sub)
      do update set
        api_key_ciphertext = excluded.api_key_ciphertext,
@@ -152,6 +169,11 @@ export async function upsertModelSettings(ownerSub: string, input: ModelSettings
        summarizer_model = excluded.summarizer_model,
        summarizer_provider = excluded.summarizer_provider,
        summarizer_reasoning_effort = excluded.summarizer_reasoning_effort,
+       ranker_api_key_ciphertext = excluded.ranker_api_key_ciphertext,
+       ranker_base_url = excluded.ranker_base_url,
+       ranker_model = excluded.ranker_model,
+       ranker_provider = excluded.ranker_provider,
+       ranker_reasoning_effort = excluded.ranker_reasoning_effort,
        updated_at = now()`,
     [
       ownerSub,
@@ -169,7 +191,12 @@ export async function upsertModelSettings(ownerSub: string, input: ModelSettings
       summarizer.baseUrl,
       summarizer.model,
       summarizer.provider,
-      summarizer.reasoningEffort
+      summarizer.reasoningEffort,
+      ranker.apiKeyCiphertext,
+      ranker.baseUrl,
+      ranker.model,
+      ranker.provider,
+      ranker.reasoningEffort
     ]
   );
 }
@@ -203,6 +230,18 @@ export async function deleteModelSettings(ownerSub: string, role: ModelRole | "a
        where owner_sub = $1`,
       [ownerSub]
     );
+  } else if (role === "ranker") {
+    await getPool().query(
+      `update user_model_settings
+         set ranker_api_key_ciphertext = null,
+             ranker_base_url = null,
+             ranker_model = null,
+             ranker_provider = null,
+             ranker_reasoning_effort = null,
+             updated_at = now()
+       where owner_sub = $1`,
+      [ownerSub]
+    );
   } else {
     await getPool().query(
       `update user_model_settings
@@ -221,7 +260,8 @@ export async function deleteModelSettings(ownerSub: string, role: ModelRole | "a
   await getPool().query(
     `delete from user_model_settings
       where owner_sub = $1
-        and model is null and grader_model is null and summarizer_model is null`,
+        and model is null and grader_model is null and summarizer_model is null
+        and ranker_model is null`,
     [ownerSub]
   );
 }
@@ -231,6 +271,7 @@ async function getModelSettingsRow(ownerSub: string): Promise<ModelSettingsRow |
     `select api_key_ciphertext, base_url, model, provider, reasoning_effort,
             grader_api_key_ciphertext, grader_base_url, grader_model, grader_provider, grader_reasoning_effort,
             summarizer_api_key_ciphertext, summarizer_base_url, summarizer_model, summarizer_provider, summarizer_reasoning_effort,
+            ranker_api_key_ciphertext, ranker_base_url, ranker_model, ranker_provider, ranker_reasoning_effort,
             updated_at
      from user_model_settings
      where owner_sub = $1`,

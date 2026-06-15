@@ -39,8 +39,9 @@ rather than relying on a catalogue here:
   `parseSources`/`resolveSources`), the tool handlers
   (`search`/`open`/`review`/`list-folder` — incl. run-resilience, scope guards,
   retries, folder redirects), the examiner verdict normaliser, budget/search
-  notes, prompts (`systemPrompt`/`describeSubjectIdentity`), and oversize
-  summarisation.
+  notes, prompts (`systemPrompt`/`describeSubjectIdentity`), oversize
+  summarisation, and curated reranking (`applyRanking` permutation invariants,
+  `rankKeptFiles` failure fallback, `buildAgentResult` ordering).
 - `test/drive.test.ts` — Drive query building/escaping, the folder child-query,
   the content-cap resolver, and the Drive API error parser (`parseDriveApiError`).
 - `test/model-settings.test.ts` — per-role model resolution (`resolveRoleSettings`)
@@ -63,7 +64,7 @@ Public import paths are stable — `@/lib/agent`, `@/lib/drive`, and
 per-file breakdown is in [`docs/architecture.md`](docs/architecture.md):
 
 - `lib/agent/` — the agent loop, tools + handlers, prompts, examiner, summarizer,
-  budget, and run-state (`FileSet`/`AgentRunState`).
+  ranker (curated rerank), budget, and run-state (`FileSet`/`AgentRunState`).
 - `lib/drive/` — Drive client, search/query, text extraction, folder navigation,
   and the per-file content cap.
 - `lib/model-settings/` — per-role model config + the DB repository.
@@ -81,7 +82,7 @@ what it is, not just what it does:
 | Topic | Doc |
 | --- | --- |
 | Module layout, `FileSet`/`AgentRunState` | [`docs/architecture.md`](docs/architecture.md) |
-| AI SDK loop, examiner & list modes, 3 model roles, reasoning effort | [`docs/llm-and-agent-loop.md`](docs/llm-and-agent-loop.md) |
+| AI SDK loop, examiner & list modes, 4 model roles, reasoning effort | [`docs/llm-and-agent-loop.md`](docs/llm-and-agent-loop.md) |
 | Search recall, berry-picking, diminishing-returns budget | [`docs/retrieval-and-budget.md`](docs/retrieval-and-budget.md) |
 | Results vs "touched" lists, `SOURCES` citations | [`docs/results-and-citations.md`](docs/results-and-citations.md) |
 | Folder navigation (`list_folder`, expand-only) | [`docs/folder-navigation.md`](docs/folder-navigation.md) |

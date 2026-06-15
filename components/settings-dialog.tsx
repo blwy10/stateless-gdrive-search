@@ -14,10 +14,10 @@ export type {
   ModelSettingsSummary
 } from "@/components/settings/constants";
 
-// Modal for managing the optional bring-your-own provider. The main, grader, and
-// summarizer roles are configured independently; each RoleSettingsForm owns its
-// transient draft plus the save/delete requests (see useRoleSettings), while the
-// persisted summary lives in the owner.
+// Modal for managing the optional bring-your-own provider. The main, grader,
+// summarizer, and ranker roles are configured independently; each RoleSettingsForm
+// owns its transient draft plus the save/delete requests (see useRoleSettings),
+// while the persisted summary lives in the owner.
 export function SettingsDialog({
   modelSettings,
   onSettingsChange,
@@ -67,7 +67,7 @@ export function SettingsDialog({
         <div className="panel-body form-grid">
           <div className="settings-note">
             API keys are write-only. After saving, a key cannot be viewed here again. The main,
-            grader, and summarizer models are configured independently.
+            grader, summarizer, and ranker models are configured independently.
           </div>
           <RoleSettingsForm
             key="main"
@@ -85,6 +85,12 @@ export function SettingsDialog({
             key="summarizer"
             role="summarizer"
             summary={modelSettings?.summarizer ?? null}
+            onSettingsChange={onSettingsChange}
+          />
+          <RoleSettingsForm
+            key="ranker"
+            role="ranker"
+            summary={modelSettings?.ranker ?? null}
             onSettingsChange={onSettingsChange}
           />
         </div>

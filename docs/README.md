@@ -18,8 +18,8 @@ topic — *why* the design is what it is, not just what it does.
   `lib/drive`, `lib/model-settings` split) and the `FileSet` / `AgentRunState`
   model.
 - [llm-and-agent-loop.md](./llm-and-agent-loop.md) — the Vercel AI SDK loop,
-  run-resilience invariants, the examiner & list modes, the three model roles
-  (main / grader / summarizer), and reasoning effort.
+  run-resilience invariants, the examiner & list modes, the four model roles
+  (main / grader / summarizer / ranker), and reasoning effort.
 
 ## Retrieval & results
 

@@ -3,6 +3,9 @@
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  applyRanking,
+  buildAgentResult,
+  buildRankerPrompt,
   createRunState,
   describeSubjectIdentity,
   handleListFolderTool,
@@ -12,6 +15,7 @@ import {
   normalizeGradeVerdict,
   parseFinalAnswer,
   parseSources,
+  rankKeptFiles,
   resolveSources,
   resolveUsageTokens,
   summarizeOversizeContent,
@@ -19,7 +23,8 @@ import {
   type AgentProgress,
   type AgentRunContext,
   type AgentRunState,
-  type GradeVerdict
+  type GradeVerdict,
+  type RankItem
 } from "@/lib/agent";
 import {
   GOOGLE_DRIVE_FOLDER_MIME_TYPE,
@@ -29,7 +34,7 @@ import {
 } from "@/lib/drive";
 import type { DriveFile } from "@/lib/drive";
 import type { ResolvedModel } from "@/lib/model-provider";
-import { generateText } from "ai";
+import { generateObject, generateText } from "ai";
 import type { DriveConnectionSummary } from "@/lib/drive-connections";
 
 // Partial mock: stub only the two network functions, keep the real exports
@@ -673,6 +678,12 @@ describe("handleReviewFileTool", () => {
     expect(payload.content).toBeUndefined();
     expect(gradeFile).toHaveBeenCalledTimes(1);
     expect(runState.kept.list()).toEqual([file("c1", "f1", "Doc")]);
+    // The verdict is retained for the terminal reranker (keyed by fileKey).
+    expect(runState.keptVerdicts.get("c1:f1")).toMatchObject({
+      relevant: true,
+      reason: "on topic",
+      entities: ["Project Atlas"]
+    });
     expect(runState.reviewed.list()).toHaveLength(1);
     expect(events.some((event) => event.type === "reviewing")).toBe(true);
     expect(events.some((event) => event.type === "kept")).toBe(true);
@@ -698,6 +709,8 @@ describe("handleReviewFileTool", () => {
     expect(payload.examined).toBe(true);
     expect(payload.relevant).toBe(false);
     expect(runState.kept.list()).toHaveLength(0);
+    // A discarded file is not kept, so no verdict is retained for ranking.
+    expect(runState.keptVerdicts.size).toBe(0);
     expect(runState.reviewed.list()).toHaveLength(1);
     expect(events.some((event) => event.type === "reviewing")).toBe(true);
     expect(events.some((event) => event.type === "discarded")).toBe(true);
@@ -924,6 +937,137 @@ describe("summarizeOversizeContent", () => {
     );
 
     expect(result).toEqual({ summary: null, usageTokens: 0 });
+  });
+});
+
+function rankItem(
+  id: string,
+  reason = "relevant",
+  aboutSubject: GradeVerdict["aboutSubject"] = "unknown"
+): RankItem {
+  return { file: file("c1", id), verdict: { relevant: true, reason, entities: [], aboutSubject } };
+}
+
+describe("applyRanking", () => {
+  const items = ["a", "b", "c", "d"];
+
+  it("reorders by the 1-based positions the model returns", () => {
+    expect(applyRanking(items, [3, 1, 4, 2])).toEqual(["c", "a", "d", "b"]);
+  });
+
+  it("is the identity for an empty order (the ranker-failed fallback)", () => {
+    expect(applyRanking(items, [])).toEqual(items);
+  });
+
+  it("appends omitted items in original order so output is always a full permutation", () => {
+    // The model only ranked positions 3 and 1; 2 and 4 are appended in order.
+    expect(applyRanking(items, [3, 1])).toEqual(["c", "a", "b", "d"]);
+  });
+
+  it("drops duplicate, out-of-range, and non-integer positions", () => {
+    // 1 repeats, 9 and 0 are out of range, 2.5 is non-integer -> only 1 then 3
+    // are honored; 2 and 4 are appended.
+    expect(applyRanking(items, [1, 1, 9, 0, 2.5, 3])).toEqual(["a", "c", "b", "d"]);
+  });
+
+  it("never adds or drops items even for garbage input (permutation invariant)", () => {
+    const result = applyRanking(items, [99, -1, 2]);
+    expect([...result].sort()).toEqual([...items].sort());
+    expect(result.length).toBe(items.length);
+  });
+});
+
+describe("rankKeptFiles", () => {
+  const resolved: ResolvedModel = {
+    model: {} as never,
+    providerOptions: {},
+    temperature: 0.2,
+    maxOutputTokens: undefined
+  };
+  const logSettings = { model: "rank-model", provider: "openai" as const };
+  const items = [rankItem("f1"), rankItem("f2"), rankItem("f3")];
+
+  beforeEach(() => {
+    vi.mocked(generateObject).mockReset();
+  });
+
+  it("returns the model's order and folds in the call's token usage", async () => {
+    vi.mocked(generateObject).mockResolvedValue({
+      object: { order: [2, 3, 1] },
+      usage: { totalTokens: 77 }
+    } as never);
+
+    const result = await rankKeptFiles(resolved, logSettings, "q", null, items, "req", 0);
+
+    expect(result.order).toEqual([2, 3, 1]);
+    expect(result.usageTokens).toBe(77);
+    expect(applyRanking(items, result.order).map((item) => item.file.id)).toEqual([
+      "f2",
+      "f3",
+      "f1"
+    ]);
+  });
+
+  it("returns an empty order (caller keeps keep-order) and never throws on failure", async () => {
+    vi.mocked(generateObject).mockRejectedValue(new Error("boom"));
+
+    const result = await rankKeptFiles(resolved, logSettings, "q", null, items, "req", 0);
+
+    expect(result).toEqual({ order: [], usageTokens: 0 });
+    // The empty order degrades to the input order (no files lost).
+    expect(applyRanking(items, result.order)).toEqual(items);
+  });
+
+  it("includes every kept file's verdict in the prompt and no file content", () => {
+    const prompt = buildRankerPrompt("my query", [
+      rankItem("f1", "directly answers it", "subject"),
+      rankItem("f2", "tangential")
+    ]);
+    expect(prompt).toContain("my query");
+    expect(prompt).toContain('1. "f1"');
+    expect(prompt).toContain("directly answers it");
+    expect(prompt).toContain("about: subject");
+    expect(prompt).toContain('2. "f2"');
+  });
+});
+
+describe("buildAgentResult curated ranking", () => {
+  const parsed = { answer: "", answerFormat: "plain" as const };
+  const curatedInput = { query: "q", mode: "list" as const, driveIds: ["c1"], curateList: true };
+
+  it("uses the reranked order for the primary files in curated list mode", () => {
+    const state = makeState();
+    const a = file("c1", "a");
+    const b = file("c1", "b");
+    const c = file("c1", "c");
+    state.kept.add(a);
+    state.kept.add(b);
+    state.kept.add(c);
+
+    const result = buildAgentResult(curatedInput, state, parsed, [c, a, b]);
+
+    expect(result.files.map((f) => f.id)).toEqual(["c", "a", "b"]);
+  });
+
+  it("falls back to keep-order when no ranking is provided", () => {
+    const state = makeState();
+    state.kept.add(file("c1", "a"));
+    state.kept.add(file("c1", "b"));
+
+    const result = buildAgentResult(curatedInput, state, parsed);
+
+    expect(result.files.map((f) => f.id)).toEqual(["a", "b"]);
+  });
+
+  it("ignores a ranked list for uncurated list mode (results are the touched set)", () => {
+    const state = makeState();
+    state.touched.add(file("c1", "t1"));
+    state.touched.add(file("c1", "t2"));
+    const uncuratedInput = { query: "q", mode: "list" as const, driveIds: ["c1"], curateList: false };
+
+    const result = buildAgentResult(uncuratedInput, state, parsed, [file("c1", "z")]);
+
+    expect(result.files.map((f) => f.id)).toEqual(["t1", "t2"]);
   });
 });
 

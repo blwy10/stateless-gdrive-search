@@ -45,12 +45,21 @@ threads the owner anchor + aboutness caution into the grader and asks it to clas
 `ABOUT_SUBJECT_VALUES`); `runDriveAgent`'s `gradeFile` closure passes the run's
 `subjectIdentity` to `gradeFileRelevance`. The verdict is auditable (logged on
 `agent.grade.completed` and `agent.tool.review_file.completed`, coarse enum, not
-PII) but does NOT yet gate keep/discard — relevance still decides curation,
+PII) but does NOT gate keep/discard — relevance still decides curation,
 preserving recall (a file about another person can still be relevant). For multiple
 connections the prompts also no longer merge distinct owners or bind first-person
-to all of them (see `systemPrompt` in `lib/agent/prompts.ts`). Remaining follow-up:
-actually *acting* on `aboutSubject` in curation/synthesis. Still prompt+heuristic
-level — it reduces but does not *guarantee* prevention.
+to all of them (see `systemPrompt` in `lib/agent/prompts.ts`).
+
+The curated **reranker** is the first place `aboutSubject` is *acted* on (the
+follow-up above): when a subject identity is known and the query is about that
+person, `rankKeptFiles` (in `lib/agent/ranker.ts`) ranks files about the subject
+above files about another person as a tie-breaker between comparably-relevant
+files — see [results-and-citations.md](./results-and-citations.md). This is a soft
+demotion in the result *order*, deliberately NOT a filter: a recommendation letter
+the owner wrote for a colleague stays in the list (recall preserved) but sinks
+below files genuinely about the owner. Remaining follow-up: acting on
+`aboutSubject` in synthesis. Still prompt+heuristic level — it reduces but does not
+*guarantee* prevention.
 
 Prompt-injection note (related): every content-ingesting prompt — `basePrompt`
 (main agent), `gradeSystemPrompt` (examiner), and `SUMMARIZE_SYSTEM_PROMPT`

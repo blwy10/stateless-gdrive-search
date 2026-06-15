@@ -5,15 +5,17 @@ export const MODEL_PROVIDERS = ["openai", "anthropic", "openai-compatible"] as c
 export type ModelProvider = (typeof MODEL_PROVIDERS)[number];
 
 /**
- * The three independent model roles. `main` runs the agent loop and writes the
+ * The four independent model roles. `main` runs the agent loop and writes the
  * synthesis answer; `grader` is a separate, cheaper model that only judges
  * per-file relevance (see gradeFileRelevance in lib/agent/examiner.ts); `summarizer` is a
  * separate model that condenses an oversize file into the synthesis budget rather
- * than hard-truncating it (see summarizeOversizeContent in lib/agent/summarizer.ts). Each
+ * than hard-truncating it (see summarizeOversizeContent in lib/agent/summarizer.ts);
+ * `ranker` is a separate model that re-orders a curated list's kept files by
+ * relevance in one terminal call (see rankKeptFiles in lib/agent/ranker.ts). Each
  * role is configured independently at the env level (all required — there is no
  * fallback between roles) and may be overridden per-user independently.
  */
-export const MODEL_ROLES = ["main", "grader", "summarizer"] as const;
+export const MODEL_ROLES = ["main", "grader", "summarizer", "ranker"] as const;
 export type ModelRole = (typeof MODEL_ROLES)[number];
 
 /**

@@ -19,9 +19,10 @@ export type ModelSettingsSummary = {
   main: RoleSettingsSummary;
   grader: RoleSettingsSummary;
   summarizer: RoleSettingsSummary;
+  ranker: RoleSettingsSummary;
 };
 
-export type ModelRole = "main" | "grader" | "summarizer";
+export type ModelRole = "main" | "grader" | "summarizer" | "ranker";
 
 export const PROVIDER_OPTIONS: { value: ModelProvider; label: string; hint: string }[] = [
   {
@@ -77,5 +78,9 @@ export const ROLE_META: Record<ModelRole, { title: string; help: string }> = {
   summarizer: {
     title: "Summarizer model",
     help: "A separate model that condenses an oversize file into the synthesis budget instead of hard-truncating it."
+  },
+  ranker: {
+    title: "Ranker model",
+    help: "A separate model that re-orders a curated list's kept files by relevance in one final pass."
   }
 };

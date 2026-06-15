@@ -17,7 +17,14 @@ export { describeSubjectIdentity, systemPrompt } from "./prompts";
 export { resolveUsageTokens } from "./tokens";
 export { gradeFileRelevance, normalizeGradeVerdict, type GradeVerdict } from "./examiner";
 export { summarizeOversizeContent } from "./summarizer";
-export { parseFinalAnswer, parseSources, resolveSources, type SourceCitation } from "./answer";
+export { applyRanking, buildRankerPrompt, rankKeptFiles, type RankItem } from "./ranker";
+export {
+  buildAgentResult,
+  parseFinalAnswer,
+  parseSources,
+  resolveSources,
+  type SourceCitation
+} from "./answer";
 export { createRunState, FileSet, type AgentRunContext, type AgentRunState } from "./state";
 export { handleSearchTool } from "./handlers/search";
 export { handleOpenFileTool } from "./handlers/open";

@@ -118,6 +118,13 @@ export type AgentRunState = {
    * authoritative curated result, populated live as the run progresses.
    */
   kept: FileSet;
+  /**
+   * Curated list mode only: the examiner verdict for each kept file, keyed by
+   * {@link fileKey}. Retained (the verdict is otherwise only logged and returned
+   * to the model) so the terminal reranker can order the kept set on the
+   * already-computed `reason`/`entities`/`aboutSubject` — see lib/agent/ranker.ts.
+   */
+  keptVerdicts: Map<string, GradeVerdict>;
   /** Keys of every file seen in any search result, for the new-results diff. */
   knownFileKeys: Set<string>;
   searchedQueries: Set<string>;
@@ -173,6 +180,7 @@ export function createRunState(): AgentRunState {
     opened: new FileSet(),
     reviewed: new FileSet(),
     kept: new FileSet(),
+    keptVerdicts: new Map<string, GradeVerdict>(),
     knownFileKeys: new Set<string>(),
     searchedQueries: new Set<string>(),
     searchCallCount: 0,

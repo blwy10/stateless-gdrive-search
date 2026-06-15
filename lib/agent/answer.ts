@@ -129,11 +129,18 @@ export function resolveSources(
  *  - `touchedFiles` (audit/disclosure): every file the agent encountered.
  * For synthesis the SOURCES block is also stripped from the answer body so the
  * UI shows structured source cards instead of a duplicated prose list.
+ *
+ * `rankedCurated` (curated list mode only) is the reranker's relevance-ordered
+ * kept set; when provided it replaces the live keep-order for the primary `files`
+ * list. It must be a permutation of the kept set (the reranker only reorders,
+ * never adds/drops — see lib/agent/ranker.ts), so passing it never changes
+ * membership, only order. Omitted (or non-curated) -> keep-order as before.
  */
 export function buildAgentResult(
   input: AgentRequest,
   state: AgentRunState,
-  parsed: { answer: string; answerFormat: "markdown" | "plain" }
+  parsed: { answer: string; answerFormat: "markdown" | "plain" },
+  rankedCurated?: DriveFile[]
 ): { answer: string; answerFormat: "markdown" | "plain"; files: DriveFile[]; touchedFiles: DriveFile[] } {
   let answer = parsed.answer;
   let files: DriveFile[];
@@ -141,9 +148,12 @@ export function buildAgentResult(
     const parsedSources = parseSources(answer);
     answer = parsedSources.body;
     files = resolveSources(parsedSources.citations, state.touched.list(), state.opened.list());
+  } else if (isCuratingRequest(input)) {
+    // The kept FileSet is already deduped, so list() is the result directly; the
+    // reranked order (when present) just reorders that same set.
+    files = rankedCurated ?? state.kept.list();
   } else {
-    // The touched/kept FileSets are already deduped, so list() is the result directly.
-    files = isCuratingRequest(input) ? state.kept.list() : state.touched.list();
+    files = state.touched.list();
   }
   return {
     answer,

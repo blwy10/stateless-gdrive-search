@@ -84,6 +84,17 @@ SUMMARIZER_AI_PROVIDER=openai
 SUMMARIZER_AI_MODEL=...
 # SUMMARIZER_AI_REASONING_EFFORT is REQUIRED (see AI_REASONING_EFFORT).
 SUMMARIZER_AI_REASONING_EFFORT=none
+# Ranker model (required). A separate model used only to re-order a curated list's
+# kept files by relevance after the run; no fallback to another role, so all four
+# must be set. Its input is compact (per-file relevance notes, no content), so a
+# cheap instruction-following model is ideal.
+RANKER_AI_API_KEY=...
+RANKER_AI_PROVIDER=openai
+# RANKER_AI_BASE_URL is optional (required for openai-compatible).
+RANKER_AI_MODEL=...
+# RANKER_AI_REASONING_EFFORT is REQUIRED (see AI_REASONING_EFFORT); "low" is a good
+# default for listwise ordering.
+RANKER_AI_REASONING_EFFORT=none
 DEBUG_LOGS=0
 DEBUG_LOG_CONTENT=0
 ```
@@ -118,18 +129,20 @@ thinking is carried across turns by the SDK, so multi-turn tool calls keep their
 chain-of-thought. User-supplied endpoints are SSRF-validated and pinned to public
 IPs at connect time.
 
-The app uses **three independent models**. The **main** model runs the agent loop
+The app uses **four independent models**. The **main** model runs the agent loop
 and writes the synthesis answer; the **grader** is a separate, cheaper model used
 only to judge per-file relevance; the **summarizer** condenses an oversize file
 into the synthesis budget (synthesis path only) instead of hard-truncating it, so
-the answer can draw on the whole file rather than just its first ~8k tokens. The
-grader and summarizer have much lower requirements than the main model (though a
-large context window helps the summarizer). Each role has its own provider, key,
-endpoint, model, and reasoning effort: set the operator defaults via the `AI_*`
-(main), `GRADER_AI_*` (grader), and `SUMMARIZER_AI_*` (summarizer) env vars — all
-required, with no fallback between roles — and override them per-user and per-role
-in **Settings**. Reasoning effort travels with a role's custom override; a role
-left on its env default takes the effort from its env var.
+the answer can draw on the whole file rather than just its first ~8k tokens; the
+**ranker** re-orders a curated file list's kept results by relevance in one final
+pass (curated list mode only). The grader, summarizer, and ranker have much lower
+requirements than the main model (though a large context window helps the
+summarizer). Each role has its own provider, key, endpoint, model, and reasoning
+effort: set the operator defaults via the `AI_*` (main), `GRADER_AI_*` (grader),
+`SUMMARIZER_AI_*` (summarizer), and `RANKER_AI_*` (ranker) env vars — all required,
+with no fallback between roles — and override them per-user and per-role in
+**Settings**. Reasoning effort travels with a role's custom override; a role left
+on its env default takes the effort from its env var.
 
 Optional per-user abuse protection on `/api/agent` (in-memory, keyed by the
 authenticated user). These have sensible defaults and only need to be set to

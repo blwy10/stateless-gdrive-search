@@ -17,7 +17,8 @@ file it now lives in.
   `synthesisSystemPrompt`), `tokens`, `logging`, `files`
   (`uniqueFiles`/`fileKey`/`formatFileProgressLabel`), `examiner` (grading,
   `gradeFileRelevance`/`normalizeGradeVerdict`/`gradeSystemPrompt`), `summarizer`
-  (`summarizeOversizeContent`/`SUMMARIZE_SYSTEM_PROMPT`), `answer` (final-answer +
+  (`summarizeOversizeContent`/`SUMMARIZE_SYSTEM_PROMPT`), `ranker` (curated rerank
+  — `rankKeptFiles`/`applyRanking`/`buildRankerPrompt`), `answer` (final-answer +
   SOURCES parsing — `parseFinalAnswer`/`parseSources`/`resolveSources` —
   + `buildAgentResult`), `budget` (limits + diminishing-returns notes —
   `searchResultNote`/`diminishingReturnsNote`/`evaluateTokenBudget`), `state`
@@ -26,7 +27,7 @@ file it now lives in.
   `isRetryableToolError`), `tools` (`buildAgentTools`),
   `handlers/{search,open,review,list-folder}` (the tested tool handlers), and `run`
   (`runDriveAgent`, decomposed into `resolveRunModels`/`selectDriveIds`/
-  `buildRunContext`/`runMainModelLoop`/`forceSynthesis`/`finalizeRun`).
+  `buildRunContext`/`runMainModelLoop`/`forceSynthesis`/`rerankCuratedKept`/`finalizeRun`).
 - `lib/drive/` (was `lib/drive.ts`): `types`, `query`
   (`buildDriveSearchQuery`/`escapeDriveQuery`), `client` (token refresh +
   `googleFetch` + metadata/download/export + `parseDriveApiError`, which enriches

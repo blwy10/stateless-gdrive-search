@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import { generateText, stepCountIs, type ModelMessage, type ToolSet } from "ai";
+import type { DriveFile } from "@/lib/drive";
 import { listDriveConnections, type DriveConnectionSummary } from "@/lib/drive-connections";
 import {
   getEffectiveModelSettings,
@@ -17,6 +18,7 @@ import {
   writeDebugLog
 } from "@/lib/debug-log";
 import {
+  isCuratingRequest,
   MODEL_REQUEST_MAX_RETRIES,
   type AgentBudget,
   type AgentOptions,
@@ -28,7 +30,9 @@ import { resolveUsageTokens } from "./tokens";
 import { describeSubjectIdentity, systemPrompt } from "./prompts";
 import { gradeFileRelevance } from "./examiner";
 import { summarizeOversizeContent } from "./summarizer";
+import { applyRanking, rankKeptFiles, type RankItem } from "./ranker";
 import { buildAgentResult, parseFinalAnswer, partialAnswer } from "./answer";
+import { fileKey } from "./files";
 import { logModelStep, type LogSettings } from "./logging";
 import { buildAgentTools } from "./tools";
 import { createRunState, type AgentRunContext, type AgentRunState } from "./state";
@@ -38,9 +42,11 @@ type RunModels = {
   main: ResolvedModel;
   grader: ResolvedModel;
   summarizer: ResolvedModel;
+  ranker: ResolvedModel;
   mainLog: LogSettings;
   graderLog: LogSettings;
   summarizerLog: LogSettings;
+  rankerLog: LogSettings;
 };
 
 /** The debug-log attribution triple for one role's effective settings. */
@@ -58,9 +64,11 @@ function resolveRunModels(settings: EffectiveModelSettingsBundle): RunModels {
     // SUMMARIZER_REQUEST_TIMEOUT_MS) — otherwise a slow-but-healthy summary is
     // aborted into a truncation fallback.
     summarizer: resolveModel(settings.summarizer, SUMMARIZER_REQUEST_TIMEOUT_MS),
+    ranker: resolveModel(settings.ranker),
     mainLog: logSettingsFor(settings.main),
     graderLog: logSettingsFor(settings.grader),
-    summarizerLog: logSettingsFor(settings.summarizer)
+    summarizerLog: logSettingsFor(settings.summarizer),
+    rankerLog: logSettingsFor(settings.ranker)
   };
 }
 
@@ -103,6 +111,10 @@ function logRunStarted(
     summarizerProvider: settings.summarizer.provider,
     summarizerModel: settings.summarizer.model,
     summarizerReasoningEffort: settings.summarizer.reasoningEffort,
+    rankerModelSettingsSource: settings.ranker.source,
+    rankerProvider: settings.ranker.provider,
+    rankerModel: settings.ranker.model,
+    rankerReasoningEffort: settings.ranker.reasoningEffort,
     budget
   });
 }
@@ -293,6 +305,47 @@ async function forceSynthesis(
 }
 
 /**
+ * Curated list mode only: re-order the kept set by relevance to the query in one
+ * terminal model call (see lib/agent/ranker.ts), returning the relevance-ordered
+ * files. Returns undefined — leaving the live keep-order — when ranking does not
+ * apply (not a curated run) or cannot help (0 or 1 kept file). The reranker uses
+ * the examiner verdicts already retained on `state.keptVerdicts`, folds its token
+ * usage into the run total, and degrades to keep-order on any failure
+ * (`applyRanking` over an empty order is the identity). Called only on the success
+ * path — the error path keeps whatever order was gathered rather than spend a call.
+ */
+async function rerankCuratedKept(
+  input: AgentRequest,
+  state: AgentRunState,
+  models: RunModels,
+  subjectIdentity: string | null,
+  requestId: string,
+  emit: (event: AgentProgress) => void | Promise<void>
+): Promise<DriveFile[] | undefined> {
+  if (!isCuratingRequest(input)) return undefined;
+  const keptFiles = state.kept.list();
+  if (keptFiles.length <= 1) return undefined;
+  const items: RankItem[] = keptFiles.map((file) => ({
+    file,
+    verdict:
+      state.keptVerdicts.get(fileKey(file)) ??
+      { relevant: true, reason: "Judged relevant.", entities: [], aboutSubject: "unknown" }
+  }));
+  await emit({ type: "progress", message: `Ranking ${keptFiles.length} results by relevance` });
+  const { order, usageTokens } = await rankKeptFiles(
+    models.ranker,
+    models.rankerLog,
+    input.query,
+    subjectIdentity,
+    items,
+    requestId,
+    state.currentStep
+  );
+  state.tokensSpent += usageTokens;
+  return applyRanking(keptFiles, order);
+}
+
+/**
  * Assemble the final result, emit the terminal `final` event, and log
  * `agent.completed`. Shared by the success and error paths so gathered work is
  * never discarded. `steps`/`forcedFinalAnswer` and the stop-reason fields are
@@ -309,10 +362,13 @@ async function finalizeRun(params: {
   steps?: number;
   forcedFinalAnswer?: boolean;
   withStopReasons: boolean;
+  // Curated list mode only: the reranker's relevance-ordered kept set (a
+  // permutation of state.kept). Omitted on the error path, which keeps keep-order.
+  rankedCurated?: DriveFile[];
 }) {
-  const { emit, requestId, startedAt, input, state, parsed, reason, steps, forcedFinalAnswer, withStopReasons } =
+  const { emit, requestId, startedAt, input, state, parsed, reason, steps, forcedFinalAnswer, withStopReasons, rankedCurated } =
     params;
-  const { answer, answerFormat, files, touchedFiles } = buildAgentResult(input, state, parsed);
+  const { answer, answerFormat, files, touchedFiles } = buildAgentResult(input, state, parsed, rankedCurated);
   await writeDebugLog({
     event: "agent.completed",
     requestId,
@@ -418,6 +474,18 @@ export async function runDriveAgent(
       forcedFinalAnswer = finalText !== null;
     }
 
+    // Curated list mode: re-order the kept set by relevance before finalizing
+    // (a no-op for other modes / <=1 kept file). Runs only here on the success
+    // path; the error path below keeps whatever order was gathered.
+    const rankedCurated = await rerankCuratedKept(
+      input,
+      state,
+      models,
+      subjectIdentity,
+      requestId,
+      emit
+    );
+
     await finalizeRun({
       emit,
       requestId,
@@ -431,7 +499,8 @@ export async function runDriveAgent(
       reason: result.finishReason,
       steps: result.steps.length,
       forcedFinalAnswer,
-      withStopReasons: true
+      withStopReasons: true,
+      rankedCurated
     });
   } catch (error) {
     // Never discard gathered work: a throw (model error after retries, an

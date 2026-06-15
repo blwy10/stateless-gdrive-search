@@ -21,19 +21,24 @@ Required (throw if unset): `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`,
 `AI_PROVIDER`, `AI_MODEL`, `AI_REASONING_EFFORT`, `GRADER_AI_API_KEY`,
 `GRADER_AI_PROVIDER`, `GRADER_AI_MODEL`, `GRADER_AI_REASONING_EFFORT`,
 `SUMMARIZER_AI_API_KEY`, `SUMMARIZER_AI_PROVIDER`, `SUMMARIZER_AI_MODEL`,
-`SUMMARIZER_AI_REASONING_EFFORT`. (`NEXTAUTH_SECRET` is also required, enforced
-by next-auth itself, not `env.ts`.) The four `SUMMARIZER_AI_*` behaviour vars
-were made required by maintainer decision (2026-06) — same "no fallback between
-roles" stance as the grader; a summarizer *call* failing falls back to plain
-truncation at run time, but the *config* is still required.
+`SUMMARIZER_AI_REASONING_EFFORT`, `RANKER_AI_API_KEY`, `RANKER_AI_PROVIDER`,
+`RANKER_AI_MODEL`, `RANKER_AI_REASONING_EFFORT`. (`NEXTAUTH_SECRET` is also
+required, enforced by next-auth itself, not `env.ts`.) The four `SUMMARIZER_AI_*`
+behaviour vars were made required by maintainer decision (2026-06) — same "no
+fallback between roles" stance as the grader; a summarizer *call* failing falls
+back to plain truncation at run time, but the *config* is still required. The
+four `RANKER_AI_*` behaviour vars were made required by the same maintainer
+decision (2026-06) for the same reason: the ranker is an independent role with no
+fallback to another role; a ranker *call* failing falls back to the kept-set's
+existing keep-order at run time, but the *config* is still required.
 
 Allowed exceptions — genuinely optional, where "unset" is a true no-op (a feature
 off / not applicable), NOT a behaviour-picking default: `AI_BASE_URL` /
-`GRADER_AI_BASE_URL` / `SUMMARIZER_AI_BASE_URL` (only meaningful for
-`openai-compatible`; native providers have no endpoint), `DATABASE_SSL` (no TLS
-when unset), the `DEBUG_*` flags (off, and force-off in production), and the
-`AGENT_*` rate-limit knobs (operational safety caps with sane values).
-`NODE_ENV` is set by the platform, not us.
+`GRADER_AI_BASE_URL` / `SUMMARIZER_AI_BASE_URL` / `RANKER_AI_BASE_URL` (only
+meaningful for `openai-compatible`; native providers have no endpoint),
+`DATABASE_SSL` (no TLS when unset), the `DEBUG_*` flags (off, and force-off in
+production), and the `AGENT_*` rate-limit knobs (operational safety caps with sane
+values). `NODE_ENV` is set by the platform, not us.
 
 When adding a new env var — MANDATORY: do NOT decide compulsory-vs-optional on
 your own. ASK THE MAINTAINER, per variable, whether it should be compulsory

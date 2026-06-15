@@ -55,5 +55,16 @@ export const env = {
   summarizerAiModel: () => required("SUMMARIZER_AI_MODEL"),
   // Required reasoning effort for the summarizer role (see aiReasoningEffort).
   summarizerAiReasoningEffort: () => required("SUMMARIZER_AI_REASONING_EFFORT"),
+  // Ranker role: a separate model used only to re-order a curated list's kept
+  // files by relevance in one terminal call — see rankKeptFiles in
+  // lib/agent/ranker.ts. Like the grader/summarizer there is no fallback to
+  // another role: all four behaviour vars are required. Endpoint optional except
+  // for openai-compatible.
+  rankerAiApiKey: () => required("RANKER_AI_API_KEY"),
+  rankerAiProvider: () => required("RANKER_AI_PROVIDER"),
+  rankerAiBaseUrl: (): string | null => process.env.RANKER_AI_BASE_URL || null,
+  rankerAiModel: () => required("RANKER_AI_MODEL"),
+  // Required reasoning effort for the ranker role (see aiReasoningEffort).
+  rankerAiReasoningEffort: () => required("RANKER_AI_REASONING_EFFORT"),
   nextAuthUrl: () => required("NEXTAUTH_URL")
 };
