@@ -8,11 +8,13 @@ import {
   buildRankerPrompt,
   createRunState,
   describeSubjectIdentity,
+  evaluateTokenBudget,
   handleListFolderTool,
   handleOpenFileTool,
   handleReviewFileTool,
   handleSearchTool,
   normalizeGradeVerdict,
+  noteDiminishingReturns,
   parseFinalAnswer,
   parseSources,
   rankKeptFiles,
@@ -399,6 +401,74 @@ describe("resolveUsageTokens", () => {
   it("returns 0 when there is neither usage nor text (step backstop is the floor)", () => {
     expect(resolveUsageTokens(undefined, "")).toBe(0);
     expect(resolveUsageTokens(undefined)).toBe(0);
+  });
+});
+
+describe("evaluateTokenBudget", () => {
+  const budget = makeContext().budget;
+
+  it("returns null and sets no wind-down while every guard is under its limit", () => {
+    const state = makeState({ tokensSpent: 1_000, lastInputTokens: 1_000, tokensAtLastProgress: 0 });
+    expect(evaluateTokenBudget(state, budget)).toBeNull();
+    expect(state.windDownReason).toBeNull();
+  });
+
+  it("trips the total-token seatbelt first, reporting the guard and a metric snapshot", () => {
+    const state = makeState({
+      tokensSpent: budget.maxTotalTokens,
+      lastInputTokens: 0,
+      tokensAtLastProgress: 0
+    });
+    const trip = evaluateTokenBudget(state, budget);
+    expect(trip?.guard).toBe("total_token_seatbelt");
+    expect(trip?.tokensSpent).toBe(budget.maxTotalTokens);
+    expect(trip?.reason).toBe(state.windDownReason);
+    expect(state.windDownReason).toContain("seatbelt");
+  });
+
+  it("trips the context-window guard on a single oversize-input call", () => {
+    const state = makeState({ lastInputTokens: budget.maxContextInputTokens });
+    expect(evaluateTokenBudget(state, budget)?.guard).toBe("context_window");
+  });
+
+  it("trips the diminishing-returns hard floor on tokens-since-progress", () => {
+    const state = makeState({
+      tokensSpent: budget.hardProgressTokenLimit,
+      tokensAtLastProgress: 0
+    });
+    const trip = evaluateTokenBudget(state, budget);
+    expect(trip?.guard).toBe("diminishing_returns_hard");
+    expect(trip?.tokensSinceProgress).toBe(budget.hardProgressTokenLimit);
+  });
+
+  it("returns null once already wound down, so the trip logs only once", () => {
+    const state = makeState({ tokensSpent: budget.maxTotalTokens, windDownReason: "already" });
+    expect(evaluateTokenBudget(state, budget)).toBeNull();
+    // The pre-existing reason is left untouched (no re-trip).
+    expect(state.windDownReason).toBe("already");
+  });
+});
+
+describe("noteDiminishingReturns", () => {
+  const budget = makeContext().budget;
+
+  it("returns null and counts no nudge while under the soft limit", async () => {
+    const state = makeState({ tokensSpent: 1_000, tokensAtLastProgress: 0 });
+    expect(await noteDiminishingReturns("req", 0, state, budget)).toBeNull();
+    expect(state.softNudgeCount).toBe(0);
+  });
+
+  it("returns the nudge and counts each firing once the soft limit is crossed", async () => {
+    const state = makeState({
+      tokensSpent: budget.softProgressTokenLimit,
+      tokensAtLastProgress: 0
+    });
+    const note = await noteDiminishingReturns("req", 0, state, budget);
+    expect(note).toContain("Returns are diminishing");
+    expect(state.softNudgeCount).toBe(1);
+    // The run-wide counter accrues across calls (surfaced in agent.completed).
+    await noteDiminishingReturns("req", 1, state, budget);
+    expect(state.softNudgeCount).toBe(2);
   });
 });
 

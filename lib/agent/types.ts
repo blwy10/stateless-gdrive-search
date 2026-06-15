@@ -115,6 +115,13 @@ export type AgentBudget = {
 
 export type AgentOptions = {
   budget?: Partial<AgentBudget>;
+  /**
+   * Correlate the run's debug logs with the HTTP request that started it. The API
+   * route mints one id, logs the request-edge events (rate-limit / concurrency /
+   * bad-request / client-disconnect) under it, and passes it here so the run's own
+   * logs share the id. A fresh id is minted when omitted (direct/test callers).
+   */
+  requestId?: string;
 };
 
 export type AgentProgress =

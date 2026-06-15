@@ -57,8 +57,13 @@ newly-surfaced/read file otherwise); `tokensSinceProgress` is the gap.
 unless you have a new angle" note once that gap passes `softProgressTokenLimit`
 (it explicitly preserves the berry-picking escape hatch), and
 `evaluateTokenBudget` (in `prepareStep`) hard-winds-down past
-`hardProgressTokenLimit`. The note fires on both `search_drive` and `review_file`
-results.
+`hardProgressTokenLimit`. The note fires on `search_drive`, `review_file`, and
+`list_folder` results — attached via `noteDiminishingReturns`, which also counts
+it (`state.softNudgeCount`, summarised in `agent.completed`) and emits an
+`agent.budget.soft_nudge` debug event. `evaluateTokenBudget` returns a
+`BudgetTrip` the step a hard guard first fires so `prepareStep` logs a one-shot
+`agent.budget.wind_down` (naming which of the three guards won); both make the
+soft→hard progression visible for tuning.
 
 ## Budget: diminishing returns, not caps
 

@@ -140,10 +140,26 @@ export type AgentRunState = {
    */
   tokensSpent: number;
   /**
+   * The same spend as {@link tokensSpent}, split by the model role that incurred
+   * it (main loop vs the isolated grader / summarizer / ranker). Logged in
+   * `agent.completed` so cost is attributable per role in one line instead of
+   * having to sum the per-call logs — the breakdown the budget docs ask for when
+   * tuning the `*ProgressTokenLimit`s. The forced terminal synthesis turn is not
+   * folded into `tokensSpent` (it runs after the loop), so it is excluded here too.
+   */
+  tokensByRole: { main: number; grader: number; summarizer: number; ranker: number };
+  /**
    * Value of {@link tokensSpent} when the result set last grew. `tokensSpent`
    * minus this is the diminishing-returns signal (see {@link tokensSinceProgress}).
    */
   tokensAtLastProgress: number;
+  /**
+   * How many times the diminishing-returns SOFT nudge was attached to a tool
+   * result this run (see {@link noteDiminishingReturns}). Logged per-occurrence
+   * and summarised in `agent.completed`, so you can see how often the model was
+   * nudged to wrap up before the hard wind-down floor actually bound.
+   */
+  softNudgeCount: number;
   /**
    * Input tokens of the most recent model step, used for the per-call
    * context-window health guard (mainly synthesis). Updated in `onStepFinish`.
@@ -188,7 +204,9 @@ export function createRunState(): AgentRunState {
     reviewFileCallCount: 0,
     listFolderCallCount: 0,
     tokensSpent: 0,
+    tokensByRole: { main: 0, grader: 0, summarizer: 0, ranker: 0 },
     tokensAtLastProgress: 0,
+    softNudgeCount: 0,
     lastInputTokens: 0,
     stopSearchingReason: null,
     windDownReason: null,

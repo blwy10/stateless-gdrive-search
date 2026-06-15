@@ -89,6 +89,7 @@ export async function summarizeOversizeContent(
   const fileKeyHash = hashForDebug(fileKey(file));
   const input = fullText.slice(0, MAX_SUMMARY_INPUT_CHARS);
   const inputTruncated = fullText.length > MAX_SUMMARY_INPUT_CHARS;
+  const startedAt = Date.now();
   try {
     const { text, usage } = await generateText({
       model: resolved.model,
@@ -116,6 +117,7 @@ export async function summarizeOversizeContent(
       level: belowUsefulFloor ? "warn" : "debug",
       requestId,
       step,
+      durationMs: Date.now() - startedAt,
       model: logSettings.model,
       provider: logSettings.provider,
       fileKeyHash,
@@ -138,6 +140,7 @@ export async function summarizeOversizeContent(
       level: "warn",
       requestId,
       step,
+      durationMs: Date.now() - startedAt,
       model: logSettings.model,
       provider: logSettings.provider,
       fileKeyHash,

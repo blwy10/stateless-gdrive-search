@@ -12,7 +12,15 @@ export {
   type AgentOptions,
   type AgentProgress
 } from "./types";
-export { defaultAgentBudgets, resolveAgentBudget } from "./budget";
+export {
+  defaultAgentBudgets,
+  diminishingReturnsNote,
+  evaluateTokenBudget,
+  noteDiminishingReturns,
+  resolveAgentBudget,
+  type BudgetTrip,
+  type BudgetWindDownGuard
+} from "./budget";
 export { describeSubjectIdentity, systemPrompt } from "./prompts";
 export { estimateMessagesChars, resolveUsageTokens } from "./tokens";
 export { wrapUntrustedContent } from "./untrusted";

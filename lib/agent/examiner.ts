@@ -172,6 +172,7 @@ export async function gradeFileRelevance(
   step: number
 ): Promise<{ verdict: GradeVerdict; usageTokens: number }> {
   const fileKeyHash = hashForDebug(fileKey(file));
+  const startedAt = Date.now();
   try {
     const { object, usage } = await generateObject({
       model: resolved.model,
@@ -195,6 +196,7 @@ export async function gradeFileRelevance(
       event: "agent.grade.completed",
       requestId,
       step,
+      durationMs: Date.now() - startedAt,
       model: logSettings.model,
       provider: logSettings.provider,
       fileKeyHash,
@@ -218,6 +220,7 @@ export async function gradeFileRelevance(
       level: "warn",
       requestId,
       step,
+      durationMs: Date.now() - startedAt,
       model: logSettings.model,
       provider: logSettings.provider,
       fileKeyHash,

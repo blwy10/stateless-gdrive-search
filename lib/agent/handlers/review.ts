@@ -12,7 +12,7 @@ import {
   toolErrorObservation,
   withToolRetries
 } from "../tool-runtime";
-import { diminishingReturnsNote, recordUsefulProgress } from "../budget";
+import { noteDiminishingReturns, recordUsefulProgress } from "../budget";
 import { fileKey, formatFileProgressLabel } from "../files";
 
 /**
@@ -211,7 +211,7 @@ export async function handleReviewFileTool(
   // Surface the verdict and — the berry-picking channel — the extracted entities
   // back to the model so it can search for related files. The file's CONTENT is
   // never returned into the main loop's context, only this compact verdict.
-  const drNote = diminishingReturnsNote(state, budget);
+  const drNote = await noteDiminishingReturns(requestId, step, state, budget);
   const payload = {
     examined: true,
     relevant: verdict.relevant,

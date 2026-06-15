@@ -169,6 +169,7 @@ function buildRunContext(
         step
       );
       state.tokensSpent += usageTokens;
+      state.tokensByRole.grader += usageTokens;
       return verdict;
     },
     summarizeOversize: async (file, fullText, step) => {
@@ -182,6 +183,7 @@ function buildRunContext(
         step
       );
       state.tokensSpent += usageTokens;
+      state.tokensByRole.summarizer += usageTokens;
       return summary;
     }
   };
@@ -236,6 +238,11 @@ async function runMainModelLoop(params: {
   // fallback (B) is needed (only when no deltas streamed for that step).
   let boundaryPending = false;
   let streamedReasoningThisStep = false;
+  // Per-step model-latency timing. `stepStartedAt` is (re)set in prepareStep just
+  // before each model call; `firstChunkAt` marks the first streamed chunk of the
+  // current step so onStepFinish can derive time-to-first-token.
+  let stepStartedAt = Date.now();
+  let firstChunkAt: number | null = null;
   const emitReasoning = (text: string): void | Promise<void> => {
     if (!text) return;
     const delta = boundaryPending ? `\n\n${text}` : text;
@@ -267,6 +274,9 @@ async function runMainModelLoop(params: {
     stopWhen: stepCountIs(budget.maxToolSteps),
     // (A) Forward each reasoning delta to the client as the model produces it.
     onChunk: ({ chunk }) => {
+      // TTFT: stamp the first streamed chunk of this step, whatever its type
+      // (reasoning, text, or tool-call delta) — i.e. the model's first output.
+      if (firstChunkAt === null) firstChunkAt = Date.now();
       if (chunk.type !== "reasoning-delta") return;
       streamedReasoningThisStep = true;
       return emitReasoning(chunk.text);
@@ -288,7 +298,23 @@ async function runMainModelLoop(params: {
       // content) so onStepFinish can fold a realistic estimate into the token
       // total when the provider reports no usage (see resolveUsageTokens).
       lastStepInputChars = systemPromptText.length + estimateMessagesChars(messages);
-      evaluateTokenBudget(state, budget);
+      // Reset per-step timing just before this step's model call.
+      stepStartedAt = Date.now();
+      firstChunkAt = null;
+      const trip = evaluateTokenBudget(state, budget);
+      if (trip) {
+        // Discrete record of the moment (step + token counts) a token guard first
+        // forced the wind-down, and which of the three won — instead of only
+        // seeing the final reason in agent.completed. Fire-and-forget so
+        // prepareStep stays synchronous.
+        void writeDebugLog({
+          event: "agent.budget.wind_down",
+          level: "warn",
+          requestId,
+          step: stepNumber,
+          ...trip
+        });
+      }
       if (state.windDownReason) return { activeTools: [] };
       if (state.stopSearchingReason) {
         // Drop search_drive but keep the read tool AND list_folder: the search
@@ -325,15 +351,22 @@ async function runMainModelLoop(params: {
       ) {
         mainModelStepsWithUsage += 1;
       }
-      state.tokensSpent += resolveUsageTokens(
+      const stepTokens = resolveUsageTokens(
         step.usage,
         `${step.text ?? ""}${step.reasoningText ?? ""}`,
         lastStepInputChars
       );
+      state.tokensSpent += stepTokens;
+      state.tokensByRole.main += stepTokens;
       if (typeof step.usage?.inputTokens === "number") {
         state.lastInputTokens = step.usage.inputTokens;
       }
-      return logModelStep(requestId, logSettings, step);
+      // durationMs spans the whole step (model + this step's tool executions,
+      // since onStepFinish fires after tools); ttftMs is the clean model-start
+      // latency. Tools log their own durationMs, so model time is derivable.
+      const durationMs = Date.now() - stepStartedAt;
+      const ttftMs = firstChunkAt !== null ? firstChunkAt - stepStartedAt : null;
+      return logModelStep(requestId, logSettings, step, { durationMs, ttftMs });
     }
   });
 
@@ -386,6 +419,9 @@ async function forceSynthesis(
   requestId: string,
   logSettings: LogSettings
 ): Promise<string | null> {
+  // Non-streaming terminal turn, so there is no first-chunk to time (ttftMs is
+  // null); durationMs is measured per step from the prior boundary.
+  let stepStartedAt = Date.now();
   try {
     const forced = await generateText({
       model: resolved.model,
@@ -399,7 +435,11 @@ async function forceSynthesis(
         ...priorMessages,
         { role: "user", content: `${reason} Stop using tools and return the final result now.` }
       ],
-      onStepFinish: (step) => logModelStep(requestId, logSettings, step)
+      onStepFinish: (step) => {
+        const durationMs = Date.now() - stepStartedAt;
+        stepStartedAt = Date.now();
+        return logModelStep(requestId, logSettings, step, { durationMs, ttftMs: null });
+      }
     });
     return forced.text;
   } catch (error) {
@@ -451,6 +491,7 @@ async function rerankCuratedKept(
     state.currentStep
   );
   state.tokensSpent += usageTokens;
+  state.tokensByRole.ranker += usageTokens;
   return applyRanking(keptFiles, order);
 }
 
@@ -494,6 +535,10 @@ async function finalizeRun(params: {
     reviewedFileCount: state.reviewed.size,
     returnedFileCount: files.length,
     tokensSpent: state.tokensSpent,
+    // Per-role cost attribution (main vs grader/summarizer/ranker) so a run's
+    // spend is breakable down in one line, plus how many soft nudges fired.
+    tokensByRole: state.tokensByRole,
+    softNudgeCount: state.softNudgeCount,
     ...(withStopReasons
       ? { windDownReason: state.windDownReason, stopSearchingReason: state.stopSearchingReason }
       : {}),
@@ -509,7 +554,10 @@ export async function runDriveAgent(
   emit: (event: AgentProgress) => void | Promise<void>,
   options: AgentOptions = {}
 ) {
-  const requestId = createDebugRequestId("agent");
+  // Prefer the id minted by the HTTP route (so its request-edge events —
+  // rate-limit / concurrency / bad-request / client-disconnect — correlate with
+  // this run's logs); fall back to a fresh one for direct/test callers.
+  const requestId = options.requestId ?? createDebugRequestId("agent");
   const startedAt = Date.now();
   const budget = resolveAgentBudget(input.mode, options.budget);
   const modelSettings = await getEffectiveModelSettings(ownerSub);

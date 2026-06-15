@@ -160,6 +160,25 @@ plus that hash are what make a grade attributable. Reasoning comes from the SDK'
 unified `reasoningText`. The verdict, `reason`, and `entityCount` are also
 recorded on `agent.tool.review_file.completed`.
 
+Latency and cost are logged alongside. Every model call carries a `durationMs`:
+the isolated grader/summarizer/ranker time their single call directly, while
+`agent.model.completed` adds the main-loop step's `durationMs` (the whole step —
+model generation *plus* that step's tool executions, since `onStepFinish` fires
+after tools, so subtract the per-tool `durationMs` to isolate model time) and a
+`ttftMs` time-to-first-token (step start to the first streamed chunk, `null` when
+nothing streamed). `agent.completed` breaks the run's `tokensSpent` down per role
+(`tokensByRole`: main / grader / summarizer / ranker) so cost is attributable in
+one line, and reports `softNudgeCount`. The budget guards log their transitions:
+`agent.budget.soft_nudge` each time the diminishing-returns nudge is attached to a
+tool result (see [retrieval-and-budget.md](./retrieval-and-budget.md)), and a
+one-shot `agent.budget.wind_down` the step a hard guard first trips, naming which
+of the three won (`total_token_seatbelt` / `context_window` /
+`diminishing_returns_hard`). Finally, the HTTP route logs request-edge events
+under the same requestId it threads into the run — `agent.request.rate_limited`,
+`agent.request.concurrency_rejected`, `agent.request.invalid`, and
+`agent.request.client_disconnected` — so a run that never started, or one the
+client abandoned mid-stream, is visible rather than silent.
+
 The set of kept files (`AgentRunState.kept`, a `FileSet`) is the authoritative curated
 *primary* result — there is no end-of-run marker, and no opened-files fallback:
 with the examiner judging every file explicitly, an empty kept set is a valid

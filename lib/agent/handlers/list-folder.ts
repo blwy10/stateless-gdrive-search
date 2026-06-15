@@ -12,7 +12,7 @@ import {
   toolErrorObservation,
   withToolRetries
 } from "../tool-runtime";
-import { combineNotes, diminishingReturnsNote, recordUsefulProgress } from "../budget";
+import { combineNotes, noteDiminishingReturns, recordUsefulProgress } from "../budget";
 import { fileKey } from "../files";
 
 /**
@@ -133,7 +133,7 @@ export async function handleListFolderTool(
     children.length === 0
       ? "This folder has no files directly inside it. It may be empty, or this id may not be a folder — use search_drive to find files instead."
       : null;
-  const note = combineNotes(emptyNote, diminishingReturnsNote(state, budget));
+  const note = combineNotes(emptyNote, await noteDiminishingReturns(requestId, step, state, budget));
   return {
     role: "tool",
     tool_call_id: toolCall.id,

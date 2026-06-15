@@ -14,6 +14,17 @@ import { isDebugTranscriptLogEnabled, writeDebugLog } from "@/lib/debug-log";
 export type LogSettings = { model: string; provider: ModelProvider; source: "default" | "custom" };
 
 /**
+ * Wall-clock timing for one main-loop step, measured around the AI SDK callbacks
+ * (the `StepResult` carries no duration). `durationMs` spans the whole step —
+ * model generation PLUS the step's tool executions, since `onStepFinish` fires
+ * after tools — so isolate model time by subtracting that step's per-tool
+ * `durationMs` (already logged). `ttftMs` (time-to-first-token: step start to the
+ * first streamed chunk) is the clean model-start latency, or `null` when nothing
+ * streamed (e.g. the non-streaming forced-synthesis turn).
+ */
+export type StepTiming = { durationMs: number; ttftMs: number | null };
+
+/**
  * Log one model step's outcome. The AI SDK drives the loop now, so instead of a
  * hand-rolled per-attempt logger this runs from `generateText`'s onStepFinish.
  * Reasoning is read from the SDK's unified `reasoningText` regardless of provider
@@ -21,18 +32,22 @@ export type LogSettings = { model: string; provider: ModelProvider; source: "def
  * there); the full untruncated transcript (content + reasoning + tool calls +
  * raw response body) is emitted only under DEBUG_LOG_TRANSCRIPT. `caller`
  * separates the main agent (`agent.model.*`) from the curated grader, which logs
- * its own `agent.grade.*` events.
+ * its own `agent.grade.*` events. `timing` adds step latency + time-to-first-token
+ * (the isolated grader/summarizer/ranker time their single call directly instead).
  */
 export async function logModelStep(
   requestId: string,
   settings: LogSettings,
-  step: StepResult<ToolSet>
+  step: StepResult<ToolSet>,
+  timing: StepTiming
 ) {
   const reasoning = step.reasoningText ?? null;
   await writeDebugLog({
     event: "agent.model.completed",
     requestId,
     step: step.stepNumber,
+    durationMs: timing.durationMs,
+    ttftMs: timing.ttftMs,
     model: settings.model,
     provider: settings.provider,
     modelSettingsSource: settings.source,

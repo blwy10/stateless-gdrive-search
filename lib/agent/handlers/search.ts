@@ -14,7 +14,7 @@ import {
 } from "../tool-runtime";
 import {
   combineNotes,
-  diminishingReturnsNote,
+  noteDiminishingReturns,
   recordUsefulProgress,
   searchResultNote
 } from "../budget";
@@ -130,7 +130,7 @@ export async function handleSearchTool(
   }
   const note = combineNotes(
     searchResultNote(wasRepeatedQuery, files.length),
-    diminishingReturnsNote(state, budget)
+    await noteDiminishingReturns(requestId, step, state, budget)
   );
   return {
     role: "tool",

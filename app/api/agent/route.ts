@@ -5,6 +5,7 @@ import { NextRequest } from "next/server";
 import { ZodError } from "zod";
 import { requireSession, withAuth } from "@/lib/auth";
 import { parseAgentRequest, runDriveAgent, type AgentProgress } from "@/lib/agent";
+import { createDebugRequestId, debugError, hashForDebug, writeDebugLog } from "@/lib/debug-log";
 import {
   CONCURRENCY_RETRY_AFTER_SECONDS,
   getAgentConcurrencyLimiter,
@@ -43,6 +44,11 @@ function errorMessage(error: unknown) {
 export const POST = withAuth(async (request: NextRequest) => {
   const session = await requireSession();
   const ownerSub = session.user.id;
+  // One id per HTTP request: it tags the request-edge events below AND is passed
+  // into runDriveAgent so the run's own logs share it (full correlation). Hash
+  // the user id per the metadata-only logging contract.
+  const requestId = createDebugRequestId("agent");
+  const ownerSubHash = hashForDebug(ownerSub);
 
   // Abuse protection. Each run fans out to a paid AI API and Google Drive, and
   // holds an open SSE stream, so an authenticated user must not be able to spam
@@ -50,6 +56,13 @@ export const POST = withAuth(async (request: NextRequest) => {
   // concurrency cap bounds how many they can run at once. See lib/rate-limit.ts.
   const rateDecision = getAgentRateLimiter().take(ownerSub);
   if (!rateDecision.allowed) {
+    void writeDebugLog({
+      event: "agent.request.rate_limited",
+      level: "warn",
+      requestId,
+      ownerSubHash,
+      retryAfterSeconds: rateDecision.retryAfterSeconds
+    });
     return tooManyRequests(
       "Too many requests. Please wait a moment before searching again.",
       rateDecision.retryAfterSeconds
@@ -60,11 +73,26 @@ export const POST = withAuth(async (request: NextRequest) => {
   try {
     input = parseAgentRequest(await request.json());
   } catch (error) {
+    void writeDebugLog({
+      event: "agent.request.invalid",
+      level: "warn",
+      requestId,
+      ownerSubHash,
+      error: debugError(error)
+    });
     return badRequest(errorMessage(error));
   }
 
   const concurrency = getAgentConcurrencyLimiter();
   if (!concurrency.tryAcquire(ownerSub)) {
+    void writeDebugLog({
+      event: "agent.request.concurrency_rejected",
+      level: "warn",
+      requestId,
+      ownerSubHash,
+      activeRuns: concurrency.activeCount(ownerSub),
+      retryAfterSeconds: CONCURRENCY_RETRY_AFTER_SECONDS
+    });
     return tooManyRequests(
       "You already have the maximum number of searches running. Let one finish first.",
       CONCURRENCY_RETRY_AFTER_SECONDS
@@ -94,7 +122,7 @@ export const POST = withAuth(async (request: NextRequest) => {
       };
 
       try {
-        await runDriveAgent(ownerSub, input, emit);
+        await runDriveAgent(ownerSub, input, emit, { requestId });
       } catch (error) {
         emit({
           type: "error",
@@ -108,6 +136,19 @@ export const POST = withAuth(async (request: NextRequest) => {
           // no-op: stream may already be closed if the consumer disconnected
         }
       }
+    },
+    cancel(reason) {
+      // The client went away before the stream finished (closed tab, navigation,
+      // aborted fetch). The run keeps executing server-side until it settles —
+      // its slot is freed in start()'s finally — but record the disconnect so an
+      // abandoned run is distinguishable from one that ran to completion.
+      void writeDebugLog({
+        event: "agent.request.client_disconnected",
+        level: "warn",
+        requestId,
+        ownerSubHash,
+        reason: typeof reason === "string" ? reason.slice(0, 200) : null
+      });
     }
   });
 

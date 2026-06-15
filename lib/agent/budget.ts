@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Benjamin Lau
 // SPDX-License-Identifier: MIT
 
+import { writeDebugLog } from "@/lib/debug-log";
 import type { AgentBudget, AgentRequest } from "./types";
 import type { AgentRunState } from "./state";
 
@@ -84,7 +85,9 @@ export function recordUsefulProgress(state: AgentRunState) {
  * result set growing. A prompt-time hint, not enforcement — it deliberately also
  * tells the model it may stop, and explicitly preserves the berry-picking escape
  * hatch (a genuinely new angle), so it nudges toward wrapping up without killing
- * a productive pivot. The hard floor lives in {@link evaluateTokenBudget}.
+ * a productive pivot. The hard floor lives in {@link evaluateTokenBudget}. Kept
+ * pure (no logging/state mutation) so it stays trivially unit-testable; the
+ * logging+counting wrapper is {@link noteDiminishingReturns}.
  */
 export function diminishingReturnsNote(state: AgentRunState, budget: AgentBudget): string | null {
   if (tokensSinceProgress(state) >= budget.softProgressTokenLimit) {
@@ -93,10 +96,72 @@ export function diminishingReturnsNote(state: AgentRunState, budget: AgentBudget
   return null;
 }
 
+/**
+ * Side-effecting wrapper around {@link diminishingReturnsNote} for the tool
+ * handlers: returns the same note, but when one fires it also counts it on
+ * `state.softNudgeCount` and emits a discrete `agent.budget.soft_nudge` debug
+ * event. Previously the soft nudge was only ever surfaced to the model and never
+ * logged, so you couldn't see how often the run was nudged before the hard floor
+ * bound. Fire-and-forget logging (writeDebugLog no-ops when debug logging is off).
+ */
+export async function noteDiminishingReturns(
+  requestId: string,
+  step: number,
+  state: AgentRunState,
+  budget: AgentBudget
+): Promise<string | null> {
+  const note = diminishingReturnsNote(state, budget);
+  if (note) {
+    state.softNudgeCount += 1;
+    await writeDebugLog({
+      event: "agent.budget.soft_nudge",
+      level: "warn",
+      requestId,
+      step,
+      tokensSpent: state.tokensSpent,
+      tokensSinceProgress: tokensSinceProgress(state),
+      softProgressTokenLimit: budget.softProgressTokenLimit,
+      softNudgeCount: state.softNudgeCount
+    });
+  }
+  return note;
+}
+
 /** Join a search-specific note with the diminishing-returns nudge, if either fires. */
 export function combineNotes(...notes: (string | null)[]): string | null {
   const joined = notes.filter((note): note is string => Boolean(note)).join(" ");
   return joined || null;
+}
+
+/** Which of the three token guards forced a wind-down (for the debug log). */
+export type BudgetWindDownGuard =
+  | "total_token_seatbelt"
+  | "context_window"
+  | "diminishing_returns_hard";
+
+/**
+ * The transition record returned by {@link evaluateTokenBudget} the step a guard
+ * first trips. Carries which guard fired plus the metric snapshot, so a discrete
+ * `agent.budget.wind_down` event can record *when* (which step / token count) the
+ * run wound down and *which* guard won — instead of only seeing the final reason
+ * in `agent.completed`.
+ */
+export type BudgetTrip = {
+  guard: BudgetWindDownGuard;
+  reason: string;
+  tokensSpent: number;
+  lastInputTokens: number;
+  tokensSinceProgress: number;
+};
+
+function budgetTrip(guard: BudgetWindDownGuard, state: AgentRunState): BudgetTrip {
+  return {
+    guard,
+    reason: state.windDownReason ?? "",
+    tokensSpent: state.tokensSpent,
+    lastInputTokens: state.lastInputTokens,
+    tokensSinceProgress: tokensSinceProgress(state)
+  };
 }
 
 /**
@@ -108,18 +173,24 @@ export function combineNotes(...notes: (string | null)[]): string | null {
  * `stopSearchingReason` (search-call backstop) is set in the search handler
  * instead, so a search plateau stops searching while still letting the model
  * finish reading/examining what it already found.
+ *
+ * Returns the {@link BudgetTrip} on the step a guard FIRST trips (so the caller
+ * can log it once) and `null` otherwise — including once `windDownReason` is
+ * already set, so re-evaluation on later steps doesn't re-log.
  */
-export function evaluateTokenBudget(state: AgentRunState, budget: AgentBudget) {
-  if (state.windDownReason) return;
+export function evaluateTokenBudget(state: AgentRunState, budget: AgentBudget): BudgetTrip | null {
+  if (state.windDownReason) return null;
   if (state.tokensSpent >= budget.maxTotalTokens) {
     state.windDownReason = `Total-token seatbelt reached (${state.tokensSpent} tokens).`;
-    return;
+    return budgetTrip("total_token_seatbelt", state);
   }
   if (state.lastInputTokens >= budget.maxContextInputTokens) {
     state.windDownReason = `Context-window limit reached (${state.lastInputTokens} input tokens in one call).`;
-    return;
+    return budgetTrip("context_window", state);
   }
   if (tokensSinceProgress(state) >= budget.hardProgressTokenLimit) {
     state.windDownReason = `Diminishing returns: ${tokensSinceProgress(state)} tokens spent with no new useful results.`;
+    return budgetTrip("diminishing_returns_hard", state);
   }
+  return null;
 }

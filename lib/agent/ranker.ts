@@ -121,6 +121,7 @@ export async function rankKeptFiles(
   step: number
 ): Promise<{ order: number[]; usageTokens: number }> {
   const prompt = buildRankerPrompt(query, items);
+  const startedAt = Date.now();
   try {
     const { object, usage } = await generateObject({
       model: resolved.model,
@@ -143,6 +144,7 @@ export async function rankKeptFiles(
       event: "agent.rank.completed",
       requestId,
       step,
+      durationMs: Date.now() - startedAt,
       model: logSettings.model,
       provider: logSettings.provider,
       itemCount: items.length,
@@ -158,6 +160,7 @@ export async function rankKeptFiles(
       level: "warn",
       requestId,
       step,
+      durationMs: Date.now() - startedAt,
       model: logSettings.model,
       provider: logSettings.provider,
       itemCount: items.length,
